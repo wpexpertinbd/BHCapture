@@ -1,0 +1,11 @@
+[package]
+name = "bhc-spike-0a"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Own workspace root: must never be pulled into the real root workspace.
+[workspace]
+
+[build-dependencies]
+cc = "1"
