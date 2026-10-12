@@ -1,0 +1,8 @@
+target.noindex/
+target/
+node_modules/
+dist/
+build.noindex/
+.DS_Store
+*.p12
+*.cer
