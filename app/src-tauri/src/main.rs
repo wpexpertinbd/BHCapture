@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use bhcapture_capture::{macos::MacCapturer, CaptureError, Capturer};
 use bhcapture_core::geom::{DisplayId, DisplayLayout, LogPoint, LogRect};
 use bhcapture_core::image::Frame;
+use bhcapture_core::naming::{Fields, Pattern, Stamp, unique_path};
+use tauri_plugin_dialog::DialogExt;
 use global_hotkey::{hotkey::{Code, HotKey, Modifiers}, GlobalHotKeyEvent, GlobalHotKeyManager};
 use serde::Serialize;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
@@ -115,39 +117,74 @@ fn selection_cancel(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>) {
     hide_overlays(&app);
 }
 
-fn save_png(frame: &Frame) -> Result<String, String> {
-    let dir = dirs_desktop();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // TODO(Phase 1): configurable naming pattern + collision handling live in core.
-    let name = format!("BHCapture-{}.png", now_stamp());
-    let path = dir.join(name);
-    let file = std::fs::File::create(&path).map_err(|e| e.to_string())?;
+/// Default output folder: `~/Pictures/BHCapture`, created on demand.
+///
+/// Falls back to the home directory, then to the temp dir, rather than failing a capture the user
+/// has already framed — losing their selection over a missing folder is the worse outcome.
+fn default_capture_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    let dir = home.as_ref()
+        .map(|h| h.join("Pictures").join("BHCapture"))
+        .unwrap_or_else(std::env::temp_dir);
+    if std::fs::create_dir_all(&dir).is_ok() {
+        return dir;
+    }
+    home.unwrap_or_else(std::env::temp_dir)
+}
+
+/// Local wall-clock time. Core does no platform discovery, so the shell resolves the time zone
+/// and hands it components -- `localtime_r` rather than UTC, because a file named with UTC is
+/// wrong for everyone not on it.
+fn local_stamp() -> Stamp {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    Stamp {
+        year: tm.tm_year + 1900,
+        month: (tm.tm_mon + 1) as u32,
+        day: tm.tm_mday as u32,
+        hour: tm.tm_hour as u32,
+        minute: tm.tm_min as u32,
+        second: tm.tm_sec as u32,
+    }
+}
+
+fn write_png(frame: &Frame, path: &std::path::Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), frame.width(), frame.height());
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     enc.write_header().map_err(|e| e.to_string())?
         .write_image_data(&frame.to_rgba8()).map_err(|e| e.to_string())?;
-    Ok(path.display().to_string())
+    Ok(())
 }
 
-fn dirs_desktop() -> std::path::PathBuf {
-    std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join("Desktop"))
-        .unwrap_or_else(|_| std::env::temp_dir())
+/// Best-effort clipboard copy. A clipboard failure must never lose a capture that is already on
+/// disk, so this reports rather than propagates.
+fn copy_to_clipboard(frame: &Frame) -> Result<(), String> {
+    let img = arboard::ImageData {
+        width: frame.width() as usize,
+        height: frame.height() as usize,
+        bytes: std::borrow::Cow::Owned(frame.to_rgba8()),
+    };
+    arboard::Clipboard::new().map_err(|e| e.to_string())?
+        .set_image(img).map_err(|e| e.to_string())
 }
 
-fn now_stamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    // Plain epoch seconds for now; the real pattern (date/time, counters) is core's job.
-    format!("{secs}")
-}
-
+/// `save_as` opens a native dialog so this one capture can go anywhere; otherwise it lands in the
+/// default folder. The default is a default, not a cage.
 #[tauri::command]
-fn selection_commit(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>) -> Result<String, String> {
-    commit(&app, &state)
+async fn selection_commit(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>, save_as: bool)
+    -> Result<String, String>
+{
+    commit(&app, &state, save_as)
 }
 
-fn commit(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<String, String> {
+fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Result<String, String> {
     let drag = state.drag.lock().unwrap().take();
     let Some(drag) = drag else { return Err("no selection".into()) };
     let rect = drag.rect();
@@ -164,7 +201,36 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<String, Strin
              — a running app never sees a new grant.".to_string(),
         other => other.to_string(),
     })?;
-    save_png(&frame)
+
+    // The name is built from the pattern; `{title}`/`{app}` are untrusted window metadata, so
+    // core sanitises them to a single path component (see bhcapture_core::naming).
+    let stem = Pattern::default().render(local_stamp(), &Fields {
+        width: frame.width(), height: frame.height(), ..Default::default()
+    });
+
+    let path = if save_as {
+        let start = default_capture_dir();
+        app.dialog().file()
+            .set_title("Save capture")
+            .set_directory(&start)
+            .set_file_name(format!("{stem}.png"))
+            .add_filter("PNG image", &["png"])
+            .blocking_save_file()
+            .ok_or_else(|| "cancelled".to_string())?
+            .into_path().map_err(|e| e.to_string())?
+    } else {
+        let dir = default_capture_dir();
+        unique_path(&dir, &stem, "png", &|p| p.exists())
+    };
+
+    write_png(&frame, &path)?;
+
+    // Clipboard is a convenience on top of a file that already exists -- never fail the capture
+    // for it, just say so.
+    if let Err(e) = copy_to_clipboard(&frame) {
+        eprintln!("[warn] capture saved but clipboard copy failed: {e}");
+    }
+    Ok(path.display().to_string())
 }
 
 fn show_overlays(app: &tauri::AppHandle) {
@@ -186,6 +252,7 @@ fn main() {
     });
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
             overlay_info, selection_begin, selection_update,
@@ -249,17 +316,42 @@ fn main() {
                     show_overlays(&h);
                     std::thread::sleep(std::time::Duration::from_millis(900));
 
-                    let (ax, ay, bx, by) = (260.0, 180.0, 900.0, 600.0);
-                    *st.drag.lock().unwrap() = Some(Drag {
-                        anchor: LogPoint::new(ax, ay), cursor: LogPoint::new(bx, by) });
-                    broadcast(&h, Some(LogRect::from_corners(
-                        LogPoint::new(ax, ay), LogPoint::new(bx, by))));
-                    println!("[demo] selection {ax},{ay} -> {bx},{by}; holding 7s so the UI can be photographed");
-                    std::thread::sleep(std::time::Duration::from_millis(7000));
+                    // Deliberately awkward, non-round, non-square sizes: the selection is
+                    // FREEFORM. A fixed rect in a demo is only because no script can hold a mouse.
+                    let cases: [(f64, f64, f64, f64); 4] = [
+                        (137.0, 211.0, 538.0, 447.0),   // 401 x 236
+                        (12.0, 33.0, 1297.0, 70.0),     // 1285 x 37  -- very wide, very thin
+                        (700.0, 100.0, 733.0, 812.0),   // 33 x 712   -- very tall, very thin
+                        (3.0, 5.0, 1349.0, 871.0),      // 1346 x 866 -- nearly the whole screen
+                    ];
+                    for (ax, ay, bx, by) in cases {
+                        show_overlays(&h);
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        *st.drag.lock().unwrap() = Some(Drag {
+                            anchor: LogPoint::new(ax, ay), cursor: LogPoint::new(bx, by) });
+                        let r = LogRect::from_corners(LogPoint::new(ax, ay), LogPoint::new(bx, by));
+                        broadcast(&h, Some(r));
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let want = r.to_physical(bhcapture_core::geom::Scale::exact(2.0));
+                        match commit(&h, &st, false) {
+                            Ok(p) => println!("[demo] {}x{} pt -> want {}x{} px :: {p}",
+                                r.size.w, r.size.h, want.size.w, want.size.h, p = p),
+                            Err(e) => println!("[demo] FAILED {e}"),
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(400));
+                    }
 
-                    match commit(&h, &st) {
-                        Ok(p) => println!("[demo] SAVED {p}"),
-                        Err(e) => println!("[demo] FAILED {e}"),
+                    // Burst with no delay: these land in the SAME second, so the pattern yields an
+                    // identical stem and the collision path must kick in rather than overwrite.
+                    println!("[demo] -- collision burst --");
+                    for _ in 0..3 {
+                        show_overlays(&h);
+                        *st.drag.lock().unwrap() = Some(Drag {
+                            anchor: LogPoint::new(50.0, 50.0), cursor: LogPoint::new(250.0, 150.0) });
+                        match commit(&h, &st, false) {
+                            Ok(p) => println!("[demo] burst -> {p}"),
+                            Err(e) => println!("[demo] burst FAILED {e}"),
+                        }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     h.exit(0);

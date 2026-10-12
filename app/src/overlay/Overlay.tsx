@@ -59,7 +59,13 @@ export function Overlay() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") { e.preventDefault(); void invoke("selection_cancel"); return; }
-      if (e.key === "Enter")  { e.preventDefault(); void invoke("selection_commit").catch(() => {}); return; }
+      // Shift+Enter routes this one capture through a native Save dialog, so the default
+      // folder never becomes a cage.
+      if (e.key === "Enter") {
+        e.preventDefault();
+        void invoke("selection_commit", { saveAs: e.shiftKey }).catch(() => {});
+        return;
+      }
       const step = e.shiftKey ? 10 : 1;
       const d: Record<string, [number, number]> = {
         ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step],
@@ -113,7 +119,7 @@ export function Overlay() {
 
       <div className="hint" style={{ bottom: 28 }}>
         {local
-          ? <><kbd>Enter</kbd> capture <kbd>&larr;&uarr;&rarr;&darr;</kbd> nudge <kbd>Esc</kbd> cancel</>
+          ? <><kbd>Enter</kbd> save <kbd>&#8679;Enter</kbd> save as&hellip; <kbd>&larr;&uarr;&rarr;&darr;</kbd> nudge <kbd>Esc</kbd> cancel</>
           : <>Drag to select &nbsp;<kbd>Esc</kbd> cancel</>}
       </div>
     </div>
