@@ -9,7 +9,9 @@ use bhcapture_core::geom::{DisplayId, DisplayLayout, LogRect};
 use bhcapture_core::image::{Frame, FrameError};
 
 pub mod error;
+pub mod snapshot;
 pub use error::CaptureError;
+pub use snapshot::Snapshot;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -28,6 +30,12 @@ pub struct WindowInfo {
     /// `false` for minimised or fully-occluded windows. Capturing one is usually a mistake,
     /// so the selector should offer them differently, not silently return an empty image.
     pub on_screen: bool,
+    /// OS window layer; `0` is an ordinary application window. Menu bar, Dock, tooltips and
+    /// overlays live elsewhere, so snap-to-window must not offer them.
+    pub layer: i32,
+    /// Front-to-back position among on-screen windows, lower = nearer the front. `None` when the
+    /// OS does not list the window as on screen.
+    pub z_order: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default)]

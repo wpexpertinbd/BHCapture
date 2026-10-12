@@ -125,6 +125,7 @@ name = "bhcapture-app"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "base64 0.22.1",
  "bhcapture-capture",
  "bhcapture-core",
  "global-hotkey",

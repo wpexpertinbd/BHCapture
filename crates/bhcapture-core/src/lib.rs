@@ -8,3 +8,4 @@ pub mod geom;
 pub mod image;
 pub mod naming;
 pub mod settings;
+pub mod snap;

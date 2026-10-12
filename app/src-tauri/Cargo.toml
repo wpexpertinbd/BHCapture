@@ -20,3 +20,9 @@ png = "0.17"
 arboard = "3.4"
 libc = "0.2"
 tauri-plugin-dialog = "2"
+base64 = "0.22"
+
+[features]
+# Test harness only (--demo, --demo-snap, --settings). Off in shipped builds: it drives the real
+# command paths with synthetic input and writes into the user's Pictures folder.
+demo = []

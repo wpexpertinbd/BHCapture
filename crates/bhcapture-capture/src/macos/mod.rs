@@ -35,6 +35,8 @@ struct BhcWindowInfo {
     x: i32, y: i32,
     pt_width: i32, pt_height: i32,
     on_screen: i32,
+    layer: i32,
+    z_order: i32,
     title: [c_char; TITLE_CAP],
     app: [c_char; APP_CAP],
 }
@@ -42,7 +44,7 @@ struct BhcWindowInfo {
 impl Default for BhcWindowInfo {
     fn default() -> Self {
         Self { window_id: 0, x: 0, y: 0, pt_width: 0, pt_height: 0, on_screen: 0,
-               title: [0; TITLE_CAP], app: [0; APP_CAP] }
+               layer: 0, z_order: -1, title: [0; TITLE_CAP], app: [0; APP_CAP] }
     }
 }
 
@@ -180,6 +182,8 @@ impl Capturer for MacCapturer {
             app: cstr(&w.app),
             bounds: LogRect::new(w.x as f64, w.y as f64, w.pt_width as f64, w.pt_height as f64),
             on_screen: w.on_screen == 1,
+            layer: w.layer,
+            z_order: if w.z_order >= 0 { Some(w.z_order as u32) } else { None },
         }).collect();
         Ok(Targets { layout, windows })
     }

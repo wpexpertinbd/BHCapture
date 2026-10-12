@@ -9,11 +9,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use bhcapture_capture::{macos::MacCapturer, CaptureError, Capturer};
+use bhcapture_capture::{macos::MacCapturer, CaptureError, Capturer, Snapshot};
 use bhcapture_core::geom::{DisplayId, DisplayLayout, LogPoint, LogRect};
 use bhcapture_core::image::Frame;
 use bhcapture_core::naming::{Fields, Pattern, Stamp, unique_path};
 use bhcapture_core::settings::{LoadOutcome, Settings, SettingsStore};
+use bhcapture_core::snap::{snap_window, Candidate};
+use base64::Engine;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri_plugin_dialog::DialogExt;
 use global_hotkey::{hotkey::{Code, HotKey, Modifiers}, GlobalHotKeyEvent, GlobalHotKeyManager};
 use serde::Serialize;
@@ -32,6 +35,16 @@ struct AppState {
     /// Refreshed on display reconfiguration, not per capture.
     layout: Mutex<DisplayLayout>,
     drag: Mutex<Option<Drag>>,
+    /// Frozen copy of every display, taken when the selector opens. Feeds the magnifier and the
+    /// final crop, so the file holds exactly what the user saw while selecting.
+    snapshot: Mutex<Option<Arc<Snapshot>>>,
+    /// Windows the pointer can snap to, in front-to-back order.
+    cands: Mutex<Vec<Candidate>>,
+    /// CGWindowIDs of our own overlays, never offered as snap targets.
+    overlay_ids: Mutex<Vec<u32>>,
+    /// Bumped each time the selector opens or closes, so a slow snapshot thread from a selector
+    /// the user already dismissed cannot land its result on the next one.
+    epoch: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -172,6 +185,92 @@ fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Release the frozen frames (tens of MB on a Retina panel) and invalidate in-flight work.
+fn release_frozen(state: &AppState) {
+    state.epoch.fetch_add(1, Ordering::SeqCst);
+    *state.snapshot.lock().unwrap() = None;
+    state.cands.lock().unwrap().clear();
+}
+
+/// The one way the selector opens, so the hotkey, the tray and the tests behave identically.
+fn open_selector(app: &tauri::AppHandle) {
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    *state.drag.lock().unwrap() = None;
+    release_frozen(&state);
+    let epoch = state.epoch.load(Ordering::SeqCst);
+    broadcast(app, None);
+    show_overlays(app); // appear first: the freeze happens behind an already-visible overlay
+
+    // Two independent jobs, each discarded if the selector has since closed or reopened.
+    let st = state.clone();
+    std::thread::spawn(move || {
+        let layout = st.layout.lock().unwrap().clone();
+        match Snapshot::take(&st.capturer, &layout) {
+            Ok(snap) if st.epoch.load(Ordering::SeqCst) == epoch => {
+                *st.snapshot.lock().unwrap() = Some(Arc::new(snap));
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[warn] could not freeze the screen ({e}); the magnifier is off and capture will be live"),
+        }
+    });
+    let st = state.clone();
+    std::thread::spawn(move || {
+        match st.capturer.list_targets() {
+            Ok(t) if st.epoch.load(Ordering::SeqCst) == epoch => {
+                let own = st.overlay_ids.lock().unwrap().clone();
+                let cands: Vec<Candidate> = t.windows.iter()
+                    .filter(|w| !own.contains(&(w.id.0 as u32)))
+                    .map(|w| Candidate { bounds: w.bounds, layer: w.layer, z: w.z_order })
+                    .collect();
+                *st.cands.lock().unwrap() = cands;
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[warn] could not list windows ({e}); snap-to-window is off"),
+        }
+    });
+}
+
+/// The window under the pointer, if any, for the highlight.
+#[tauri::command]
+fn snap_at(state: tauri::State<Arc<AppState>>, x: f64, y: f64) -> Option<[f64; 4]> {
+    let layout = state.layout.lock().unwrap();
+    let cands = state.cands.lock().unwrap();
+    snap_window(&cands, &layout, LogPoint::new(x, y))
+        .map(|r| [r.min_x(), r.min_y(), r.size.w, r.size.h])
+}
+
+#[derive(Serialize)]
+struct Loupe {
+    /// Side length in physical pixels.
+    size: u32,
+    /// Physical pixels per logical point on the display under the pointer.
+    scale: f64,
+    /// Tightly packed RGBA8, base64. 21x21 is ~1.7 KB, far cheaper than shipping JSON arrays.
+    rgba: String,
+}
+
+/// Pixels around the pointer for the magnifier. `None` until the snapshot is ready, which the UI
+/// treats as "not available yet", not as an error.
+#[tauri::command]
+fn loupe(state: tauri::State<Arc<AppState>>, x: f64, y: f64) -> Option<Loupe> {
+    let snap = state.snapshot.lock().unwrap().clone()?;
+    let f = snap.loupe(LogPoint::new(x, y), 10)?;
+    Some(Loupe {
+        size: f.width(),
+        scale: f.scale().get(),
+        rgba: base64::engine::general_purpose::STANDARD.encode(f.to_rgba8()),
+    })
+}
+
+/// Select a whole rectangle in one step (a click on a snapped window). The corner that nudge moves
+/// is the bottom-right, so the result can still be fine-tuned with the arrow keys.
+#[tauri::command]
+fn selection_set_rect(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, x: f64, y: f64, w: f64, h: f64) {
+    let (a, b) = (LogPoint::new(x, y), LogPoint::new(x + w, y + h));
+    *state.drag.lock().unwrap() = Some(Drag { anchor: a, cursor: b });
+    broadcast(&app, Some(LogRect::from_corners(a, b)));
+}
+
 fn hide_overlays(app: &tauri::AppHandle) {
     for (label, w) in app.webview_windows() {
         if label.starts_with(OVERLAY_PREFIX) { let _ = w.hide(); }
@@ -181,6 +280,7 @@ fn hide_overlays(app: &tauri::AppHandle) {
 #[tauri::command]
 fn selection_cancel(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>) {
     *state.drag.lock().unwrap() = None;
+    release_frozen(&state);
     broadcast(&app, None);
     hide_overlays(&app);
 }
@@ -277,8 +377,18 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Resul
     broadcast(app, None);
     hide_overlays(app);
 
-    let layout = state.layout.lock().unwrap().clone();
-    let frame = state.capturer.capture_region_in(rect, &layout).map_err(|e| match e {
+    // Prefer the frozen frames: the file then holds exactly what the user saw while selecting.
+    // Falls back to a live capture if the freeze had not finished or failed.
+    let frozen = state.snapshot.lock().unwrap().clone();
+    release_frozen(state);
+    let cropped = match &frozen {
+        Some(snap) => snap.capture_region_in(rect, snap.layout()),
+        None => {
+            let layout = state.layout.lock().unwrap().clone();
+            state.capturer.capture_region_in(rect, &layout)
+        }
+    };
+    let frame = cropped.map_err(|e| match e {
         CaptureError::PermissionDenied =>
             "Screen Recording is not granted. Allow it in System Settings, then RELAUNCH BHCapture \
              — a running app never sees a new grant.".to_string(),
@@ -354,6 +464,10 @@ fn main() {
         settings: Mutex::new(store),
         layout: Mutex::new(layout),
         drag: Mutex::new(None),
+        snapshot: Mutex::new(None),
+        cands: Mutex::new(Vec::new()),
+        overlay_ids: Mutex::new(Vec::new()),
+        epoch: AtomicU64::new(0),
     });
     apply_settings(&state);
 
@@ -363,6 +477,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             overlay_info, selection_begin, selection_update,
             selection_nudge, selection_cancel, selection_commit,
+            snap_at, loupe, selection_set_rect,
             settings_get, settings_save, settings_pick_dir, open_settings
         ])
         .setup(move |app| {
@@ -394,6 +509,7 @@ fn main() {
                     if id != 0 { overlay_ids.push(id); }
                 }
             }
+            *state.overlay_ids.lock().unwrap() = overlay_ids.clone();
             state.capturer.set_excluded_windows(overlay_ids);
 
             // Tray: without it there is no way to reach settings, since every window is an
@@ -410,18 +526,11 @@ fn main() {
                 .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(true)
-                .on_menu_event({
-                    let st = state.clone();
-                    move |app, ev| match ev.id().as_ref() {
-                        "capture" => {
-                            *st.drag.lock().unwrap() = None;
-                            broadcast(app, None);
-                            show_overlays(app);
-                        }
-                        "settings" => { let _ = open_settings(app.clone()); }
-                        "quit" => app.exit(0),
-                        _ => {}
-                    }
+                .on_menu_event(move |app, ev| match ev.id().as_ref() {
+                    "capture" => open_selector(app),
+                    "settings" => { let _ = open_settings(app.clone()); }
+                    "quit" => app.exit(0),
+                    _ => {}
                 })
                 .build(app)?;
             // Keep the TrayIcon alive: dropping it removes the icon from the menu bar.
@@ -434,16 +543,92 @@ fn main() {
             std::mem::forget(manager); // must outlive setup()
             println!("BHCapture ready. Region capture: Cmd+Shift+Ctrl+4");
 
-            let (h, st) = (handle.clone(), state.clone());
+            let h = handle.clone();
             std::thread::spawn(move || {
                 let rx = GlobalHotKeyEvent::receiver();
                 while let Ok(ev) = rx.recv() {
                     if ev.state != global_hotkey::HotKeyState::Pressed { continue; }
-                    *st.drag.lock().unwrap() = None;
-                    broadcast(&h, None);
-                    show_overlays(&h);
+                    open_selector(&h);
                 }
             });
+            #[cfg(feature = "demo")]
+            {
+            if std::env::args().any(|a| a == "--demo-snap") {
+                let (h, st) = (handle.clone(), state.clone());
+                std::thread::spawn(move || {
+                    // Synthetic POINTER only: the events go into the real overlay webview, so the
+                    // real React handlers, IPC and Rust commands all run. Nobody can move a
+                    // physical mouse on the harness's behalf.
+                    let js = |t: &str, x: f64, y: f64| format!(
+                        "(()=>{{const el=document.elementFromPoint({x},{y})||document.body;\
+                         el.dispatchEvent(new MouseEvent('{t}',{{bubbles:true,cancelable:true,\
+                         clientX:{x},clientY:{y},button:0}}));}})()");
+                    let wait_ready = |st: &Arc<AppState>| {
+                        let t0 = std::time::Instant::now();
+                        let (mut a, mut b) = (None, None);
+                        while t0.elapsed() < std::time::Duration::from_secs(5) {
+                            if a.is_none() && st.snapshot.lock().unwrap().is_some() { a = Some(t0.elapsed().as_millis()); }
+                            if b.is_none() && !st.cands.lock().unwrap().is_empty() { b = Some(t0.elapsed().as_millis()); }
+                            if a.is_some() && b.is_some() { break; }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        println!("[snap] frozen after {a:?} ms, window list after {b:?} ms (from overlay shown)");
+                    };
+                    let rect_of = |st: &Arc<AppState>| st.drag.lock().unwrap().map(|d| {
+                        let r = d.rect(); (r.min_x(), r.min_y(), r.size.w, r.size.h) });
+
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    open_selector(&h);
+                    wait_ready(&st);
+                    let w = h.get_webview_window("overlay-1").expect("overlay-1");
+
+                    // --- hover: the highlight + loupe ---
+                    let (hx, hy) = (676.0, 450.0);
+                    let _ = w.eval(&js("mousemove", hx, hy));
+                    std::thread::sleep(std::time::Duration::from_millis(700));
+                    {
+                        let layout = st.layout.lock().unwrap().clone();
+                        let cands = st.cands.lock().unwrap().clone();
+                        println!("[snap] {} candidate windows; snap at ({hx},{hy}) = {:?}",
+                            cands.len(), snap_window(&cands, &layout, LogPoint::new(hx, hy)));
+                    }
+                    println!("[snap] HOLD-HOVER");
+                    std::thread::sleep(std::time::Duration::from_millis(5500));
+
+                    // --- click on the highlighted window ---
+                    let _ = w.eval(&js("mousedown", hx, hy));
+                    let _ = w.eval(&js("mouseup", hx, hy));
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    println!("[snap] after a CLICK, selection = {:?}", rect_of(&st));
+                    match commit(&h, &st, false) {
+                        Ok(p) => println!("[snap] click-capture saved: {p}"),
+                        Err(e) => println!("[snap] click-capture FAILED {e}"),
+                    }
+
+                    // --- a drag must stay freeform ---
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    open_selector(&h);
+                    wait_ready(&st);
+                    let _ = w.eval(&js("mousedown", 200.0, 200.0));
+                    for i in 1..=8 {
+                        let (x, y) = (200.0 + 237.0 * i as f64 / 8.0, 200.0 + 161.0 * i as f64 / 8.0);
+                        let _ = w.eval(&js("mousemove", x, y));
+                        std::thread::sleep(std::time::Duration::from_millis(40));
+                    }
+                    let _ = w.eval(&js("mouseup", 437.0, 361.0));
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    println!("[snap] after a DRAG, selection = {:?}", rect_of(&st));
+                    println!("[snap] HOLD-DRAG");
+                    std::thread::sleep(std::time::Duration::from_millis(4500));
+                    match commit(&h, &st, false) {
+                        Ok(p) => println!("[snap] drag-capture saved: {p}"),
+                        Err(e) => println!("[snap] drag-capture FAILED {e}"),
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    h.exit(0);
+                });
+            }
+
             if std::env::args().any(|a| a == "--settings") {
                 let h = handle.clone();
                 std::thread::spawn(move || {
@@ -514,6 +699,7 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     h.exit(0);
                 });
+            }
             }
             Ok(())
         })

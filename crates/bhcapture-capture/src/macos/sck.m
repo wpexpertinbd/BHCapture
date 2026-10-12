@@ -171,6 +171,27 @@ int32_t bhc_list_displays(BhcDisplayInfo *out, int32_t cap, int32_t *n_out, char
     }
 }
 
+/* Front-to-back order and layer, from CGWindowListCopyWindowInfo.
+ *
+ * SCShareableContent documents NO ordering, so picking "the first window containing the point"
+ * from it can highlight a window that is actually hidden behind another. CGWindowList documents
+ * its result as front-to-back, which is what snap-to-window needs. Layer and order are not
+ * permission-gated (only window NAMES are), so this works even before a grant. */
+static void bhc_window_order(NSMutableDictionary<NSNumber *, NSNumber *> *z,
+                             NSMutableDictionary<NSNumber *, NSNumber *> *layer) {
+    CFArrayRef list = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (!list) return;
+    NSArray *arr = CFBridgingRelease(list);
+    NSInteger i = 0;
+    for (NSDictionary *d in arr) {
+        NSNumber *num = d[(id)kCGWindowNumber];
+        NSNumber *lyr = d[(id)kCGWindowLayer];
+        if (num) { z[num] = @(i); if (lyr) layer[num] = lyr; }
+        i++;
+    }
+}
+
 int32_t bhc_list_windows(BhcWindowInfo *out, int32_t cap, int32_t *n_out, char *err, int32_t errcap) {
     @autoreleasepool {
         *n_out = 0;
@@ -184,10 +205,17 @@ int32_t bhc_list_windows(BhcWindowInfo *out, int32_t cap, int32_t *n_out, char *
             bhc_set_err(err, errcap, e ? e.localizedDescription : @"SCShareableContent returned nil");
             return bhc_classify(e);
         }
+        NSMutableDictionary<NSNumber *, NSNumber *> *zmap = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSNumber *, NSNumber *> *lmap = [NSMutableDictionary dictionary];
+        bhc_window_order(zmap, lmap);
+
         int32_t n = 0;
         for (SCWindow *w in content.windows) {
             if (n >= cap) break;
             CGRect f = w.frame;
+            NSNumber *key = @(w.windowID);
+            out[n].z_order = zmap[key] ? (int32_t)[zmap[key] integerValue] : -1;
+            out[n].layer = lmap[key] ? (int32_t)[lmap[key] integerValue] : (int32_t)w.windowLayer;
             out[n].window_id = (uint64_t)w.windowID;
             out[n].x = (int32_t)f.origin.x;   out[n].y = (int32_t)f.origin.y;
             out[n].pt_width = (int32_t)f.size.width;

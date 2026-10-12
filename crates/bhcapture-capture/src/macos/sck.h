@@ -35,6 +35,8 @@ typedef struct {
     int32_t  x, y;
     int32_t  pt_width, pt_height;
     int32_t  on_screen;            /* 0/1 */
+    int32_t  layer;                /* CGWindowLevel layer; 0 = ordinary app window */
+    int32_t  z_order;              /* front-to-back index among on-screen windows; -1 = not listed */
     char     title[BHC_TITLE_CAP];
     char     app[BHC_APP_CAP];
 } BhcWindowInfo;

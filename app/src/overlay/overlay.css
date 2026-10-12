@@ -62,3 +62,32 @@ html, body, #root {
   font: inherit; padding: 2px 5px; margin: 0 2px;
   border-radius: 4px; background: rgba(255, 255, 255, 0.16);
 }
+
+/* Snap-to-window: the window under the pointer. Accent outline + light tint, clearly different
+   from the white selection edge so "what I would click" never reads as "what I selected". */
+.snap {
+  position: fixed;
+  outline: 2px solid #4f8cff;
+  outline-offset: -1px;
+  background: rgba(79, 140, 255, 0.14);
+  pointer-events: none;
+}
+.snap-readout { background: rgba(35, 70, 150, 0.95); }
+
+/* Magnifier */
+.loupe {
+  position: fixed;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #16161a;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.4), 0 6px 22px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+.loupe canvas { display: block; image-rendering: pixelated; }
+.loupe-meta {
+  display: flex; justify-content: space-between; gap: 8px;
+  padding: 5px 8px;
+  color: #fff;
+  font: 500 11px/1.3 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.loupe-meta .px { color: rgba(255, 255, 255, 0.55); }
