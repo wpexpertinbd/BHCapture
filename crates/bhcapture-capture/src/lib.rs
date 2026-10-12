@@ -37,9 +37,18 @@ pub struct Targets {
 }
 
 pub trait Capturer {
-    /// Everything capturable right now. Backends should treat this as cheap enough to call on
-    /// each capture, but callers that re-read it in a loop should cache and refresh on display
-    /// reconfiguration instead.
+    /// Just the displays.
+    ///
+    /// Separate from [`list_targets`](Capturer::list_targets) because enumerating windows is the
+    /// expensive half and a region capture needs none of it. Measured warm on macOS 27 with 91
+    /// windows open: `list_displays` ~29 ms, `list_targets` ~61 ms, so window enumeration adds
+    /// ~31 ms the hotkey path would otherwise pay and discard. (`examples/listcost.rs`.)
+    ///
+    /// ⚠️ ~29 ms is still too slow to sit on a hotkey, so the overlay should hold a cached layout
+    /// and use [`capture_region_in`](Capturer::capture_region_in) rather than listing per capture.
+    fn list_displays(&self) -> Result<DisplayLayout, CaptureError>;
+
+    /// Everything capturable right now, displays and windows.
     fn list_targets(&self) -> Result<Targets, CaptureError>;
 
     /// One whole display, in its own physical pixels.
@@ -61,7 +70,7 @@ pub trait Capturer {
         if region.is_empty() {
             return Err(CaptureError::RegionEmpty);
         }
-        let layout = self.list_targets()?.layout;
+        let layout = self.list_displays()?;
         let out = layout
             .preferred_output_scale(region)
             .ok_or(CaptureError::RegionOffScreen)?;
@@ -75,6 +84,32 @@ pub trait Capturer {
             return Err(CaptureError::RegionOffScreen);
         }
 
+        let mut canvas = Frame::transparent(whole.size.w, whole.size.h, out).map_err(CaptureError::Frame)?;
+        for p in pieces {
+            let src = self.capture_display(p.display)?;
+            canvas.blit(p.dest, &src, p.source);
+        }
+        Ok(canvas)
+    }
+
+    /// [`capture_region`](Capturer::capture_region) against a layout the caller already holds.
+    ///
+    /// The overlay knows the layout — it created one window per display from it — so re-reading
+    /// it on every capture is wasted latency on the path where latency is most visible. The
+    /// caller owns refreshing it on display reconfiguration.
+    fn capture_region_in(&self, region: LogRect, layout: &DisplayLayout) -> Result<Frame, CaptureError> {
+        if region.is_empty() {
+            return Err(CaptureError::RegionEmpty);
+        }
+        let out = layout.preferred_output_scale(region).ok_or(CaptureError::RegionOffScreen)?;
+        let whole = region.to_physical(out);
+        if whole.is_empty() {
+            return Err(CaptureError::RegionEmpty);
+        }
+        let pieces = layout.split_region(region, out);
+        if pieces.is_empty() {
+            return Err(CaptureError::RegionOffScreen);
+        }
         let mut canvas = Frame::transparent(whole.size.w, whole.size.h, out).map_err(CaptureError::Frame)?;
         for p in pieces {
             let src = self.capture_display(p.display)?;

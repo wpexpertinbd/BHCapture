@@ -20,10 +20,18 @@ struct Fake {
     pixels: HashMap<DisplayId, [u8; 4]>,
     fail_with: Option<fn() -> CaptureError>,
     calls: RefCell<Vec<DisplayId>>,
+    /// Counts the EXPENSIVE listing (windows included), so a test can prove the region path
+    /// never pays for window enumeration it throws away.
+    target_listings: RefCell<u32>,
 }
 
 impl Capturer for Fake {
+    fn list_displays(&self) -> Result<DisplayLayout, CaptureError> {
+        if let Some(f) = self.fail_with { return Err(f()); }
+        Ok(self.targets.layout.clone())
+    }
     fn list_targets(&self) -> Result<Targets, CaptureError> {
+        *self.target_listings.borrow_mut() += 1;
         if let Some(f) = self.fail_with { return Err(f()); }
         Ok(self.targets.clone())
     }
@@ -51,6 +59,7 @@ fn fake() -> Fake {
         pixels: HashMap::from([(DisplayId(1), RED), (DisplayId(2), BLUE)]),
         fail_with: None,
         calls: RefCell::new(Vec::new()),
+        target_listings: RefCell::new(0),
     }
 }
 
@@ -138,4 +147,26 @@ fn permission_denied_propagates_unchanged_and_is_not_retryable() {
     // Retrying cannot help: a running process never sees a new Screen Recording grant (Phase 0a).
     assert!(!err.is_retryable());
     assert!(CaptureError::Backend("transient".into()).is_retryable());
+}
+
+#[test]
+fn region_capture_never_enumerates_windows() {
+    let f = fake();
+    f.capture_region(LogRect::new(-50.0, 0.0, 100.0, 50.0)).unwrap();
+    assert_eq!(*f.target_listings.borrow(), 0,
+        "capture_region must use list_displays -- window enumeration adds ~31ms (measured warm, \
+         91 windows) and a region capture discards all of it");
+}
+
+#[test]
+fn capture_region_in_reuses_a_caller_held_layout() {
+    let f = fake();
+    let layout = f.list_displays().unwrap();
+    let a = f.capture_region_in(LogRect::new(-50.0, 0.0, 100.0, 50.0), &layout).unwrap();
+    let b = f.capture_region(LogRect::new(-50.0, 0.0, 100.0, 50.0)).unwrap();
+    // Identical result, one fewer enumeration -- the overlay already holds the layout.
+    assert_eq!((a.width(), a.height()), (b.width(), b.height()));
+    assert_eq!(a.scale().get(), b.scale().get());
+    assert_eq!(a.bytes(), b.bytes());
+    assert_eq!(*f.target_listings.borrow(), 0);
 }

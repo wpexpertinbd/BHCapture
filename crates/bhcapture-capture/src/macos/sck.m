@@ -1,0 +1,289 @@
+#import <Foundation/Foundation.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <string.h>
+#import "sck.h"
+
+/* Every async entry point blocks on a semaphore WITH A TIMEOUT. Without it a missing TCC grant
+ * can leave the completion handler un-called forever, which presents as a frozen app rather
+ * than an error -- the silent failure mode Phase 0a was built to find. */
+static const int64_t kBhcTimeoutNs = 5LL * NSEC_PER_SEC;
+
+/* SCStreamErrorUserDeclined. Matching on the code, not on the message text, because the
+ * message is localised and not API. */
+static const NSInteger kSCUserDeclined = -3801;
+
+static void bhc_set_err(char *err, int32_t errcap, NSString *msg) {
+    if (!err || errcap <= 0) return;
+    const char *c = msg ? [msg UTF8String] : NULL;
+    if (!c) c = "unknown error";
+    strncpy(err, c, (size_t)errcap - 1);
+    err[(size_t)errcap - 1] = '\0';
+}
+
+static void bhc_copy_str(char *dst, size_t cap, NSString *s) {
+    dst[0] = '\0';
+    if (!s) return;
+    const char *c = [s UTF8String];
+    if (!c) return;
+    strncpy(dst, c, cap - 1);
+    dst[cap - 1] = '\0';
+}
+
+static int32_t bhc_classify(NSError *e) {
+    if (e && e.code == kSCUserDeclined) return BHC_ERR_PERMISSION;
+    return BHC_ERR_GENERIC;
+}
+
+int32_t bhc_preflight_permission(void) { return CGPreflightScreenCaptureAccess() ? 1 : 0; }
+int32_t bhc_request_permission(void)   { return CGRequestScreenCaptureAccess()  ? 1 : 0; }
+
+static SCShareableContent *bhc_fetch_content(NSError **errOut) {
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block SCShareableContent *result = nil;
+    __block NSError *blockErr = nil;
+
+    [SCShareableContent getShareableContentExcludingDesktopWindows:YES
+                                               onScreenWindowsOnly:NO
+                                                 completionHandler:^(SCShareableContent *c, NSError *e) {
+        result = c; blockErr = e;
+        dispatch_semaphore_signal(sem);
+    }];
+
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, kBhcTimeoutNs)) != 0) {
+        if (errOut) {
+            *errOut = [NSError errorWithDomain:@"com.biswashost.bhcapture" code:-1000 userInfo:@{
+                NSLocalizedDescriptionKey: @"timed out waiting for SCShareableContent (5s)"}];
+        }
+        return nil;
+    }
+    if (errOut) *errOut = blockErr;
+    return result;
+}
+
+static void bhc_physical_size(CGDirectDisplayID did, int32_t *pw, int32_t *ph) {
+    *pw = 0; *ph = 0;
+    CGDisplayModeRef mode = CGDisplayCopyDisplayMode(did);
+    if (mode) {
+        *pw = (int32_t)CGDisplayModeGetPixelWidth(mode);
+        *ph = (int32_t)CGDisplayModeGetPixelHeight(mode);
+        CGDisplayModeRelease(mode);
+    }
+}
+
+static double bhc_display_scale(SCDisplay *d) {
+    int32_t pw = 0, ph = 0;
+    bhc_physical_size(d.displayID, &pw, &ph);
+    (void)ph;
+    double pts = (double)d.width;
+    if (pts <= 0.0 || pw <= 0) return 1.0;
+    return (double)pw / pts;
+}
+
+/* CGImage -> owned, tightly-strided BGRA8. */
+static int32_t bhc_cgimage_to_bgra(CGImageRef img, double scale, BhcImage *out, char *err, int32_t errcap) {
+    size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
+    if (w == 0 || h == 0) { bhc_set_err(err, errcap, @"captured image has zero size"); return BHC_ERR_GENERIC; }
+
+    size_t stride = w * 4;
+    uint8_t *buf = (uint8_t *)calloc(h, stride);
+    if (!buf) { bhc_set_err(err, errcap, @"out of memory"); return BHC_ERR_GENERIC; }
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    /* PremultipliedFirst + 32Little == B,G,R,A byte order in memory. */
+    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, stride, cs,
+        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+    CGColorSpaceRelease(cs);
+    if (!ctx) { free(buf); bhc_set_err(err, errcap, @"CGBitmapContextCreate failed"); return BHC_ERR_GENERIC; }
+
+    CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
+    CGContextRelease(ctx);
+
+    out->data = buf; out->width = (int32_t)w; out->height = (int32_t)h;
+    out->stride = (int32_t)stride; out->scale = scale;
+    return BHC_OK;
+}
+
+/* Shared capture path. Caller supplies the filter and the pixel dimensions it wants. */
+static int32_t bhc_shoot(SCContentFilter *filter, size_t px_w, size_t px_h, double scale,
+                         BhcImage *out, char *err, int32_t errcap) API_AVAILABLE(macos(14.0)) {
+    SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
+    cfg.width = px_w;
+    cfg.height = px_h;
+    cfg.pixelFormat = 'BGRA';
+    cfg.showsCursor = NO;
+    cfg.capturesAudio = NO;
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block CGImageRef img = NULL;
+    __block NSError *shotErr = nil;
+
+    [SCScreenshotManager captureImageWithFilter:filter configuration:cfg
+                              completionHandler:^(CGImageRef sampled, NSError *e) {
+        if (sampled) img = CGImageRetain(sampled);   /* must outlive the block */
+        shotErr = e;
+        dispatch_semaphore_signal(sem);
+    }];
+
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, kBhcTimeoutNs)) != 0) {
+        bhc_set_err(err, errcap, @"timed out waiting for SCScreenshotManager (5s)");
+        return BHC_ERR_GENERIC;
+    }
+    if (!img) {
+        bhc_set_err(err, errcap, shotErr ? shotErr.localizedDescription : @"captureImage returned no image");
+        return bhc_classify(shotErr);
+    }
+
+    int32_t rc = bhc_cgimage_to_bgra(img, scale, out, err, errcap);
+    CGImageRelease(img);
+    return rc;
+}
+
+int32_t bhc_list_displays(BhcDisplayInfo *out, int32_t cap, int32_t *n_out, char *err, int32_t errcap) {
+    @autoreleasepool {
+        *n_out = 0;
+        if (!CGPreflightScreenCaptureAccess()) {
+            bhc_set_err(err, errcap, @"Screen Recording not granted");
+            return BHC_ERR_PERMISSION;
+        }
+        NSError *e = nil;
+        SCShareableContent *content = bhc_fetch_content(&e);
+        if (!content) {
+            bhc_set_err(err, errcap, e ? e.localizedDescription : @"SCShareableContent returned nil");
+            return bhc_classify(e);
+        }
+        int32_t n = 0;
+        for (SCDisplay *d in content.displays) {
+            if (n >= cap) break;
+            CGRect f = d.frame;
+            out[n].display_id = (uint32_t)d.displayID;
+            out[n].x = (int32_t)f.origin.x;    out[n].y = (int32_t)f.origin.y;
+            out[n].pt_width = (int32_t)f.size.width;
+            out[n].pt_height = (int32_t)f.size.height;
+            bhc_physical_size(d.displayID, &out[n].px_width, &out[n].px_height);
+            n++;
+        }
+        *n_out = n;
+        return BHC_OK;
+    }
+}
+
+int32_t bhc_list_windows(BhcWindowInfo *out, int32_t cap, int32_t *n_out, char *err, int32_t errcap) {
+    @autoreleasepool {
+        *n_out = 0;
+        if (!CGPreflightScreenCaptureAccess()) {
+            bhc_set_err(err, errcap, @"Screen Recording not granted");
+            return BHC_ERR_PERMISSION;
+        }
+        NSError *e = nil;
+        SCShareableContent *content = bhc_fetch_content(&e);
+        if (!content) {
+            bhc_set_err(err, errcap, e ? e.localizedDescription : @"SCShareableContent returned nil");
+            return bhc_classify(e);
+        }
+        int32_t n = 0;
+        for (SCWindow *w in content.windows) {
+            if (n >= cap) break;
+            CGRect f = w.frame;
+            out[n].window_id = (uint64_t)w.windowID;
+            out[n].x = (int32_t)f.origin.x;   out[n].y = (int32_t)f.origin.y;
+            out[n].pt_width = (int32_t)f.size.width;
+            out[n].pt_height = (int32_t)f.size.height;
+            out[n].on_screen = w.isOnScreen ? 1 : 0;
+            bhc_copy_str(out[n].title, BHC_TITLE_CAP, w.title);
+            bhc_copy_str(out[n].app, BHC_APP_CAP, w.owningApplication.applicationName);
+            n++;
+        }
+        *n_out = n;
+        return BHC_OK;
+    }
+}
+
+int32_t bhc_capture_display(uint32_t display_id, BhcImage *out, char *err, int32_t errcap) {
+    @autoreleasepool {
+        if (!out) { bhc_set_err(err, errcap, @"null out param"); return BHC_ERR_GENERIC; }
+        memset(out, 0, sizeof(*out));
+        if (!CGPreflightScreenCaptureAccess()) {
+            bhc_set_err(err, errcap, @"Screen Recording not granted");
+            return BHC_ERR_PERMISSION;
+        }
+        if (@available(macOS 14.0, *)) {
+            NSError *e = nil;
+            SCShareableContent *content = bhc_fetch_content(&e);
+            if (!content) {
+                bhc_set_err(err, errcap, e ? e.localizedDescription : @"SCShareableContent returned nil");
+                return bhc_classify(e);
+            }
+            SCDisplay *target = nil;
+            for (SCDisplay *d in content.displays) {
+                if ((uint32_t)d.displayID == display_id) { target = d; break; }
+            }
+            if (!target) { bhc_set_err(err, errcap, @"display not found"); return BHC_ERR_NOT_FOUND; }
+
+            int32_t pw = 0, ph = 0;
+            bhc_physical_size(target.displayID, &pw, &ph);
+            if (pw <= 0 || ph <= 0) { pw = (int32_t)target.width; ph = (int32_t)target.height; }
+
+            SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:target excludingWindows:@[]];
+            return bhc_shoot(filter, (size_t)pw, (size_t)ph, bhc_display_scale(target), out, err, errcap);
+        } else {
+            bhc_set_err(err, errcap, @"needs macOS 14+ (SCScreenshotManager)");
+            return BHC_ERR_UNSUPPORTED;
+        }
+    }
+}
+
+int32_t bhc_capture_window(uint64_t window_id, BhcImage *out, char *err, int32_t errcap) {
+    @autoreleasepool {
+        if (!out) { bhc_set_err(err, errcap, @"null out param"); return BHC_ERR_GENERIC; }
+        memset(out, 0, sizeof(*out));
+        if (!CGPreflightScreenCaptureAccess()) {
+            bhc_set_err(err, errcap, @"Screen Recording not granted");
+            return BHC_ERR_PERMISSION;
+        }
+        if (@available(macOS 14.0, *)) {
+            NSError *e = nil;
+            SCShareableContent *content = bhc_fetch_content(&e);
+            if (!content) {
+                bhc_set_err(err, errcap, e ? e.localizedDescription : @"SCShareableContent returned nil");
+                return bhc_classify(e);
+            }
+            SCWindow *target = nil;
+            for (SCWindow *w in content.windows) {
+                if ((uint64_t)w.windowID == window_id) { target = w; break; }
+            }
+            if (!target) { bhc_set_err(err, errcap, @"window not found"); return BHC_ERR_NOT_FOUND; }
+
+            /* A window must be captured at ITS OWN display's scale, otherwise dragging a window
+             * to a 1x monitor silently yields a half-resolution capture. Pick the display whose
+             * frame contains the window centre; fall back to the largest scale present. */
+            CGRect wf = target.frame;
+            CGPoint centre = CGPointMake(CGRectGetMidX(wf), CGRectGetMidY(wf));
+            double scale = 0.0;
+            for (SCDisplay *d in content.displays) {
+                if (CGRectContainsPoint(d.frame, centre)) { scale = bhc_display_scale(d); break; }
+            }
+            if (scale <= 0.0) {
+                for (SCDisplay *d in content.displays) {
+                    double s = bhc_display_scale(d);
+                    if (s > scale) scale = s;
+                }
+            }
+            if (scale <= 0.0) scale = 1.0;
+
+            size_t pw = (size_t)llround(wf.size.width  * scale);
+            size_t ph = (size_t)llround(wf.size.height * scale);
+            if (pw == 0 || ph == 0) { bhc_set_err(err, errcap, @"window has zero size"); return BHC_ERR_GENERIC; }
+
+            SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:target];
+            return bhc_shoot(filter, pw, ph, scale, out, err, errcap);
+        } else {
+            bhc_set_err(err, errcap, @"needs macOS 14+ (SCScreenshotManager)");
+            return BHC_ERR_UNSUPPORTED;
+        }
+    }
+}
+
+void bhc_image_free(BhcImage *img) {
+    if (img && img->data) { free(img->data); img->data = NULL; }
+}
