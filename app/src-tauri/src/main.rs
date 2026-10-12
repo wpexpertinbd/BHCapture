@@ -13,15 +13,21 @@ use bhcapture_capture::{macos::MacCapturer, CaptureError, Capturer};
 use bhcapture_core::geom::{DisplayId, DisplayLayout, LogPoint, LogRect};
 use bhcapture_core::image::Frame;
 use bhcapture_core::naming::{Fields, Pattern, Stamp, unique_path};
+use bhcapture_core::settings::{LoadOutcome, Settings, SettingsStore};
 use tauri_plugin_dialog::DialogExt;
 use global_hotkey::{hotkey::{Code, HotKey, Modifiers}, GlobalHotKeyEvent, GlobalHotKeyManager};
 use serde::Serialize;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
 
 const OVERLAY_PREFIX: &str = "overlay-";
 
+const SETTINGS_WINDOW: &str = "settings";
+
 struct AppState {
     capturer: MacCapturer,
+    settings: Mutex<SettingsStore>,
     /// Cached so the hotkey path never pays ~29 ms to re-enumerate displays.
     /// Refreshed on display reconfiguration, not per capture.
     layout: Mutex<DisplayLayout>,
@@ -104,6 +110,68 @@ fn selection_nudge(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, dx
     }
 }
 
+#[derive(Serialize, Clone)]
+struct SettingsView {
+    settings: Settings,
+    /// Resolved default, so the UI can show what "default" actually means rather than blank.
+    default_dir: String,
+    path: String,
+    /// False when the on-disk file could not be read. The UI must say so and must not pretend a
+    /// save succeeded.
+    writable: bool,
+    notice: Option<String>,
+}
+
+fn settings_view(state: &AppState, notice: Option<String>) -> SettingsView {
+    let st = state.settings.lock().unwrap();
+    SettingsView {
+        settings: st.get().clone(),
+        default_dir: default_capture_dir().display().to_string(),
+        path: st.path().display().to_string(),
+        writable: st.is_writable(),
+        notice,
+    }
+}
+
+#[tauri::command]
+fn settings_get(state: tauri::State<Arc<AppState>>) -> SettingsView {
+    settings_view(&state, None)
+}
+
+#[tauri::command]
+fn settings_save(state: tauri::State<Arc<AppState>>, next: Settings) -> Result<SettingsView, String> {
+    let repaired = { state.settings.lock().unwrap().set(next) };
+    // Report a refused save honestly rather than letting the UI claim it worked.
+    state.settings.lock().unwrap().save().map_err(|e| e.to_string())?;
+    apply_settings(&state);
+    let notice = if repaired.is_empty() { None } else { Some(repaired.join("; ")) };
+    Ok(settings_view(&state, notice))
+}
+
+/// Native folder picker for the output directory.
+#[tauri::command]
+async fn settings_pick_dir(app: tauri::AppHandle) -> Option<String> {
+    app.dialog().file().set_title("Choose where captures are saved")
+        .blocking_pick_folder()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.display().to_string())
+}
+
+#[tauri::command]
+fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(SETTINGS_WINDOW) {
+        let _ = w.show();
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(&app, SETTINGS_WINDOW, WebviewUrl::App("index.html".into()))
+        .title("BHCapture Settings")
+        .inner_size(560.0, 620.0)
+        .resizable(true)
+        .build().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn hide_overlays(app: &tauri::AppHandle) {
     for (label, w) in app.webview_windows() {
         if label.starts_with(OVERLAY_PREFIX) { let _ = w.hide(); }
@@ -115,6 +183,21 @@ fn selection_cancel(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>) {
     *state.drag.lock().unwrap() = None;
     broadcast(&app, None);
     hide_overlays(&app);
+}
+
+/// `~/Library/Application Support/BHCapture/settings.json`.
+///
+/// A private file, not the Keychain (family rule): every new self-signed build looks like a
+/// different app to the Keychain, so it would prompt after every update.
+fn settings_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+    home.join("Library").join("Application Support").join("BHCapture").join("settings.json")
+}
+
+/// Push settings that the capture backend owns into it.
+fn apply_settings(state: &AppState) {
+    let s = state.settings.lock().unwrap();
+    state.capturer.set_show_cursor(s.get().include_cursor);
 }
 
 /// Default output folder: `~/Pictures/BHCapture`, created on demand.
@@ -204,31 +287,40 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Resul
 
     // The name is built from the pattern; `{title}`/`{app}` are untrusted window metadata, so
     // core sanitises them to a single path component (see bhcapture_core::naming).
-    let stem = Pattern::default().render(local_stamp(), &Fields {
+    let (pattern, out_dir, ask, clip) = {
+        let st = state.settings.lock().unwrap();
+        let s = st.get();
+        (Pattern::parse(&s.pattern).unwrap_or_default(),
+         s.output_dir.clone().unwrap_or_else(default_capture_dir),
+         s.always_ask_where_to_save,
+         s.copy_to_clipboard)
+    };
+    let stem = pattern.render(local_stamp(), &Fields {
         width: frame.width(), height: frame.height(), ..Default::default()
     });
 
-    let path = if save_as {
-        let start = default_capture_dir();
+    let path = if save_as || ask {
         app.dialog().file()
             .set_title("Save capture")
-            .set_directory(&start)
+            .set_directory(&out_dir)
             .set_file_name(format!("{stem}.png"))
             .add_filter("PNG image", &["png"])
             .blocking_save_file()
             .ok_or_else(|| "cancelled".to_string())?
             .into_path().map_err(|e| e.to_string())?
     } else {
-        let dir = default_capture_dir();
-        unique_path(&dir, &stem, "png", &|p| p.exists())
+        let _ = std::fs::create_dir_all(&out_dir);
+        unique_path(&out_dir, &stem, "png", &|p| p.exists())
     };
 
     write_png(&frame, &path)?;
 
     // Clipboard is a convenience on top of a file that already exists -- never fail the capture
     // for it, just say so.
-    if let Err(e) = copy_to_clipboard(&frame) {
-        eprintln!("[warn] capture saved but clipboard copy failed: {e}");
+    if clip {
+        if let Err(e) = copy_to_clipboard(&frame) {
+            eprintln!("[warn] capture saved but clipboard copy failed: {e}");
+        }
     }
     Ok(path.display().to_string())
 }
@@ -245,18 +337,33 @@ fn show_overlays(app: &tauri::AppHandle) {
 fn main() {
     let capturer = MacCapturer::new();
     let layout = capturer.list_displays().unwrap_or_default();
+
+    let (store, outcome) = SettingsStore::load(settings_path());
+    match &outcome {
+        LoadOutcome::Loaded { repaired } if !repaired.is_empty() =>
+            println!("[settings] repaired: {}", repaired.join("; ")),
+        LoadOutcome::Missing => println!("[settings] none yet; using defaults"),
+        LoadOutcome::Unreadable(why) => eprintln!(
+            "[settings] UNREADABLE ({why}). Running on defaults and REFUSING to save, so the \
+             existing file is not destroyed. Fix or move {} and restart.", settings_path().display()),
+        _ => {}
+    }
+
     let state = Arc::new(AppState {
         capturer,
+        settings: Mutex::new(store),
         layout: Mutex::new(layout),
         drag: Mutex::new(None),
     });
+    apply_settings(&state);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
             overlay_info, selection_begin, selection_update,
-            selection_nudge, selection_cancel, selection_commit
+            selection_nudge, selection_cancel, selection_commit,
+            settings_get, settings_save, settings_pick_dir, open_settings
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -289,6 +396,37 @@ fn main() {
             }
             state.capturer.set_excluded_windows(overlay_ids);
 
+            // Tray: without it there is no way to reach settings, since every window is an
+            // overlay that hides itself.
+            let cap_i = MenuItem::with_id(app, "capture", "Capture Region", true, Some("Cmd+Shift+Ctrl+4"))?;
+            let set_i = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
+            let quit_i = MenuItem::with_id(app, "quit", "Quit BHCapture", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&cap_i, &set_i, &quit_i])?;
+            let tray_img = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+            let tray = TrayIconBuilder::new()
+                .icon(tray_img)
+                // macOS recolours a template image with the rest of the menu bar; without this
+                // the glyph stays black and disappears in dark mode.
+                .icon_as_template(true)
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event({
+                    let st = state.clone();
+                    move |app, ev| match ev.id().as_ref() {
+                        "capture" => {
+                            *st.drag.lock().unwrap() = None;
+                            broadcast(app, None);
+                            show_overlays(app);
+                        }
+                        "settings" => { let _ = open_settings(app.clone()); }
+                        "quit" => app.exit(0),
+                        _ => {}
+                    }
+                })
+                .build(app)?;
+            // Keep the TrayIcon alive: dropping it removes the icon from the menu bar.
+            app.manage(tray);
+
             let manager = GlobalHotKeyManager::new()?;
             let hk = HotKey::new(
                 Some(Modifiers::SUPER | Modifiers::SHIFT | Modifiers::CONTROL), Code::Digit4);
@@ -306,6 +444,26 @@ fn main() {
                     show_overlays(&h);
                 }
             });
+            if std::env::args().any(|a| a == "--settings") {
+                let h = handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    let _ = open_settings(h.clone());
+                    std::thread::sleep(std::time::Duration::from_millis(900));
+                    if let Some(w) = h.get_webview_window(SETTINGS_WINDOW) {
+                        let _ = w.set_focus();
+                        #[cfg(target_os = "macos")]
+                        if let Ok(ptr) = w.ns_window() {
+                            // screencapture -l <id> grabs ONLY this window, so nothing can
+                            // overlap it however busy the desktop is.
+                            println!("[settings] CGWindowID={}", unsafe { bhcapture_capture::macos::cgwindow_id(ptr) });
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10000));
+                    h.exit(0);
+                });
+            }
+
             // --demo drives the REAL command path with no keyboard, so the overlay and the
             // self-exclusion can be verified without a human pressing a global hotkey.
             if std::env::args().any(|a| a == "--demo") {

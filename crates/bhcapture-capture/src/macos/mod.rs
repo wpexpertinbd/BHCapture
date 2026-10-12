@@ -61,7 +61,7 @@ extern "C" {
     fn bhc_request_permission() -> i32;
     fn bhc_list_displays(out: *mut BhcDisplayInfo, cap: i32, n: *mut i32, err: *mut c_char, errcap: i32) -> i32;
     fn bhc_list_windows(out: *mut BhcWindowInfo, cap: i32, n: *mut i32, err: *mut c_char, errcap: i32) -> i32;
-    fn bhc_capture_display(id: u32, exclude: *const u32, exclude_n: i32, out: *mut BhcImage, err: *mut c_char, errcap: i32) -> i32;
+    fn bhc_capture_display(id: u32, exclude: *const u32, exclude_n: i32, show_cursor: i32, out: *mut BhcImage, err: *mut c_char, errcap: i32) -> i32;
     fn bhc_cgwindow_id(nswindow: *mut c_void) -> u32;
     fn bhc_capture_window(id: u64, out: *mut BhcImage, err: *mut c_char, errcap: i32) -> i32;
     fn bhc_image_free(img: *mut BhcImage);
@@ -107,6 +107,9 @@ pub unsafe fn cgwindow_id(ptr: *mut c_void) -> u32 { bhc_cgwindow_id(ptr) }
 pub struct MacCapturer {
     /// CGWindowIDs left out of every display capture — our own overlay windows.
     excluded: Arc<Mutex<Vec<u32>>>,
+    /// Whether the pointer appears in captures. Off by default: most screenshots are of content,
+    /// not of where the pointer happened to be.
+    show_cursor: Arc<Mutex<bool>>,
 }
 
 impl MacCapturer {
@@ -116,6 +119,10 @@ impl MacCapturer {
     /// photographs itself.
     pub fn set_excluded_windows(&self, ids: Vec<u32>) {
         *self.excluded.lock().unwrap() = ids;
+    }
+
+    pub fn set_show_cursor(&self, on: bool) {
+        *self.show_cursor.lock().unwrap() = on;
     }
 
     /// Whether Screen Recording is granted. Never prompts.
@@ -181,8 +188,9 @@ impl Capturer for MacCapturer {
         let mut img = BhcImage::default();
         let mut err = [0 as c_char; ERRCAP as usize];
         let skip = self.excluded.lock().unwrap().clone();
+        let cursor = i32::from(*self.show_cursor.lock().unwrap());
         let rc = unsafe {
-            bhc_capture_display(id.0, skip.as_ptr(), skip.len() as i32, &mut img, err.as_mut_ptr(), ERRCAP)
+            bhc_capture_display(id.0, skip.as_ptr(), skip.len() as i32, cursor, &mut img, err.as_mut_ptr(), ERRCAP)
         };
         if rc != BHC_OK {
             return Err(classify(rc, &err, CaptureError::DisplayNotFound(id)));

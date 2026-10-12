@@ -8,3 +8,8 @@ description = "Portable core for BHCapture: coordinate math, image ops, naming, 
 
 # Pure portable Rust. NO Tauri, NO UI, NO platform discovery -- the shell injects every path.
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+serde_json = "1"

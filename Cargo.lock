@@ -149,6 +149,10 @@ dependencies = [
 [[package]]
 name = "bhcapture-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "bit-set"
@@ -3266,6 +3270,7 @@ dependencies = [
  "gtk",
  "heck 0.5.0",
  "http",
+ "image",
  "jni",
  "libc",
  "log",

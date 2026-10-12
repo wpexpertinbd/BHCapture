@@ -1,0 +1,96 @@
+/* Light/dark is three things (CLAUDE.md): CSS tokens, `color-scheme` for native widgets, and the
+   titlebar, which belongs to the OS and is set from Rust. This file covers the first two. */
+.settings {
+  --bg: #ffffff;
+  --fg: #1a1a1c;
+  --muted: #6b6b73;
+  --line: #e2e2e7;
+  --field-bg: #ffffff;
+  --accent: #2563eb;
+  --warn-bg: #fff4e5;
+  --warn-fg: #7a4100;
+  --warn-line: #f0c48a;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  .settings:not([data-theme="light"]) {
+    --bg: #1c1c1f; --fg: #ececf1; --muted: #9a9aa4; --line: #343438;
+    --field-bg: #262629; --accent: #5b8dff;
+    --warn-bg: #3a2a12; --warn-fg: #ffd9a0; --warn-line: #6b4a1c;
+    color-scheme: dark;
+  }
+}
+.settings[data-theme="dark"] {
+  --bg: #1c1c1f; --fg: #ececf1; --muted: #9a9aa4; --line: #343438;
+  --field-bg: #262629; --accent: #5b8dff;
+  --warn-bg: #3a2a12; --warn-fg: #ffd9a0; --warn-line: #6b4a1c;
+  color-scheme: dark;
+}
+
+.settings {
+  position: fixed; inset: 0; overflow-y: auto;
+  background: var(--bg); color: var(--fg);
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  padding: 22px 24px 92px;
+  cursor: default; user-select: none; -webkit-user-select: none;
+}
+.settings h1 { font-size: 17px; margin: 0 0 4px; }
+.settings .sub { color: var(--muted); margin: 0 0 20px; font-size: 12px; }
+
+.row { padding: 14px 0; border-top: 1px solid var(--line); }
+.row:first-of-type { border-top: 0; }
+.row label.title { display: block; font-weight: 600; margin-bottom: 5px; }
+.row .help { color: var(--muted); font-size: 12px; margin-top: 6px; }
+.row .help code {
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--field-bg); border: 1px solid var(--line);
+  border-radius: 4px; padding: 1px 4px;
+}
+
+input[type="text"], select {
+  width: 100%; box-sizing: border-box;
+  padding: 7px 9px; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--field-bg); color: var(--fg);
+  font: inherit;
+}
+input[type="text"]:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.with-button { display: flex; gap: 8px; }
+.with-button input { flex: 1; }
+
+button {
+  padding: 7px 13px; border-radius: 7px;
+  border: 1px solid var(--line); background: var(--field-bg); color: var(--fg);
+  font: inherit; cursor: pointer; white-space: nowrap;
+}
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.check { display: flex; align-items: flex-start; gap: 9px; padding: 9px 0; }
+.check input { margin-top: 2px; }
+/* Both must be block: inline spans run the title straight into the description. */
+.check > span { display: block; }
+.check .t { display: block; font-weight: 600; }
+.check .d { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+.preview {
+  margin-top: 8px; padding: 7px 9px; border-radius: 6px;
+  background: var(--field-bg); border: 1px solid var(--line);
+  font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all;
+}
+
+.banner {
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 16px;
+  background: var(--warn-bg); color: var(--warn-fg); border: 1px solid var(--warn-line);
+  font-size: 12px;
+}
+.banner b { display: block; margin-bottom: 3px; }
+
+.footer {
+  position: fixed; left: 0; right: 0; bottom: 0;
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 24px; background: var(--bg); border-top: 1px solid var(--line);
+}
+.footer .path { flex: 1; color: var(--muted); font-size: 11px; word-break: break-all; }
+.saved { color: var(--accent); font-size: 12px; }

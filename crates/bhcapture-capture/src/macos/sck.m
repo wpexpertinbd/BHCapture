@@ -109,12 +109,12 @@ static int32_t bhc_cgimage_to_bgra(CGImageRef img, double scale, BhcImage *out, 
  * No @available guard: the deployment target is 14.0, so SCScreenshotManager is always present
  * and LSMinimumSystemVersion stops the app launching anywhere it is not. */
 static int32_t bhc_shoot(SCContentFilter *filter, size_t px_w, size_t px_h, double scale,
-                         BhcImage *out, char *err, int32_t errcap) {
+                         int32_t show_cursor, BhcImage *out, char *err, int32_t errcap) {
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
     cfg.width = px_w;
     cfg.height = px_h;
     cfg.pixelFormat = 'BGRA';
-    cfg.showsCursor = NO;
+    cfg.showsCursor = show_cursor ? YES : NO;
     cfg.capturesAudio = NO;
 
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -203,7 +203,7 @@ int32_t bhc_list_windows(BhcWindowInfo *out, int32_t cap, int32_t *n_out, char *
 }
 
 int32_t bhc_capture_display(uint32_t display_id, const uint32_t *exclude, int32_t exclude_n,
-                            BhcImage *out, char *err, int32_t errcap) {
+                            int32_t show_cursor, BhcImage *out, char *err, int32_t errcap) {
     @autoreleasepool {
         if (!out) { bhc_set_err(err, errcap, @"null out param"); return BHC_ERR_GENERIC; }
         memset(out, 0, sizeof(*out));
@@ -235,7 +235,7 @@ int32_t bhc_capture_display(uint32_t display_id, const uint32_t *exclude, int32_
                 }
             }
             SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:target excludingWindows:skip];
-            return bhc_shoot(filter, (size_t)pw, (size_t)ph, bhc_display_scale(target), out, err, errcap);
+            return bhc_shoot(filter, (size_t)pw, (size_t)ph, bhc_display_scale(target), show_cursor, out, err, errcap);
         }
     }
 }
@@ -283,7 +283,7 @@ int32_t bhc_capture_window(uint64_t window_id, BhcImage *out, char *err, int32_t
             if (pw == 0 || ph == 0) { bhc_set_err(err, errcap, @"window has zero size"); return BHC_ERR_GENERIC; }
 
             SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:target];
-            return bhc_shoot(filter, pw, ph, scale, out, err, errcap);
+            return bhc_shoot(filter, pw, ph, scale, 0, out, err, errcap);
         }
     }
 }
