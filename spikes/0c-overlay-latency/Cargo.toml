@@ -1,0 +1,20 @@
+[package]
+name = "bhc-spike-0c"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Own workspace root: must never be pulled into the real root workspace.
+[workspace]
+
+[build-dependencies]
+tauri-build = "2"
+cc = "1"
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+global-hotkey = "0.6"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+debug = true

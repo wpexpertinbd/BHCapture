@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Spike: let the overlay webview listen for events and invoke the report command.",
+  "windows": ["*"],
+  "permissions": ["core:default", "core:event:default", "core:window:default"]
+}
