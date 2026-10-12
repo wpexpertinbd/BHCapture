@@ -170,18 +170,51 @@ async fn settings_pick_dir(app: tauri::AppHandle) -> Option<String> {
         .map(|p| p.display().to_string())
 }
 
+/// Show the Dock icon only while a real window (settings, and later the editor) is open.
+///
+/// BHCapture lives in the menu bar and should not occupy the Dock while it sits in the background.
+/// But while the user is working in a window, a Dock icon and an app menu are what they expect, so
+/// the app switches between macOS "accessory" and "regular" modes to match. Overlays do not count:
+/// they are a transient tool surface, and a Dock icon bouncing in for every capture would be noise.
+///
+/// The decision is derived from the windows that actually exist rather than tracked in a flag, so
+/// it cannot drift out of step with reality. `closing` names a window that is mid-destroy and must
+/// not be counted.
+fn sync_dock(app: &tauri::AppHandle, closing: Option<&str>) {
+    #[cfg(target_os = "macos")]
+    {
+        let any_window = app.webview_windows().iter().any(|(label, w)| {
+            !label.starts_with(OVERLAY_PREFIX)
+                && Some(label.as_str()) != closing
+                && w.is_visible().unwrap_or(false)
+        });
+        let policy = if any_window {
+            tauri::ActivationPolicy::Regular
+        } else {
+            tauri::ActivationPolicy::Accessory
+        };
+        let _ = app.set_activation_policy(policy);
+    }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = (app, closing); }
+}
+
 #[tauri::command]
 fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(w) = app.get_webview_window(SETTINGS_WINDOW) {
         let _ = w.show();
+        sync_dock(&app, None);
         let _ = w.set_focus();
         return Ok(());
     }
-    WebviewWindowBuilder::new(&app, SETTINGS_WINDOW, WebviewUrl::App("index.html".into()))
+    let w = WebviewWindowBuilder::new(&app, SETTINGS_WINDOW, WebviewUrl::App("index.html".into()))
         .title("BHCapture Settings")
         .inner_size(560.0, 620.0)
         .resizable(true)
         .build().map_err(|e| e.to_string())?;
+    // Regular mode first, then focus: an accessory app cannot reliably take focus for a window.
+    sync_dock(&app, None);
+    let _ = w.set_focus();
     Ok(())
 }
 
@@ -474,6 +507,12 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(state.clone())
+        // The moment the last real window goes, the Dock icon goes with it.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                sync_dock(window.app_handle(), Some(window.label()));
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             overlay_info, selection_begin, selection_update,
             selection_nudge, selection_cancel, selection_commit,
@@ -482,6 +521,9 @@ fn main() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            // Menu-bar only until a window is opened. Info.plist's LSUIElement does this for the
+            // bundled app; stating it here makes an unbundled dev run behave the same.
+            sync_dock(&handle, None);
             let displays: Vec<_> = state.layout.lock().unwrap().displays().to_vec();
 
             // Pre-create every overlay hidden AT LAUNCH. Creating a webview window on
@@ -644,7 +686,18 @@ fn main() {
                             println!("[settings] CGWindowID={}", unsafe { bhcapture_capture::macos::cgwindow_id(ptr) });
                         }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10000));
+                    let ms = |n| std::thread::sleep(std::time::Duration::from_millis(n));
+                    println!("[dock] settings window OPEN");
+                    ms(4000);
+                    if let Some(w) = h.get_webview_window(SETTINGS_WINDOW) { let _ = w.close(); }
+                    println!("[dock] settings window CLOSED");
+                    ms(3500);
+                    let _ = open_settings(h.clone());
+                    println!("[dock] settings window REOPENED");
+                    ms(3500);
+                    if let Some(w) = h.get_webview_window(SETTINGS_WINDOW) { let _ = w.close(); }
+                    println!("[dock] settings window CLOSED again");
+                    ms(3000);
                     h.exit(0);
                 });
             }
