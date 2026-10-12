@@ -1,6 +1,7 @@
 //! macOS backend: ScreenCaptureKit via a C shim (see `sck.m`).
 
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
+use std::sync::{Arc, Mutex};
 
 use bhcapture_core::geom::{Display, DisplayId, DisplayLayout, LogRect, PhysSize, Scale};
 use bhcapture_core::image::Frame;
@@ -60,7 +61,8 @@ extern "C" {
     fn bhc_request_permission() -> i32;
     fn bhc_list_displays(out: *mut BhcDisplayInfo, cap: i32, n: *mut i32, err: *mut c_char, errcap: i32) -> i32;
     fn bhc_list_windows(out: *mut BhcWindowInfo, cap: i32, n: *mut i32, err: *mut c_char, errcap: i32) -> i32;
-    fn bhc_capture_display(id: u32, out: *mut BhcImage, err: *mut c_char, errcap: i32) -> i32;
+    fn bhc_capture_display(id: u32, exclude: *const u32, exclude_n: i32, out: *mut BhcImage, err: *mut c_char, errcap: i32) -> i32;
+    fn bhc_cgwindow_id(nswindow: *mut c_void) -> u32;
     fn bhc_capture_window(id: u64, out: *mut BhcImage, err: *mut c_char, errcap: i32) -> i32;
     fn bhc_image_free(img: *mut BhcImage);
 }
@@ -95,11 +97,26 @@ fn take_frame(img: &mut BhcImage) -> Result<Frame, CaptureError> {
     Frame::from_bgra(data, w, h, stride, scale).map_err(CaptureError::Frame)
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct MacCapturer;
+/// CGWindowID of an `NSWindow` pointer, as Tauri's `ns_window()` returns.
+///
+/// # Safety
+/// `ptr` must be a live `NSWindow*`.
+pub unsafe fn cgwindow_id(ptr: *mut c_void) -> u32 { bhc_cgwindow_id(ptr) }
+
+#[derive(Debug, Default, Clone)]
+pub struct MacCapturer {
+    /// CGWindowIDs left out of every display capture — our own overlay windows.
+    excluded: Arc<Mutex<Vec<u32>>>,
+}
 
 impl MacCapturer {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self { Self::default() }
+
+    /// Windows to omit from captures. The selector registers its overlays here so it never
+    /// photographs itself.
+    pub fn set_excluded_windows(&self, ids: Vec<u32>) {
+        *self.excluded.lock().unwrap() = ids;
+    }
 
     /// Whether Screen Recording is granted. Never prompts.
     pub fn has_permission() -> bool { unsafe { bhc_preflight_permission() == 1 } }
@@ -163,7 +180,10 @@ impl Capturer for MacCapturer {
     fn capture_display(&self, id: DisplayId) -> Result<Frame, CaptureError> {
         let mut img = BhcImage::default();
         let mut err = [0 as c_char; ERRCAP as usize];
-        let rc = unsafe { bhc_capture_display(id.0, &mut img, err.as_mut_ptr(), ERRCAP) };
+        let skip = self.excluded.lock().unwrap().clone();
+        let rc = unsafe {
+            bhc_capture_display(id.0, skip.as_ptr(), skip.len() as i32, &mut img, err.as_mut_ptr(), ERRCAP)
+        };
         if rc != BHC_OK {
             return Err(classify(rc, &err, CaptureError::DisplayNotFound(id)));
         }

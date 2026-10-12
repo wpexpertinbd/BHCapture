@@ -54,7 +54,14 @@ int32_t bhc_request_permission(void);
 
 int32_t bhc_list_displays(BhcDisplayInfo *out, int32_t cap, int32_t *n_out, char *err, int32_t errcap);
 int32_t bhc_list_windows(BhcWindowInfo *out, int32_t cap, int32_t *n_out, char *err, int32_t errcap);
-int32_t bhc_capture_display(uint32_t display_id, BhcImage *out, char *err, int32_t errcap);
+/* `exclude` lists CGWindowIDs to leave out of the capture -- our own overlay windows. Excluding
+ * them is how the selector avoids photographing itself; hiding the overlay first would flash and
+ * would race the compositor, since hide() returns before the window is actually gone. */
+int32_t bhc_capture_display(uint32_t display_id, const uint32_t *exclude, int32_t exclude_n,
+                            BhcImage *out, char *err, int32_t errcap);
+
+/* CGWindowID of an NSWindow pointer (what Tauri hands back from ns_window()). */
+uint32_t bhc_cgwindow_id(void *nswindow);
 int32_t bhc_capture_window(uint64_t window_id, BhcImage *out, char *err, int32_t errcap);
 void    bhc_image_free(BhcImage *img);
 

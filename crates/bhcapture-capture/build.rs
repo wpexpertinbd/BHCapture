@@ -13,7 +13,7 @@ fn main() {
     cc::Build::new()
         .file("src/macos/sck.m")
         .flag("-fobjc-arc")
-        .flag("-mmacosx-version-min=12.3")
+        .flag("-mmacosx-version-min=14.0")
         .flag("-Wall")
         .compile("bhc_sck");
 

@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <AppKit/AppKit.h>
 #import <string.h>
 #import "sck.h"
 
@@ -104,9 +105,11 @@ static int32_t bhc_cgimage_to_bgra(CGImageRef img, double scale, BhcImage *out, 
     return BHC_OK;
 }
 
-/* Shared capture path. Caller supplies the filter and the pixel dimensions it wants. */
+/* Shared capture path. Caller supplies the filter and the pixel dimensions it wants.
+ * No @available guard: the deployment target is 14.0, so SCScreenshotManager is always present
+ * and LSMinimumSystemVersion stops the app launching anywhere it is not. */
 static int32_t bhc_shoot(SCContentFilter *filter, size_t px_w, size_t px_h, double scale,
-                         BhcImage *out, char *err, int32_t errcap) API_AVAILABLE(macos(14.0)) {
+                         BhcImage *out, char *err, int32_t errcap) {
     SCStreamConfiguration *cfg = [[SCStreamConfiguration alloc] init];
     cfg.width = px_w;
     cfg.height = px_h;
@@ -199,7 +202,8 @@ int32_t bhc_list_windows(BhcWindowInfo *out, int32_t cap, int32_t *n_out, char *
     }
 }
 
-int32_t bhc_capture_display(uint32_t display_id, BhcImage *out, char *err, int32_t errcap) {
+int32_t bhc_capture_display(uint32_t display_id, const uint32_t *exclude, int32_t exclude_n,
+                            BhcImage *out, char *err, int32_t errcap) {
     @autoreleasepool {
         if (!out) { bhc_set_err(err, errcap, @"null out param"); return BHC_ERR_GENERIC; }
         memset(out, 0, sizeof(*out));
@@ -207,13 +211,13 @@ int32_t bhc_capture_display(uint32_t display_id, BhcImage *out, char *err, int32
             bhc_set_err(err, errcap, @"Screen Recording not granted");
             return BHC_ERR_PERMISSION;
         }
-        if (@available(macOS 14.0, *)) {
-            NSError *e = nil;
-            SCShareableContent *content = bhc_fetch_content(&e);
-            if (!content) {
-                bhc_set_err(err, errcap, e ? e.localizedDescription : @"SCShareableContent returned nil");
-                return bhc_classify(e);
-            }
+        NSError *e = nil;
+        SCShareableContent *content = bhc_fetch_content(&e);
+        if (!content) {
+            bhc_set_err(err, errcap, e ? e.localizedDescription : @"SCShareableContent returned nil");
+            return bhc_classify(e);
+        }
+        {
             SCDisplay *target = nil;
             for (SCDisplay *d in content.displays) {
                 if ((uint32_t)d.displayID == display_id) { target = d; break; }
@@ -224,11 +228,14 @@ int32_t bhc_capture_display(uint32_t display_id, BhcImage *out, char *err, int32
             bhc_physical_size(target.displayID, &pw, &ph);
             if (pw <= 0 || ph <= 0) { pw = (int32_t)target.width; ph = (int32_t)target.height; }
 
-            SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:target excludingWindows:@[]];
+            NSMutableArray<SCWindow *> *skip = [NSMutableArray array];
+            for (int32_t i = 0; i < exclude_n; i++) {
+                for (SCWindow *w in content.windows) {
+                    if ((uint32_t)w.windowID == exclude[i]) { [skip addObject:w]; break; }
+                }
+            }
+            SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:target excludingWindows:skip];
             return bhc_shoot(filter, (size_t)pw, (size_t)ph, bhc_display_scale(target), out, err, errcap);
-        } else {
-            bhc_set_err(err, errcap, @"needs macOS 14+ (SCScreenshotManager)");
-            return BHC_ERR_UNSUPPORTED;
         }
     }
 }
@@ -241,13 +248,13 @@ int32_t bhc_capture_window(uint64_t window_id, BhcImage *out, char *err, int32_t
             bhc_set_err(err, errcap, @"Screen Recording not granted");
             return BHC_ERR_PERMISSION;
         }
-        if (@available(macOS 14.0, *)) {
-            NSError *e = nil;
-            SCShareableContent *content = bhc_fetch_content(&e);
-            if (!content) {
-                bhc_set_err(err, errcap, e ? e.localizedDescription : @"SCShareableContent returned nil");
-                return bhc_classify(e);
-            }
+        NSError *e = nil;
+        SCShareableContent *content = bhc_fetch_content(&e);
+        if (!content) {
+            bhc_set_err(err, errcap, e ? e.localizedDescription : @"SCShareableContent returned nil");
+            return bhc_classify(e);
+        }
+        {
             SCWindow *target = nil;
             for (SCWindow *w in content.windows) {
                 if ((uint64_t)w.windowID == window_id) { target = w; break; }
@@ -277,13 +284,17 @@ int32_t bhc_capture_window(uint64_t window_id, BhcImage *out, char *err, int32_t
 
             SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:target];
             return bhc_shoot(filter, pw, ph, scale, out, err, errcap);
-        } else {
-            bhc_set_err(err, errcap, @"needs macOS 14+ (SCScreenshotManager)");
-            return BHC_ERR_UNSUPPORTED;
         }
     }
 }
 
 void bhc_image_free(BhcImage *img) {
     if (img && img->data) { free(img->data); img->data = NULL; }
+}
+
+uint32_t bhc_cgwindow_id(void *nswindow) {
+    if (!nswindow) return 0;
+    NSWindow *w = (__bridge NSWindow *)nswindow;
+    NSInteger n = [w windowNumber];
+    return n > 0 ? (uint32_t)n : 0;
 }

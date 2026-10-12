@@ -3,9 +3,8 @@ resolver = "2"
 members = [
     "crates/bhcapture-core",
     "crates/bhcapture-capture",
+    "app/src-tauri",
 ]
-# NOTE: "app/src-tauri" joins this list when the Tauri shell is scaffolded. It MUST be listed
-# once it exists, or the build dies with "package ID <app> did not match".
 # spikes/* are deliberately excluded -- each is its own workspace root.
 
 [workspace.package]

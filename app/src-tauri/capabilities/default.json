@@ -1,0 +1,11 @@
+{
+  "identifier": "default",
+  "description": "Overlay windows need the event bus and the selector commands. Without this file the webview silently cannot call listen or invoke -- nothing errors, it just never happens.",
+  "windows": ["*"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:webview:default"
+  ]
+}

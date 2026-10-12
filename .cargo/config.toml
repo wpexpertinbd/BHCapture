@@ -1,0 +1,4 @@
+# Spotlight skips *.noindex, so dev builds never show up as a second BHCapture in
+# Finder/Launchpad. Family convention -- Benjamin hit "2 BHDisplay" in Finder before this.
+[build]
+target-dir = "target.noindex"
