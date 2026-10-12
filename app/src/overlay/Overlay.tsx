@@ -47,9 +47,16 @@ export function Overlay() {
   const snapRef = useRef<Rect | null>(null);
   snapRef.current = snap;
 
-  useEffect(() => {
+  const loadInfo = useCallback(() => {
     invoke<OverlayInfo>("overlay_info").then(setInfo).catch(() => setInfo(null));
   }, []);
+  useEffect(loadInfo, [loadInfo]);
+
+  // A monitor was plugged in, removed or resized: this overlay's origin/size/scale may be stale.
+  useEffect(() => {
+    const un = listen("layout-changed", loadInfo);
+    return () => { un.then((f) => f()); };
+  }, [loadInfo]);
 
   // The selection is owned by Rust and broadcast to every overlay, because a drag that crosses
   // a display boundary is still ONE selection and no single webview can own it.

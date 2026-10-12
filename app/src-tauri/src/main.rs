@@ -233,6 +233,13 @@ fn open_selector(app: &tauri::AppHandle) {
     let epoch = state.epoch.load(Ordering::SeqCst);
     broadcast(app, None);
     show_overlays(app); // appear first: the freeze happens behind an already-visible overlay
+    for (label, w) in app.webview_windows() {
+        if label.starts_with(OVERLAY_PREFIX) {
+            println!("[selector] {label} shown: visible={:?} at {:?} size {:?}",
+                w.is_visible(), w.outer_position().ok().map(|p| (p.x, p.y)),
+                w.inner_size().ok().map(|s| (s.width, s.height)));
+        }
+    }
 
     // Two independent jobs, each discarded if the selector has since closed or reopened.
     let st = state.clone();
@@ -308,6 +315,13 @@ fn selection_set_rect(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>,
     broadcast(&app, Some(LogRect::from_corners(a, b)));
 }
 
+/// Close the selector for good: hide the overlays AND give the keyboard back to the previous app.
+/// (The Save dialog path uses `hide_overlays` alone, because the dialog needs this app active.)
+fn dismiss_selector(app: &tauri::AppHandle) {
+    hide_overlays(app);
+    bhcapture_capture::macos::deactivate_app();
+}
+
 fn hide_overlays(app: &tauri::AppHandle) {
     for (label, w) in app.webview_windows() {
         if label.starts_with(OVERLAY_PREFIX) { let _ = w.hide(); }
@@ -319,7 +333,7 @@ fn selection_cancel(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>) {
     *state.drag.lock().unwrap() = None;
     release_frozen(&state);
     broadcast(&app, None);
-    hide_overlays(&app);
+    dismiss_selector(&app);
 }
 
 /// `~/Library/Application Support/BHCapture/settings.json`.
@@ -518,7 +532,7 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Resul
     *state.drag.lock().unwrap() = None;
     release_frozen(state);
     broadcast(app, None);
-    hide_overlays(app);
+    dismiss_selector(app);
 
     // Clipboard is a convenience on top of a file that already exists -- never fail the capture
     // for it, just say so.
@@ -560,13 +574,134 @@ fn relaunch_app(app: tauri::AppHandle) {
     app.restart(); // unbundled dev run
 }
 
-fn show_overlays(app: &tauri::AppHandle) {
+fn overlay_label(id: DisplayId) -> String { format!("{OVERLAY_PREFIX}{}", id.0) }
+
+/// Make the overlay windows match the current display layout: create what is missing, move and
+/// resize what exists, destroy what no longer has a display. The ONE path used both at launch and
+/// after a display change, so what the resolution-change test exercises is what startup runs.
+///
+/// Must run on the main thread: creating a webview window from another thread can deadlock.
+fn sync_overlays(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result<()> {
+    let displays = state.layout.lock().unwrap().displays().to_vec();
+    let wanted: Vec<String> = displays.iter().map(|d| overlay_label(d.id)).collect();
+
     for (label, w) in app.webview_windows() {
-        if label.starts_with(OVERLAY_PREFIX) {
-            let _ = w.show();
-            let _ = w.set_focus(); // the overlay must have key focus for Esc/Enter/arrows
+        if label.starts_with(OVERLAY_PREFIX) && !wanted.contains(&label) {
+            println!("[display] removing {label}: its display is gone");
+            let _ = w.destroy();
         }
     }
+
+    let mut ids = Vec::new();
+    for d in &displays {
+        let label = overlay_label(d.id);
+        let w = match app.get_webview_window(&label) {
+            Some(w) => {
+                // Size FIRST, then position. macOS keeps a window's BOTTOM edge fixed when it is resized,
+                // so shrinking a screen from 878 to 800 pt pushed the overlay's top edge 78 pt down and
+                // left a strip uncovered; placing it afterwards puts the top-left back where it belongs.
+                let _ = w.set_size(tauri::LogicalSize::new(d.bounds.size.w, d.bounds.size.h));
+                let _ = w.set_position(tauri::LogicalPosition::new(d.bounds.min_x(), d.bounds.min_y()));
+                w
+            }
+            None => WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+                .position(d.bounds.min_x(), d.bounds.min_y())
+                .inner_size(d.bounds.size.w, d.bounds.size.h)
+                .decorations(false)
+                .transparent(true)
+                .always_on_top(true)
+                .visible(false)
+                .resizable(false)
+                .shadow(false)
+                .title("BHCapture selector")
+                .build()?,
+        };
+        println!("[display] {label}: {}x{} pt at ({},{}) scale {:.2}",
+            d.bounds.size.w, d.bounds.size.h, d.bounds.min_x(), d.bounds.min_y(), d.scale.get());
+
+        // Register the overlay with the capturer so it is excluded from captures.
+        // Without this the selector photographs its own scrim.
+        #[cfg(target_os = "macos")]
+        if let Ok(ptr) = w.ns_window() {
+            let id = unsafe { bhcapture_capture::macos::cgwindow_id(ptr) };
+            if id != 0 { ids.push(id); }
+        }
+    }
+    *state.overlay_ids.lock().unwrap() = ids.clone();
+    state.capturer.set_excluded_windows(ids);
+    Ok(())
+}
+
+/// Re-read the displays and, if anything changed, rebuild the overlays to match.
+fn refresh_displays(app: &tauri::AppHandle) {
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    let new = match state.capturer.list_displays() {
+        Ok(l) => l,
+        // Keep the old layout rather than replacing it with nothing: a stale layout is a visible
+        // problem that can be fixed, an empty one disables the selector entirely.
+        Err(e) => { eprintln!("[display] could not re-read displays ({e}); keeping the old layout"); return; }
+    };
+    {
+        let old = state.layout.lock().unwrap();
+        if old.displays() == new.displays() { return; }
+        println!("[display] layout changed: {} -> {} display(s)", old.displays().len(), new.displays().len());
+    }
+
+    // A selector that is open was drawn from the OLD layout, so its overlays and its frozen frame
+    // no longer describe the screen. Dismiss it; the user can press the hotkey again.
+    *state.drag.lock().unwrap() = None;
+    release_frozen(&state);
+    broadcast(app, None);
+    dismiss_selector(app);
+    *state.layout.lock().unwrap() = new;
+
+    let (a, st) = (app.clone(), state.clone());
+    let _ = app.run_on_main_thread(move || {
+        if let Err(e) = sync_overlays(&a, &st) {
+            eprintln!("[display] could not rebuild the overlays: {e}");
+        }
+        // Overlays that already exist must refetch their origin/size/scale.
+        let _ = a.emit("layout-changed", ());
+    });
+}
+
+/// The OS reports one physical change as several callbacks, so wait for them to stop before
+/// acting. Reading mid-change would see a half-applied layout.
+fn on_displays_changed(app: &tauri::AppHandle) {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    let mine = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if GENERATION.load(Ordering::SeqCst) == mine { refresh_displays(&app); }
+    });
+}
+
+fn show_overlays(app: &tauri::AppHandle) {
+    // Without this a hotkey-opened overlay never gets keystrokes: Esc and Enter go to whatever app
+    // was in front until the user happens to click.
+    bhcapture_capture::macos::activate_app();
+    for (label, w) in app.webview_windows() {
+        if label.starts_with(OVERLAY_PREFIX) { let _ = w.show(); }
+    }
+    // Focus AFTER activation has landed. activate_app() is asynchronous: a window can only become the
+    // key window of an app that is already active, and the web view inside it must also be made the
+    // first responder, or keystrokes go nowhere. WebviewWindow::set_focus only focuses the WINDOW.
+    let a = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(180));
+        let a2 = a.clone();
+        let _ = a.run_on_main_thread(move || {
+            for (label, w) in a2.webview_windows() {
+                if label.starts_with(OVERLAY_PREFIX) {
+                    let _ = w.set_focus();
+                    // The web view must be the first responder or keystrokes go nowhere.
+                    let webview: &tauri::Webview = w.as_ref();
+                    let _ = webview.set_focus();
+                }
+            }
+        });
+    });
 }
 
 fn main() {
@@ -616,35 +751,13 @@ fn main() {
             // Menu-bar only until a window is opened. Info.plist's LSUIElement does this for the
             // bundled app; stating it here makes an unbundled dev run behave the same.
             sync_dock(&handle, None);
-            let displays: Vec<_> = state.layout.lock().unwrap().displays().to_vec();
-
             // Pre-create every overlay hidden AT LAUNCH. Creating a webview window on
             // hotkey-press is visibly slow; spike 0c measured ~25 ms for a pre-created one.
-            let mut overlay_ids = Vec::new();
-            for d in &displays {
-                let w = WebviewWindowBuilder::new(
-                        app, format!("{OVERLAY_PREFIX}{}", d.id.0), WebviewUrl::App("index.html".into()))
-                    .position(d.bounds.min_x(), d.bounds.min_y())
-                    .inner_size(d.bounds.size.w, d.bounds.size.h)
-                    .decorations(false)
-                    .transparent(true)
-                    .always_on_top(true)
-                    .visible(false)
-                    .resizable(false)
-                    .shadow(false)
-                    .title("BHCapture selector")
-                    .build()?;
+            sync_overlays(&handle, &state)?;
 
-                // Register the overlay with the capturer so it is excluded from captures.
-                // Without this the selector photographs its own scrim.
-                #[cfg(target_os = "macos")]
-                if let Ok(ptr) = w.ns_window() {
-                    let id = unsafe { bhcapture_capture::macos::cgwindow_id(ptr) };
-                    if id != 0 { overlay_ids.push(id); }
-                }
-            }
-            *state.overlay_ids.lock().unwrap() = overlay_ids.clone();
-            state.capturer.set_excluded_windows(overlay_ids);
+            // Keep the overlays matched to the real displays for the life of the process.
+            let h_watch = handle.clone();
+            bhcapture_capture::macos::watch_displays(move || on_displays_changed(&h_watch));
 
             // Tray: without it there is no way to reach settings, since every window is an
             // overlay that hides itself.
@@ -682,6 +795,7 @@ fn main() {
                 let rx = GlobalHotKeyEvent::receiver();
                 while let Ok(ev) = rx.recv() {
                     if ev.state != global_hotkey::HotKeyState::Pressed { continue; }
+                    println!("[hotkey] pressed");
                     open_selector(&h);
                 }
             });

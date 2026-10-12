@@ -67,4 +67,15 @@ uint32_t bhc_cgwindow_id(void *nswindow);
 int32_t bhc_capture_window(uint64_t window_id, BhcImage *out, char *err, int32_t errcap);
 void    bhc_image_free(BhcImage *img);
 
+/* Calls `cb(ctx)` after the display configuration CHANGES (monitor plugged/unplugged, resolution,
+ * arrangement). The OS reports each change in two phases and once per affected display, so `cb`
+ * fires several times per physical change -- the caller must debounce. Register once. */
+void    bhc_watch_displays(void (*cb)(void *), void *ctx);
+
+/* A menu-bar (accessory) app is not made active just by showing a window, so its overlay would never
+ * receive keystrokes until the first click. Activate on open; deactivate on close so the previous
+ * app gets its keyboard back. Both hop to the main thread. */
+void    bhc_activate_app(void);
+void    bhc_deactivate_app(void);
+
 #endif /* BHC_SCK_H */

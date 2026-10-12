@@ -67,6 +67,32 @@ extern "C" {
     fn bhc_cgwindow_id(nswindow: *mut c_void) -> u32;
     fn bhc_capture_window(id: u64, out: *mut BhcImage, err: *mut c_char, errcap: i32) -> i32;
     fn bhc_image_free(img: *mut BhcImage);
+    fn bhc_watch_displays(cb: extern "C" fn(*mut c_void), ctx: *mut c_void);
+    fn bhc_activate_app();
+    fn bhc_deactivate_app();
+}
+
+static DISPLAY_WATCHER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
+
+extern "C" fn display_trampoline(_ctx: *mut c_void) {
+    if let Some(f) = DISPLAY_WATCHER.get() { f(); }
+}
+
+/// Run `f` whenever the display configuration changes (plug, unplug, resolution, arrangement).
+///
+/// The OS reports one physical change as several callbacks, on whatever thread it likes, so `f`
+/// must be cheap and must debounce. Registers once per process; a second call is ignored.
+/// Make this app the active one, so its windows receive keystrokes. Needed because a menu-bar
+/// (accessory) app is not activated merely by showing a window.
+pub fn activate_app() { unsafe { bhc_activate_app() } }
+
+/// Give the keyboard back to whichever app was active before [`activate_app`].
+pub fn deactivate_app() { unsafe { bhc_deactivate_app() } }
+
+pub fn watch_displays(f: impl Fn() + Send + Sync + 'static) {
+    if DISPLAY_WATCHER.set(Box::new(f)).is_ok() {
+        unsafe { bhc_watch_displays(display_trampoline, std::ptr::null_mut()) };
+    }
 }
 
 fn cstr(buf: &[c_char]) -> String {

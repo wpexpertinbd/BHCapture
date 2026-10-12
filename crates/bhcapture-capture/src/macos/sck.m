@@ -326,3 +326,39 @@ uint32_t bhc_cgwindow_id(void *nswindow) {
     NSInteger n = [w windowNumber];
     return n > 0 ? (uint32_t)n : 0;
 }
+
+static void (*gDisplayCb)(void *) = NULL;
+static void *gDisplayCtx = NULL;
+
+static void bhc_display_reconfig(CGDirectDisplayID display, CGDisplayChangeSummaryFlags flags, void *userInfo) {
+    (void)display; (void)userInfo;
+    /* Every change arrives first as a BEGIN call (the new state is not in place yet) and then as a
+     * second call per display once it is. Acting on BEGIN would read the OLD layout. */
+    if (flags & kCGDisplayBeginConfigurationFlag) return;
+    if (gDisplayCb) gDisplayCb(gDisplayCtx);
+}
+
+void bhc_watch_displays(void (*cb)(void *), void *ctx) {
+    static dispatch_once_t once;
+    gDisplayCb = cb;
+    gDisplayCtx = ctx;
+    dispatch_once(&once, ^{
+        CGDisplayRegisterReconfigurationCallback(bhc_display_reconfig, NULL);
+    });
+}
+
+void bhc_activate_app(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        /* On macOS 14+ this is a REQUEST that the system may decline: an app can no longer force its
+         * way to the front. Verified on macOS 27 that a menu-bar app activated this way from a global
+         * hotkey is NOT made frontmost, so callers must not rely on it for keyboard input. */
+        [NSApp activateIgnoringOtherApps:YES];
+#pragma clang diagnostic pop
+    });
+}
+
+void bhc_deactivate_app(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{ [NSApp deactivate]; });
+}
