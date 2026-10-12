@@ -16,6 +16,18 @@ type OverlayInfo = {
 /** Global logical rect: [x, y, w, h]. */
 type Rect = [number, number, number, number];
 
+/** Why a capture did not happen, as the Rust side reports it. */
+type Notice = { kind: "permission" | "empty" | "cancelled" | "failed"; message: string };
+
+function asNotice(e: unknown): Notice | null {
+  if (e && typeof e === "object" && "kind" in e && "message" in e) {
+    const n = e as Notice;
+    // A dismissed Save dialog is the user's own choice, not something to report.
+    return n.kind === "cancelled" ? null : n;
+  }
+  return { kind: "failed", message: String(e) };
+}
+
 /** Movement under this many points between press and release is a click, not a drag. */
 const CLICK_SLOP = 4;
 const LOUPE_OFFSET = 26;
@@ -28,6 +40,7 @@ export function Overlay() {
   const [loupe, setLoupe] = useState<LoupeData | null>(null);
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [notice, setNotice] = useState<Notice | null>(null);
 
   const dragRef = useRef(false);
   const downAt = useRef<{ x: number; y: number } | null>(null);
@@ -53,6 +66,12 @@ export function Overlay() {
     return () => { un.then((f) => f()); };
   }, []);
 
+  useEffect(() => {
+    if (!notice || notice.kind === "permission") return;
+    const t = setTimeout(() => setNotice(null), 6000);
+    return () => clearTimeout(t);
+  }, [notice]);
+
   const toGlobal = useCallback(
     (cx: number, cy: number) => (info ? { x: info.origin_x + cx, y: info.origin_y + cy } : null),
     [info]
@@ -61,6 +80,7 @@ export function Overlay() {
   // Pointer queries go to Rust, so they are coalesced: one in flight, newest position wins.
   // Without this a fast mouse queues hundreds of stale requests and the loupe lags behind.
   const pending = useRef<{ x: number; y: number } | null>(null);
+  const lastPointer = useRef<{ x: number; y: number } | null>(null);
   const busy = useRef(false);
   const pump = useCallback(async () => {
     if (busy.current) return;
@@ -83,11 +103,21 @@ export function Overlay() {
     }
   }, []);
 
+  // The frozen frame lands ~100 ms after the overlay opens. If the pointer has not moved since,
+  // ask again now so the magnifier appears without waiting for the next movement.
+  useEffect(() => {
+    const un = listen("frozen-ready", () => {
+      if (lastPointer.current) { pending.current = lastPointer.current; void pump(); }
+    });
+    return () => { un.then((f) => f()); };
+  }, [pump]);
+
   const onMouseDown = useCallback((e: React.MouseEvent) => {
     const g = toGlobal(e.clientX, e.clientY);
     if (!g) return;
     dragRef.current = true;
     setDragging(true);
+    setNotice(null);
     downAt.current = { x: e.clientX, y: e.clientY };
     void invoke("selection_begin", g);
   }, [toGlobal]);
@@ -97,6 +127,7 @@ export function Overlay() {
     const g = toGlobal(e.clientX, e.clientY);
     if (!g) return;
     if (dragRef.current) void invoke("selection_update", g);
+    lastPointer.current = g;
     pending.current = g;
     void pump();
   }, [toGlobal, pump]);
@@ -126,12 +157,16 @@ export function Overlay() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.preventDefault(); void invoke("selection_cancel"); return; }
+      if (e.key === "Escape") { e.preventDefault(); setNotice(null); void invoke("selection_cancel"); return; }
       // Shift+Enter routes this one capture through a native Save dialog, so the default
       // folder never becomes a cage.
       if (e.key === "Enter") {
         e.preventDefault();
-        void invoke("selection_commit", { saveAs: e.shiftKey }).catch(() => {});
+        // Failures used to be swallowed here, so a missing Screen Recording grant looked like
+        // "Enter does nothing". Show them where the user is looking.
+        invoke("selection_commit", { saveAs: e.shiftKey })
+          .then(() => setNotice(null))
+          .catch((err) => setNotice(asNotice(err)));
         return;
       }
       const step = e.shiftKey ? 10 : 1;
@@ -205,6 +240,18 @@ export function Overlay() {
       {cursor && loupe && info && (
         <Loupe data={loupe} gx={info.origin_x + cursor.x} gy={info.origin_y + cursor.y}
                left={loupeLeft} top={loupeTop} />
+      )}
+
+      {notice && (
+        <div className={`notice notice-${notice.kind}`} role="alert" onMouseDown={(e) => e.stopPropagation()}>
+          <div className="notice-text">{notice.message}</div>
+          {notice.kind === "permission" && (
+            <div className="notice-actions">
+              <button onClick={() => void invoke("open_privacy_settings")}>Open System Settings</button>
+              <button className="primary" onClick={() => void invoke("relaunch_app")}>Relaunch BHCapture</button>
+            </div>
+          )}
+        </div>
       )}
 
       <div className="hint" style={{ bottom: 28 }}>

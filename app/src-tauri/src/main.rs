@@ -236,11 +236,15 @@ fn open_selector(app: &tauri::AppHandle) {
 
     // Two independent jobs, each discarded if the selector has since closed or reopened.
     let st = state.clone();
+    let app_for_freeze = app.clone();
     std::thread::spawn(move || {
         let layout = st.layout.lock().unwrap().clone();
         match Snapshot::take(&st.capturer, &layout) {
             Ok(snap) if st.epoch.load(Ordering::SeqCst) == epoch => {
                 *st.snapshot.lock().unwrap() = Some(Arc::new(snap));
+                // A pointer that has not moved since the overlay opened would otherwise show no
+                // magnifier until its next movement.
+                let _ = app_for_freeze.emit("frozen-ready", ());
             }
             Ok(_) => {}
             Err(e) => eprintln!("[warn] could not freeze the screen ({e}); the magnifier is off and capture will be live"),
@@ -391,29 +395,67 @@ fn copy_to_clipboard(frame: &Frame) -> Result<(), String> {
         .set_image(img).map_err(|e| e.to_string())
 }
 
+/// Why a capture did not happen. Serialised to the overlay as `{kind, message}`, so the UI can pick
+/// the right treatment: a permission problem needs buttons, a cancelled dialog needs nothing.
+#[derive(Serialize, Debug)]
+#[serde(tag = "kind", content = "message", rename_all = "snake_case")]
+enum CommitError {
+    /// Screen Recording is not granted to this app.
+    Permission(String),
+    /// There is nothing sensible to capture (no selection, or an area outside every screen).
+    Empty(String),
+    /// The user dismissed the Save dialog. Not a failure, so the UI shows nothing.
+    Cancelled(String),
+    Failed(String),
+}
+
+impl CommitError {
+    fn message(&self) -> &str {
+        match self { Self::Permission(m) | Self::Empty(m) | Self::Cancelled(m) | Self::Failed(m) => m }
+    }
+}
+impl std::fmt::Display for CommitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.message()) }
+}
+
+const NOTHING_SELECTED: &str = "Drag to select an area, or click a window, then press Enter.";
+
 /// `save_as` opens a native dialog so this one capture can go anywhere; otherwise it lands in the
 /// default folder. The default is a default, not a cage.
 #[tauri::command]
 async fn selection_commit(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>, save_as: bool)
-    -> Result<String, String>
+    -> Result<String, CommitError>
 {
     commit(&app, &state, save_as)
 }
 
-fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Result<String, String> {
-    let drag = state.drag.lock().unwrap().take();
-    let Some(drag) = drag else { return Err("no selection".into()) };
-    let rect = drag.rect();
+/// Bring the selector back exactly as the user left it, after a step that needed it out of the way.
+fn restore_selector(app: &tauri::AppHandle, rect: LogRect) {
+    show_overlays(app);
+    broadcast(app, Some(rect));
+}
 
-    // Hide before capturing anyway: the overlays are excluded from the capture by window id, but
-    // the user should not keep staring at a scrim while the file is written.
-    broadcast(app, None);
-    hide_overlays(app);
+/// Nothing destructive happens until the file is safely written. A failure at ANY earlier step
+/// leaves the overlay, the selection and the frozen frame intact, so the user sees the problem
+/// where they are and can retry or adjust, instead of losing a selection they spent time framing.
+fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Result<String, CommitError> {
+    let rect = match *state.drag.lock().unwrap() {
+        Some(d) => d.rect(),
+        None => return Err(CommitError::Empty(NOTHING_SELECTED.into())),
+    };
+    if rect.is_empty() {
+        return Err(CommitError::Empty(NOTHING_SELECTED.into()));
+    }
+
+    // Test hook so the permission UI can be exercised without revoking a real grant.
+    #[cfg(feature = "demo")]
+    if std::env::var("BHC_FORCE_ERROR").as_deref() == Ok("permission") {
+        return Err(CommitError::Permission(PERMISSION_MESSAGE.into()));
+    }
 
     // Prefer the frozen frames: the file then holds exactly what the user saw while selecting.
     // Falls back to a live capture if the freeze had not finished or failed.
     let frozen = state.snapshot.lock().unwrap().clone();
-    release_frozen(state);
     let cropped = match &frozen {
         Some(snap) => snap.capture_region_in(rect, snap.layout()),
         None => {
@@ -422,10 +464,10 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Resul
         }
     };
     let frame = cropped.map_err(|e| match e {
-        CaptureError::PermissionDenied =>
-            "Screen Recording is not granted. Allow it in System Settings, then RELAUNCH BHCapture \
-             — a running app never sees a new grant.".to_string(),
-        other => other.to_string(),
+        CaptureError::PermissionDenied => CommitError::Permission(PERMISSION_MESSAGE.into()),
+        CaptureError::RegionEmpty | CaptureError::RegionOffScreen =>
+            CommitError::Empty("That area is outside every screen. Drag inside a display.".into()),
+        other => CommitError::Failed(other.to_string()),
     })?;
 
     // The name is built from the pattern; `{title}`/`{app}` are untrusted window metadata, so
@@ -442,21 +484,41 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Resul
         width: frame.width(), height: frame.height(), ..Default::default()
     });
 
-    let path = if save_as || ask {
-        app.dialog().file()
+    let asking = save_as || ask;
+    let path = if asking {
+        // The Save dialog has to sit above the overlay, so the overlay steps aside for it.
+        broadcast(app, None);
+        hide_overlays(app);
+        let picked = app.dialog().file()
             .set_title("Save capture")
             .set_directory(&out_dir)
             .set_file_name(format!("{stem}.png"))
             .add_filter("PNG image", &["png"])
-            .blocking_save_file()
-            .ok_or_else(|| "cancelled".to_string())?
-            .into_path().map_err(|e| e.to_string())?
+            .blocking_save_file();
+        match picked.map(|p| p.into_path()) {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => { restore_selector(app, rect); return Err(CommitError::Failed(e.to_string())); }
+            None => {
+                // Cancelled: the capture is not lost, the selector comes straight back.
+                restore_selector(app, rect);
+                return Err(CommitError::Cancelled("Save cancelled. Your selection is still here.".into()));
+            }
+        }
     } else {
         let _ = std::fs::create_dir_all(&out_dir);
         unique_path(&out_dir, &stem, "png", &|p| p.exists())
     };
 
-    write_png(&frame, &path)?;
+    if let Err(e) = write_png(&frame, &path) {
+        if asking { restore_selector(app, rect); }
+        return Err(CommitError::Failed(format!("Could not save the file: {e}")));
+    }
+
+    // Written. Only now is it safe to tear the selector down.
+    *state.drag.lock().unwrap() = None;
+    release_frozen(state);
+    broadcast(app, None);
+    hide_overlays(app);
 
     // Clipboard is a convenience on top of a file that already exists -- never fail the capture
     // for it, just say so.
@@ -466,6 +528,36 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Resul
         }
     }
     Ok(path.display().to_string())
+}
+
+const PERMISSION_MESSAGE: &str = "BHCapture is not allowed to record the screen yet. \
+    Allow it in System Settings, then relaunch BHCapture. A running app never sees a new grant.";
+
+/// Opens System Settings at Screen & System Audio Recording.
+#[tauri::command]
+fn open_privacy_settings() {
+    let _ = std::process::Command::new("/usr/bin/open")
+        .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+        .spawn();
+}
+
+/// Quit and start again. A newly granted Screen Recording permission only takes effect in a NEW
+/// process (verified in Phase 0a), so "allow it, then relaunch" has to be one click, not a chore.
+///
+/// Goes through LaunchServices (`open`) rather than re-executing the binary, so the new process is
+/// a normal app launch. The bundle path is passed as an ARGUMENT to the shell, never interpolated
+/// into the command string.
+#[tauri::command]
+fn relaunch_app(app: tauri::AppHandle) {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bundle) = exe.ancestors().find(|p| p.extension().map_or(false, |e| e == "app")) {
+            let _ = std::process::Command::new("/bin/sh")
+                .arg("-c").arg("sleep 1.5; /usr/bin/open \"$0\"").arg(bundle).spawn();
+            app.exit(0);
+            return;
+        }
+    }
+    app.restart(); // unbundled dev run
 }
 
 fn show_overlays(app: &tauri::AppHandle) {
@@ -516,7 +608,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             overlay_info, selection_begin, selection_update,
             selection_nudge, selection_cancel, selection_commit,
-            snap_at, loupe, selection_set_rect,
+            snap_at, loupe, selection_set_rect, open_privacy_settings, relaunch_app,
             settings_get, settings_save, settings_pick_dir, open_settings
         ])
         .setup(move |app| {
@@ -595,6 +687,60 @@ fn main() {
             });
             #[cfg(feature = "demo")]
             {
+            if std::env::args().any(|a| a == "--demo-notice") {
+                let (h, st) = (handle.clone(), state.clone());
+                std::thread::spawn(move || {
+                    let ms = |n| std::thread::sleep(std::time::Duration::from_millis(n));
+                    let js = |t: &str, x: f64, y: f64| format!(
+                        "(()=>{{const el=document.elementFromPoint({x},{y})||document.body;\
+                         el.dispatchEvent(new MouseEvent('{t}',{{bubbles:true,cancelable:true,\
+                         clientX:{x},clientY:{y},button:0}}));}})()");
+                    let enter = "window.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))";
+                    ms(1500);
+                    open_selector(&h);
+                    ms(1200);
+                    let w = h.get_webview_window("overlay-1").expect("overlay-1");
+                    println!("[notice] visible 1.2s after open_selector = {:?}", w.is_visible());
+
+                    // 1) Enter with nothing selected.
+                    let _ = w.eval(enter);
+                    ms(700);
+                    println!("[notice] visible after the empty Enter = {:?}", w.is_visible());
+                    println!("[notice] HOLD-EMPTY");
+                    ms(4500);
+
+                    // 2) A real selection, then a capture that fails with a permission error.
+                    let _ = w.eval(&js("mousedown", 300.0, 300.0));
+                    for i in 1..=6 {
+                        let _ = w.eval(&js("mousemove", 300.0 + 50.0 * i as f64, 300.0 + 33.0 * i as f64));
+                        ms(40);
+                    }
+                    let _ = w.eval(&js("mouseup", 600.0, 498.0));
+                    ms(400);
+                    std::env::set_var("BHC_FORCE_ERROR", "permission");
+                    let _ = w.eval(enter);
+                    ms(900);
+                    // The point of the restructure: a failure must destroy nothing.
+                    println!("[notice] after the FAILED capture: selection kept = {}, frozen frame kept = {}, overlay still visible = {}",
+                        st.drag.lock().unwrap().is_some(),
+                        st.snapshot.lock().unwrap().is_some(),
+                        w.is_visible().unwrap_or(false));
+                    println!("[notice] HOLD-PERMISSION");
+                    ms(5000);
+
+                    // 3) Clear the forced failure: the SAME selection must now save.
+                    std::env::remove_var("BHC_FORCE_ERROR");
+                    match commit(&h, &st, false) {
+                        Ok(p) => println!("[notice] retry saved: {p}"),
+                        Err(e) => println!("[notice] retry FAILED: {e}"),
+                    }
+                    println!("[notice] after SUCCESS: selection cleared = {}, overlay hidden = {}",
+                        st.drag.lock().unwrap().is_none(), !w.is_visible().unwrap_or(true));
+                    ms(500);
+                    h.exit(0);
+                });
+            }
+
             if std::env::args().any(|a| a == "--demo-snap") {
                 let (h, st) = (handle.clone(), state.clone());
                 std::thread::spawn(move || {
