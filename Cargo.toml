@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bhcapture-core",
+]
+# NOTE: "app/src-tauri" joins this list when the Tauri shell is scaffolded. It MUST be listed
+# once it exists, or the build dies with "package ID <app> did not match".
+# spikes/* are deliberately excluded -- each is its own workspace root.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Benjamin Biswas (BiswasHost)"]
+
+[profile.release]
+debug = true

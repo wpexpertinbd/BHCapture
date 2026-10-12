@@ -1,0 +1,10 @@
+[package]
+name = "bhcapture-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Portable core for BHCapture: coordinate math, image ops, naming, settings."
+
+# Pure portable Rust. NO Tauri, NO UI, NO platform discovery -- the shell injects every path.
+[dependencies]
