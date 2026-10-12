@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "bhcapture-capture"
+version = "0.1.0"
+dependencies = [
+ "bhcapture-core",
+]
+
+[[package]]
 name = "bhcapture-core"
 version = "0.1.0"

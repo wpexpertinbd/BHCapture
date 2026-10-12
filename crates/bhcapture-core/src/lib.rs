@@ -5,3 +5,4 @@
 //! which is what makes the hard parts testable without a screen attached.
 
 pub mod geom;
+pub mod image;
