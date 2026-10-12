@@ -1,0 +1,18 @@
+[package]
+name = "bhc-spike-0b"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its own workspace root on purpose: this spike must NOT get pulled into the real
+# root workspace when that is created, or it becomes a build dependency of the app.
+[workspace]
+
+[dependencies]
+png = "0.17"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+debug = true

@@ -1,0 +1,3 @@
+# Spotlight skips *.noindex, so dev builds never show up as a second app in Finder.
+[build]
+target-dir = "../../target.noindex/spike-0b"
