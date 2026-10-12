@@ -72,10 +72,15 @@ void    bhc_image_free(BhcImage *img);
  * fires several times per physical change -- the caller must debounce. Register once. */
 void    bhc_watch_displays(void (*cb)(void *), void *ctx);
 
-/* A menu-bar (accessory) app is not made active just by showing a window, so its overlay would never
- * receive keystrokes until the first click. Activate on open; deactivate on close so the previous
- * app gets its keyboard back. Both hop to the main thread. */
-void    bhc_activate_app(void);
-void    bhc_deactivate_app(void);
+/* Turn a Tauri overlay window into a NON-ACTIVATING PANEL.
+ *
+ * A menu-bar (accessory) app is not made active by showing a window, and on macOS 14+ it cannot force
+ * itself frontmost (verified on macOS 27: activateIgnoringOtherApps, activate, and activateWithOptions
+ * all left the previous app in front). So an overlay opened by a global hotkey got no keystrokes until
+ * the user clicked once. A non-activating panel can be the KEY window without its app being active,
+ * which is how Spotlight-style overlays take keys -- no Dock icon, no focus fight.
+ *
+ * Returns 1 on success, 0 on a bad argument, -1 if the swap was refused as unsafe. Main thread only. */
+int32_t bhc_make_overlay_panel(void *nswindow);
 
 #endif /* BHC_SCK_H */

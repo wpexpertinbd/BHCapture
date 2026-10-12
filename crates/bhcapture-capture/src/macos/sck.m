@@ -3,6 +3,8 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <AppKit/AppKit.h>
 #import <string.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 #import "sck.h"
 
 /* Every async entry point blocks on a semaphore WITH A TIMEOUT. Without it a missing TCC grant
@@ -347,18 +349,46 @@ void bhc_watch_displays(void (*cb)(void *), void *ctx) {
     });
 }
 
-void bhc_activate_app(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        /* On macOS 14+ this is a REQUEST that the system may decline: an app can no longer force its
-         * way to the front. Verified on macOS 27 that a menu-bar app activated this way from a global
-         * hotkey is NOT made frontmost, so callers must not rely on it for keyboard input. */
-        [NSApp activateIgnoringOtherApps:YES];
-#pragma clang diagnostic pop
-    });
-}
+@interface BHCOverlayPanel : NSPanel
+@end
+@implementation BHCOverlayPanel
+/* A borderless window cannot become key by default, and a panel only if asked. */
+- (BOOL)canBecomeKeyWindow { return YES; }
+/* Never the MAIN window: that would make it look like the app's document window. */
+- (BOOL)canBecomeMainWindow { return NO; }
+@end
 
-void bhc_deactivate_app(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{ [NSApp deactivate]; });
+int32_t bhc_make_overlay_panel(void *nswindow) {
+    if (!nswindow) return 0;
+    NSWindow *w = (__bridge NSWindow *)nswindow;
+    if (![w isKindOfClass:[NSWindow class]]) return 0;
+
+    Class cur = object_getClass(w);
+    Class want = [BHCOverlayPanel class];
+    if (cur == want) return 1;   /* already converted */
+
+    /* Changing an object's class in place is only safe if the new class needs no more memory than
+     * the object was allocated with, otherwise AppKit writes past the end of the allocation.
+     * NSWindow and NSPanel are both 528 bytes on macOS 27, but check the real object every time
+     * rather than trust that a future OS keeps it so. */
+    if (class_getInstanceSize(want) > class_getInstanceSize(cur)) return -1;
+
+    object_setClass(w, want);
+    NSPanel *p = (NSPanel *)w;
+    p.styleMask |= NSWindowStyleMaskNonactivatingPanel;
+    p.floatingPanel = YES;
+    /* Panels default to hiding when their app is inactive -- which is ALWAYS, for this app. */
+    p.hidesOnDeactivate = NO;
+    p.becomesKeyOnlyIfNeeded = NO;
+
+    /* Converting an existing window skips NSPanel's own initialisation, so changing the style mask
+     * does NOT update the window server's "prevents activation" flag, and a real mouse click would
+     * still activate this app. The private selector below syncs it. This is the same step the
+     * widely used tauri-nspanel crate takes (found by reading its source). It is private API, so
+     * it is guarded: if a future macOS drops the selector we lose only that nicety. */
+    SEL prevents = NSSelectorFromString(@"_setPreventsActivation:");
+    if ([p respondsToSelector:prevents]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(p, prevents, YES);
+    }
+    return 1;
 }

@@ -73,6 +73,13 @@ export function Overlay() {
     return () => { un.then((f) => f()); };
   }, []);
 
+  // A capture started by a global key (Enter pressed while another app is in front) has no promise
+  // to reject, so its failure arrives as an event instead.
+  useEffect(() => {
+    const un = listen<Notice>("commit-error", (e) => setNotice(asNotice(e.payload)));
+    return () => { un.then((f) => f()); };
+  }, []);
+
   useEffect(() => {
     if (!notice || notice.kind === "permission") return;
     const t = setTimeout(() => setNotice(null), 6000);
