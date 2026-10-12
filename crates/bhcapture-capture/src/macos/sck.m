@@ -83,7 +83,15 @@ static double bhc_display_scale(SCDisplay *d) {
     return (double)pw / pts;
 }
 
-/* CGImage -> owned, tightly-strided BGRA8. */
+/* CGImage -> owned, tightly-strided BGRA8.
+ *
+ * FAST PATH: copy the pixels straight out of the image's data provider. Drawing the image into a
+ * bitmap context instead (the original approach) leaked ~20 MB per capture on macOS 27 -- Core
+ * Graphics kept a copy per draw even after the image was released. Measured: 12 draws grew a process
+ * from 9 MB to 254 MB; with the draw skipped it stayed flat at 36 MB. A selector session takes one
+ * frame per display, so the leak was ~18 MB every time the hotkey was pressed. The fallback below
+ * is kept for any pixel format the fast path does not recognise.
+ */
 static int32_t bhc_cgimage_to_bgra(CGImageRef img, double scale, BhcImage *out, char *err, int32_t errcap) {
     size_t w = CGImageGetWidth(img), h = CGImageGetHeight(img);
     if (w == 0 || h == 0) { bhc_set_err(err, errcap, @"captured image has zero size"); return BHC_ERR_GENERIC; }
@@ -92,15 +100,35 @@ static int32_t bhc_cgimage_to_bgra(CGImageRef img, double scale, BhcImage *out, 
     uint8_t *buf = (uint8_t *)calloc(h, stride);
     if (!buf) { bhc_set_err(err, errcap, @"out of memory"); return BHC_ERR_GENERIC; }
 
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    /* PremultipliedFirst + 32Little == B,G,R,A byte order in memory. */
-    CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, stride, cs,
-        kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
-    CGColorSpaceRelease(cs);
-    if (!ctx) { free(buf); bhc_set_err(err, errcap, @"CGBitmapContextCreate failed"); return BHC_ERR_GENERIC; }
+    BOOL copied = NO;
+    CGBitmapInfo bi = CGImageGetBitmapInfo(img);
+    if (CGImageGetBitsPerPixel(img) == 32 && CGImageGetBitsPerComponent(img) == 8 &&
+        (bi & kCGBitmapByteOrderMask) == kCGBitmapByteOrder32Little &&
+        (bi & kCGBitmapAlphaInfoMask) == kCGImageAlphaPremultipliedFirst) {
+        CGDataProviderRef dp = CGImageGetDataProvider(img);
+        CFDataRef data = dp ? CGDataProviderCopyData(dp) : NULL;
+        if (data) {
+            size_t bpr = CGImageGetBytesPerRow(img);
+            const uint8_t *src = CFDataGetBytePtr(data);
+            /* Rows may be padded (bpr > w*4); and never read past what the provider actually gave. */
+            if (bpr >= stride && (size_t)CFDataGetLength(data) >= bpr * (h - 1) + stride) {
+                for (size_t y = 0; y < h; y++) memcpy(buf + y * stride, src + y * bpr, stride);
+                copied = YES;
+            }
+            CFRelease(data);
+        }
+    }
 
-    CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
-    CGContextRelease(ctx);
+    if (!copied) {
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        /* PremultipliedFirst + 32Little == B,G,R,A byte order in memory. */
+        CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, stride, cs,
+            kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+        CGColorSpaceRelease(cs);
+        if (!ctx) { free(buf); bhc_set_err(err, errcap, @"CGBitmapContextCreate failed"); return BHC_ERR_GENERIC; }
+        CGContextDrawImage(ctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h), img);
+        CGContextRelease(ctx);
+    }
 
     out->data = buf; out->width = (int32_t)w; out->height = (int32_t)h;
     out->stride = (int32_t)stride; out->scale = scale;
@@ -116,6 +144,10 @@ static int32_t bhc_shoot(SCContentFilter *filter, size_t px_w, size_t px_h, doub
     cfg.width = px_w;
     cfg.height = px_h;
     cfg.pixelFormat = 'BGRA';
+    /* Deliver sRGB. The raw pixel copy below skips Core Graphics' colour conversion, so the values
+     * must already be in the space the saved PNG is assumed to be in. Without this a wide-gamut
+     * (Display P3) screen would come out slightly wrong. */
+    cfg.colorSpaceName = kCGColorSpaceSRGB;
     cfg.showsCursor = show_cursor ? YES : NO;
     cfg.capturesAudio = NO;
 
