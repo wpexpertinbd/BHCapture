@@ -736,6 +736,98 @@ pub(crate) async fn video_save(app: tauri::AppHandle, window: tauri::WebviewWind
     Ok(dest.display().to_string())
 }
 
+#[derive(Serialize, Clone)]
+struct ExportProgress { percent: u32, kind: String }
+
+/// File › Export Recording As: MP4 (H.264), MP4 (HEVC), MOV or GIF, always through a Save dialog.
+/// The file is built next to its destination under a temporary name and renamed into place only when
+/// complete, so a failed or cancelled export never leaves a half-written file under the real name.
+#[tauri::command]
+pub(crate) async fn video_export(app: tauri::AppHandle, window: tauri::WebviewWindow, state: tauri::State<'_, Arc<AppState>>,
+                                 kind: String) -> Result<String, CommitError> {
+    let id = video_id_of(window.label()).map_err(CommitError::Failed)?;
+    let src = videos(|v| v.get(&id).map(|d| d.file.clone()))
+        .ok_or_else(|| CommitError::Failed("this recording is no longer open".into()))?;
+    let (ext, label) = match kind.as_str() {
+        "mp4" => ("mp4", "MPEG-4 Video (H.264)"),
+        "hevc" => ("mp4", "MPEG-4 Video (HEVC)"),
+        "mov" => ("mov", "QuickTime Movie"),
+        "gif" => ("gif", "Animated GIF"),
+        _ => return Err(CommitError::Failed(format!("unknown export format {kind}"))),
+    };
+    let out_dir = state.settings.lock().unwrap().get().output_dir.clone().unwrap_or_else(default_capture_dir);
+    let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "BHCapture".into());
+    let mut dest = match app.dialog().file()
+        .set_title("Export recording")
+        .set_directory(&out_dir)
+        .set_file_name(format!("{stem}.{ext}"))
+        .add_filter(label, &[ext])
+        .set_parent(&window)
+        .blocking_save_file().map(|p| p.into_path()) {
+        Some(Ok(p)) => p,
+        Some(Err(e)) => return Err(CommitError::Failed(e.to_string())),
+        None => return Err(CommitError::Cancelled("Export cancelled.".into())),
+    };
+    if dest.extension().map_or(true, |e| !e.eq_ignore_ascii_case(ext)) {
+        let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        dest.set_file_name(format!("{name}.{ext}"));
+    }
+    if dest == src { return Err(CommitError::Failed("Choose a folder other than BHCapture's working folder.".into())); }
+    let tmp = dest.with_file_name(format!(".{}.bhc-partial.{ext}",
+        dest.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
+
+    let (win, k) = (window.clone(), kind.clone());
+    let report = move |p: f64| { let _ = win.emit_to(win.label(), "video-export-progress",
+        ExportProgress { percent: (p.clamp(0.0, 1.0) * 100.0) as u32, kind: k.clone() }); true };
+    let (s2, t2, k2) = (src.clone(), tmp.clone(), kind.clone());
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        use bhcapture_capture::macos::{export_video, VideoExport};
+        let mut report = report;
+        match k2.as_str() {
+            "mp4" => { std::fs::copy(&s2, &t2).map(|_| ()).map_err(|e| e.to_string()) }
+            "hevc" => export_video(&s2, &t2, VideoExport::Hevc, &mut report).map_err(|e| e.to_string()),
+            "mov" => export_video(&s2, &t2, VideoExport::Mov, &mut report).map_err(|e| e.to_string()),
+            _ => export_gif(&s2, &t2, &mut report),
+        }
+    }).await.map_err(|e| CommitError::Failed(e.to_string()))?;
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CommitError::Failed(format!("Export failed: {e}")));
+    }
+    #[cfg(unix)]
+    { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)); }
+    std::fs::rename(&tmp, &dest).map_err(|e| { let _ = std::fs::remove_file(&tmp);
+        CommitError::Failed(format!("Could not save the export: {e}")) })?;
+    // The user has their copy, in the format they chose: closing no longer needs to ask.
+    videos(|v| if let Some(d) = v.get_mut(&id) { d.saved_to = Some(dest.clone()); });
+    println!("[record] {} exported as {kind} to {}", window.label(), dest.display());
+    Ok(dest.display().to_string())
+}
+
+fn export_gif(src: &Path, dst: &Path, report: &mut dyn FnMut(f64) -> bool) -> Result<(), String> {
+    use bhcapture_core::gif_export::{GifWriter, DEFAULT_FPS, DEFAULT_MAX_SIDE};
+    let mut w: Option<GifWriter<std::io::BufWriter<std::fs::File>>> = None;
+    let (mut end, mut failure) = (0.0, None::<String>);
+    let mut last_report = -1.0;
+    bhcapture_capture::macos::video_frames(src, DEFAULT_FPS, DEFAULT_MAX_SIDE, |px, wd, ht, t, dur| {
+        if w.is_none() {
+            match std::fs::File::create(dst).map_err(|e| e.to_string())
+                .and_then(|f| GifWriter::new(std::io::BufWriter::new(f), wd, ht).map_err(|e| e.to_string())) {
+                Ok(g) => w = Some(g),
+                Err(e) => { failure = Some(e); return false; }
+            }
+        }
+        end = dur;
+        if let Err(e) = w.as_mut().unwrap().push(px, t) { failure = Some(e.to_string()); return false; }
+        if dur > 0.0 && t - last_report >= dur / 50.0 { last_report = t; return report(t / dur); }
+        true
+    }).map_err(|e| failure.clone().unwrap_or_else(|| e.to_string()))?;
+    if let Some(e) = failure { return Err(e); }
+    w.ok_or("no frames")?.finish(end).map_err(|e| e.to_string())?;
+    report(1.0);
+    Ok(())
+}
+
 /// Copy readable only by this user (0600), like every capture (see `write_private`).
 fn copy_private(src: &Path, dest: &Path) -> std::io::Result<()> {
     std::fs::copy(src, dest)?;

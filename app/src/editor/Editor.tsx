@@ -353,7 +353,7 @@ export function Editor() {
         <span>{info.width} × {info.height} px</span>
         <span className="ed-dim">{FORMATS.find((f) => f.value === format)?.label}</span>
         <span className="ed-dim">{savedTo ? (dirty ? "Edited since last save" : `Saved · ${savedTo.split("/").pop()}`) : "Not saved yet"}</span>
-        <span className="ed-dim ed-keys">File › Save ⌘S · Save As ⇧⌘S · Format · Edit › Copy ⌘C · Undo ⌘Z</span>
+        <span className="ed-dim ed-keys">File › Save ⌘S · Save As ⇧⌘S · Image Format · Edit › Copy ⌘C · Undo ⌘Z</span>
       </div>
 
       {notice && <div className={`ed-notice ${notice.kind}`}>{notice.message}</div>}

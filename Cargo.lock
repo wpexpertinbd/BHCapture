@@ -163,6 +163,7 @@ dependencies = [
 name = "bhcapture-core"
 version = "0.1.0"
 dependencies = [
+ "gif",
  "image",
  "nnnoiseless",
  "serde",

@@ -44,6 +44,12 @@ extern "C" {
     fn bhc_rec_status(r: *mut BhcRecorder, out: *mut BhcRecordStatus, err: *mut c_char, errcap: i32);
     fn bhc_rec_stop(r: *mut BhcRecorder, err: *mut c_char, errcap: i32) -> i32;
     fn bhc_rec_mic_supported() -> i32;
+    fn bhc_video_frames(path: *const c_char, fps: f64, max_side: i32,
+        cb: extern "C" fn(*const u8, i32, i32, f64, f64, *mut std::ffi::c_void) -> i32,
+        ctx: *mut std::ffi::c_void, err: *mut c_char, errcap: i32) -> i32;
+    fn bhc_export_video(src: *const c_char, dst: *const c_char, kind: i32,
+        progress: extern "C" fn(f64, *mut std::ffi::c_void) -> i32, ctx: *mut std::ffi::c_void,
+        err: *mut c_char, errcap: i32) -> i32;
     fn bhc_watch_clicks(cb: extern "C" fn(f64, f64, i32, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void);
     fn bhc_unwatch_clicks();
     fn bhc_rec_mix_audio(src: *const c_char, dst: *const c_char, err: *mut c_char, errcap: i32) -> i32;
@@ -78,6 +84,50 @@ pub fn watch_clicks(f: impl Fn(f64, f64, bool) + Send + Sync + 'static) {
 pub fn unwatch_clicks() {
     unsafe { bhc_unwatch_clicks() };
     *CLICK_WATCHER.lock().unwrap() = None;
+}
+
+type FrameFn<'a> = &'a mut dyn FnMut(&[u8], u32, u32, f64, f64) -> bool;
+
+extern "C" fn frame_trampoline(rgba: *const u8, w: i32, h: i32, t: f64, dur: f64, ctx: *mut std::ffi::c_void) -> i32 {
+    let f = unsafe { &mut *(ctx as *mut FrameFn) };
+    let px = unsafe { std::slice::from_raw_parts(rgba, (w.max(0) as usize) * (h.max(0) as usize) * 4) };
+    if f(px, w as u32, h as u32, t, dur) { 0 } else { 1 }
+}
+
+/// Decode a recording into RGBA frames at `fps`, longest side at most `max_side`. `f(rgba, w, h,
+/// t, duration)` returns `false` to stop early. For GIF export.
+pub fn video_frames(path: &std::path::Path, fps: f64, max_side: u32,
+                    mut f: impl FnMut(&[u8], u32, u32, f64, f64) -> bool) -> Result<(), CaptureError> {
+    let p = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| CaptureError::Backend("bad path".into()))?;
+    let mut err = [0 as c_char; ERRCAP];
+    let mut dynf: FrameFn = &mut f;
+    let rc = unsafe { bhc_video_frames(p.as_ptr(), fps, max_side as i32, frame_trampoline,
+                                       &mut dynf as *mut FrameFn as *mut std::ffi::c_void, err.as_mut_ptr(), ERRCAP as i32) };
+    if rc == 0 { Ok(()) } else { Err(CaptureError::Backend(cstr(&err))) }
+}
+
+/// What [`export_video`] makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoExport { Mov, Hevc }
+
+type ProgressFn<'a> = &'a mut dyn FnMut(f64) -> bool;
+
+extern "C" fn progress_trampoline(p: f64, ctx: *mut std::ffi::c_void) -> i32 {
+    let f = unsafe { &mut *(ctx as *mut ProgressFn) };
+    if f(p) { 0 } else { 1 }
+}
+
+/// Re-wrap a recording as MOV, or re-encode it as HEVC MP4. `progress(0..1)` returns `false` to cancel.
+pub fn export_video(src: &std::path::Path, dst: &std::path::Path, kind: VideoExport,
+                    mut progress: impl FnMut(f64) -> bool) -> Result<(), CaptureError> {
+    let s = CString::new(src.to_string_lossy().as_bytes()).map_err(|_| CaptureError::Backend("bad path".into()))?;
+    let d = CString::new(dst.to_string_lossy().as_bytes()).map_err(|_| CaptureError::Backend("bad path".into()))?;
+    let mut err = [0 as c_char; ERRCAP];
+    let mut dynf: ProgressFn = &mut progress;
+    let k = match kind { VideoExport::Mov => 0, VideoExport::Hevc => 1 };
+    let rc = unsafe { bhc_export_video(s.as_ptr(), d.as_ptr(), k, progress_trampoline,
+                                       &mut dynf as *mut ProgressFn as *mut std::ffi::c_void, err.as_mut_ptr(), ERRCAP as i32) };
+    if rc == 0 { Ok(()) } else { Err(CaptureError::Backend(cstr(&err))) }
 }
 
 /// Whether the microphone can be recorded on this macOS (15 or later).

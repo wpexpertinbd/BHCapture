@@ -20,7 +20,7 @@ fn main() {
         .flag("-Wall")
         .compile("bhc_sck");
 
-    for fw in ["ScreenCaptureKit", "CoreGraphics", "CoreFoundation", "Foundation", "CoreMedia", "CoreVideo", "AppKit", "AVFoundation"] {
+    for fw in ["ScreenCaptureKit", "CoreGraphics", "CoreFoundation", "Foundation", "CoreMedia", "CoreVideo", "AppKit", "AVFoundation", "Accelerate"] {
         println!("cargo:rustc-link-lib=framework={fw}");
     }
 }

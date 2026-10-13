@@ -69,6 +69,15 @@ void  *bhc_eq_new(uint32_t sample_rate);
 void   bhc_eq_process(void *e, float *samples, size_t n);
 void   bhc_eq_free(void *e);
 
+/* Decode a recording to RGBA frames at `fps` (longest side <= max_side); cb returns non-zero to stop. */
+int32_t bhc_video_frames(const char *path, double fps, int32_t max_side,
+                         int32_t (*cb)(const uint8_t *rgba, int32_t w, int32_t h, double t, double dur, void *ctx),
+                         void *ctx, char *err, int32_t errcap);
+
+/* Re-wrap as MOV (kind 0) or re-encode as HEVC MP4 (kind 1). progress returns non-zero to cancel. */
+int32_t bhc_export_video(const char *src_path, const char *dst_path, int32_t kind,
+                         int32_t (*progress)(double, void *), void *ctx, char *err, int32_t errcap);
+
 /* Report every left/right mouse-down anywhere on screen as global TOP-LEFT logical points, for the
  * click highlight. A global NSEvent monitor: needs no Accessibility permission for mouse events.
  * Main thread only. One watcher at a time; watch again replaces it. */

@@ -17,6 +17,7 @@ export function VideoWindow() {
   const [status, setStatus] = useState<string | null>(null);
   const [asking, setAsking] = useState(false);
   const [size, setSize] = useState<{ w: number; h: number; d: number } | null>(null);
+  const [exporting, setExporting] = useState<{ kind: string; percent: number } | null>(null);
   const saving = useRef(false);
   const infoRef = useRef<Info | null>(null);
   infoRef.current = info;
@@ -43,6 +44,29 @@ export function VideoWindow() {
     }
   }, []);
 
+  const NAMES: Record<string, string> = { mp4: "MP4", hevc: "MP4 (HEVC)", mov: "MOV", gif: "GIF" };
+  const exportAs = useCallback(async (kind: string) => {
+    if (saving.current) return;
+    saving.current = true;
+    setExporting({ kind, percent: -1 }); // -1 = the Save dialog is still open
+    try {
+      const path = await invoke<string>("video_export", { kind });
+      setInfo((i) => (i ? { ...i, saved_to: path } : i));
+      setStatus(`Exported ${NAMES[kind] ?? kind} to ${path}`);
+    } catch (e) {
+      const f = e as Failure;
+      if (!(f && f.kind === "cancelled")) setStatus(f && f.message ? f.message : String(e));
+    } finally {
+      saving.current = false;
+      setExporting(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    const un = listen<{ percent: number; kind: string }>("video-export-progress", (e) => setExporting(e.payload));
+    return () => { un.then((f) => f()); };
+  }, []);
+
   const close = useCallback(() => {
     if (infoRef.current && !infoRef.current.saved_to) { setAsking(true); return; }
     void invoke("video_close");
@@ -54,6 +78,7 @@ export function VideoWindow() {
     if (a === "save") void save(false);
     else if (a === "save-as") void save(true);
     else if (a === "close") close();
+    else if (a.startsWith("export:")) void exportAs(a.slice(7));
   };
   useEffect(() => {
     const a = listen<string>("editor-menu", (e) => menu.current(e.payload));
@@ -91,8 +116,10 @@ export function VideoWindow() {
       </div>
       <div className="vd-status">
         <span>{size ? `${size.w} × ${size.h} px · ${isFinite(size.d) ? size.d.toFixed(1) + " s" : ""} · MP4` : "MP4"}</span>
-        <span className="vd-msg">{status ?? (info.saved_to ? `Saved to ${info.saved_to}` : "Not saved yet")}</span>
-        <span className="vd-hint">File › Save ⌘S · Save As ⇧⌘S · Close ⌘W</span>
+        <span className="vd-msg">{exporting
+          ? (exporting.percent < 0 ? "Choose where to save…" : `Exporting ${NAMES[exporting.kind] ?? exporting.kind}… ${exporting.percent}%`)
+          : (status ?? (info.saved_to ? `Saved to ${info.saved_to}` : "Not saved yet"))}</span>
+        <span className="vd-hint">File › Save ⌘S · Export Recording As (MP4, HEVC, MOV, GIF ⇧⌘E) · Close ⌘W</span>
       </div>
       {asking && (
         <div className="ed-modal-backdrop">

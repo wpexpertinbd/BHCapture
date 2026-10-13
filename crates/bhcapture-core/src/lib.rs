@@ -7,6 +7,7 @@
 pub mod denoise;
 pub mod export;
 pub mod geom;
+pub mod gif_export;
 pub mod hotkey;
 pub mod image;
 pub mod level;

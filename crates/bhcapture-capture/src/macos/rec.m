@@ -638,3 +638,218 @@ void bhc_unwatch_clicks(void) {
     if (gClickMonitor) { [NSEvent removeMonitor:gClickMonitor]; gClickMonitor = nil; }
     gClickCb = NULL; gClickCtx = NULL;
 }
+
+/* Decode a recording into RGBA frames at `fps`, longest side at most `max_side`, calling `cb` for
+ * each (return non-zero from `cb` to stop). For GIF export.
+ *
+ * Reads EVERY decoded frame in order (cheap: the hardware decoder is fast) and hands on the frame
+ * that is current at each output tick, so a still screen -- where the recorder wrote few frames --
+ * still yields evenly spaced output. Scaling and the BGRA->RGBA swap are vImage, NOT a Core Graphics
+ * draw (a CGContextDrawImage per frame leaked ~20 MB each on macOS 27, see sck.m). */
+#import <Accelerate/Accelerate.h>
+
+int32_t bhc_video_frames(const char *path, double fps, int32_t max_side,
+                         int32_t (*cb)(const uint8_t *rgba, int32_t w, int32_t h, double t, double dur, void *ctx),
+                         void *ctx, char *err, int32_t errcap) {
+    @autoreleasepool {
+        if (fps <= 0) fps = 12;
+        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:@{ AVURLAssetPreferPreciseDurationAndTimingKey: @YES }];
+        dispatch_semaphore_t s = dispatch_semaphore_create(0);
+        [asset loadValuesAsynchronouslyForKeys:@[@"duration"] completionHandler:^{ dispatch_semaphore_signal(s); }];
+        if (!rec_wait(s, 10)) { rec_set_err(err, errcap, @"timed out reading the recording"); return BHC_ERR_GENERIC; }
+        double dur = CMTimeGetSeconds(asset.duration);
+        NSArray<AVAssetTrack *> *vt = nil;
+        if (!rec_wait_load(asset, AVMediaTypeVideo, &vt) || vt.count == 0) { rec_set_err(err, errcap, @"no video in this file"); return BHC_ERR_GENERIC; }
+
+        NSError *e = nil;
+        AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&e];
+        if (!reader) { rec_set_err(err, errcap, e.localizedDescription); return BHC_ERR_GENERIC; }
+        AVAssetReaderTrackOutput *out = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:vt[0]
+            outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA) }];
+        out.alwaysCopiesSampleData = NO;
+        [reader addOutput:out];
+        if (![reader startReading]) { rec_set_err(err, errcap, reader.error.localizedDescription ?: @"cannot read"); return BHC_ERR_GENERIC; }
+
+        uint8_t *scaled = NULL, *rgba = NULL;
+        int32_t W = 0, H = 0;
+        double next = 0, step = 1.0 / fps;
+        int32_t rc = BHC_OK;
+        uint8_t perm[4] = {2, 1, 0, 3};   /* BGRA -> RGBA */
+        CMSampleBufferRef sb;
+        BOOL stop = NO;
+        while (!stop && (sb = [out copyNextSampleBuffer])) {
+            @autoreleasepool {
+                double t = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb));
+                CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
+                if (pb && t + 1e-6 >= next) {
+                    CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+                    vImage_Buffer src = { CVPixelBufferGetBaseAddress(pb), CVPixelBufferGetHeight(pb),
+                                          CVPixelBufferGetWidth(pb), CVPixelBufferGetBytesPerRow(pb) };
+                    if (!scaled) {
+                        double sw = (double)src.width, sh = (double)src.height, longest = sw > sh ? sw : sh;
+                        double k = (max_side > 0 && longest > max_side) ? max_side / longest : 1.0;
+                        W = (int32_t)llround(sw * k); H = (int32_t)llround(sh * k);
+                        if (W < 1) W = 1;
+                        if (H < 1) H = 1;
+                        scaled = malloc((size_t)W * H * 4); rgba = malloc((size_t)W * H * 4);
+                        if (!scaled || !rgba) { rc = BHC_ERR_GENERIC; rec_set_err(err, errcap, @"out of memory"); stop = YES; }
+                    }
+                    if (!stop) {
+                        vImage_Buffer dst = { scaled, (vImagePixelCount)H, (vImagePixelCount)W, (size_t)W * 4 };
+                        vImage_Buffer fin = { rgba, (vImagePixelCount)H, (vImagePixelCount)W, (size_t)W * 4 };
+                        vImageScale_ARGB8888(&src, &dst, NULL, kvImageHighQualityResampling);
+                        vImagePermuteChannels_ARGB8888(&dst, &fin, perm, kvImageNoFlags);
+                        /* Every tick this frame covers: the encoder merges repeats. */
+                        while (!stop && t + 1e-6 >= next) {
+                            if (cb(rgba, W, H, next, dur, ctx) != 0) stop = YES;
+                            next += step;
+                        }
+                    }
+                    CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+                }
+                CFRelease(sb);
+            }
+        }
+        /* Hold the last frame to the end of the recording. */
+        while (!stop && rc == BHC_OK && rgba && next < dur) {
+            if (cb(rgba, W, H, next, dur, ctx) != 0) stop = YES;
+            next += step;
+        }
+        if (stop && rc == BHC_OK) { rc = BHC_ERR_GENERIC; rec_set_err(err, errcap, @"cancelled"); }
+        if (reader.status == AVAssetReaderStatusFailed && rc == BHC_OK) {
+            rc = BHC_ERR_GENERIC; rec_set_err(err, errcap, reader.error.localizedDescription ?: @"decode failed");
+        }
+        [reader cancelReading];
+        free(scaled); free(rgba);
+        if (rc == BHC_OK && !W) { rc = BHC_ERR_GENERIC; rec_set_err(err, errcap, @"no frames in this file"); }
+        return rc;
+    }
+}
+
+/* Re-wrap (kind 0: MOV, no re-encode) or re-encode (kind 1: HEVC in MP4, hardware) a recording.
+ * `progress(fraction, ctx)` is called about ten times a second; return non-zero to cancel. */
+/* HEVC at ~55% of the source's bitrate -- what HEVC needs for the quality H.264 had. Apple's
+ * HEVC export presets aim at "highest quality" and came out ~85% BIGGER than the H.264 original
+ * (3.0 MB -> 5.6 MB), so "smaller" would have been a false promise. Audio is copied untouched. */
+static int32_t rec_export_hevc(NSURL *src, NSURL *dst, int32_t (*progress)(double, void *), void *ctx,
+                               char *err, int32_t errcap) {
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:src options:nil];
+    NSArray<AVAssetTrack *> *vt = nil, *at = nil;
+    if (!rec_wait_load(asset, AVMediaTypeVideo, &vt) || !rec_wait_load(asset, AVMediaTypeAudio, &at) || vt.count == 0) {
+        rec_set_err(err, errcap, @"could not read the recording"); return BHC_ERR_GENERIC;
+    }
+    AVAssetTrack *v = vt[0];
+    double dur = CMTimeGetSeconds(v.timeRange.duration);
+    CGSize sz = v.naturalSize;
+    double rate = v.estimatedDataRate;           /* bits per second */
+    double bps = rate > 0 ? rate * 0.55 : 4e6;
+    /* Floor low: a 1 Mbps floor made a quiet 0.9 Mbps recording come out BIGGER as HEVC (604 -> 634 KB). */
+    if (bps < 250e3) bps = 250e3;
+
+    NSError *e = nil;
+    AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&e];
+    AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:dst fileType:AVFileTypeMPEG4 error:&e];
+    if (!reader || !writer) { rec_set_err(err, errcap, e.localizedDescription); return BHC_ERR_GENERIC; }
+    writer.shouldOptimizeForNetworkUse = YES;
+    AVAssetReaderTrackOutput *vout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:v
+        outputSettings:@{ (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) }];
+    vout.alwaysCopiesSampleData = NO;
+    AVAssetWriterInput *vin = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:@{
+        AVVideoCodecKey: AVVideoCodecTypeHEVC,
+        AVVideoWidthKey: @((int)sz.width), AVVideoHeightKey: @((int)sz.height),
+        AVVideoCompressionPropertiesKey: @{ AVVideoAverageBitRateKey: @((int64_t)bps) },
+        AVVideoColorPropertiesKey: @{
+            AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+            AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+            AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2 } }];
+    [reader addOutput:vout]; [writer addInput:vin];
+    AVAssetReaderTrackOutput *aout = nil; AVAssetWriterInput *ain = nil;
+    if (at.count) {
+        aout = [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:at[0] outputSettings:nil];
+        ain = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:nil
+                                                sourceFormatHint:(__bridge CMFormatDescriptionRef)at[0].formatDescriptions.firstObject];
+        if ([reader canAddOutput:aout] && [writer canAddInput:ain]) { [reader addOutput:aout]; [writer addInput:ain]; }
+        else { aout = nil; ain = nil; }
+    }
+    if (![reader startReading] || ![writer startWriting]) {
+        rec_set_err(err, errcap, reader.error.localizedDescription ?: writer.error.localizedDescription ?: @"cannot start");
+        [reader cancelReading]; [writer cancelWriting]; return BHC_ERR_GENERIC;
+    }
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
+    __block BOOL failed = NO, cancelled = NO;
+    __block double vdone = 0;
+    dispatch_group_t g = dispatch_group_create();
+    NSMutableArray *pairs = [NSMutableArray arrayWithObject:@[vin, vout, @YES]];
+    if (ain) [pairs addObject:@[ain, aout, @NO]];
+    for (NSArray *pr in pairs) {
+        AVAssetWriterInput *in = pr[0]; AVAssetReaderOutput *out = pr[1]; BOOL isVideo = [pr[2] boolValue];
+        dispatch_group_enter(g);
+        __block BOOL done = NO;
+        [in requestMediaDataWhenReadyOnQueue:dispatch_queue_create("com.biswashost.bhcapture.hevc", DISPATCH_QUEUE_SERIAL) usingBlock:^{
+            while (!done && in.readyForMoreMediaData) {
+                CMSampleBufferRef sb = cancelled ? NULL : [out copyNextSampleBuffer];
+                if (!sb) { done = YES; [in markAsFinished]; dispatch_group_leave(g); return; }
+                if (isVideo) vdone = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb));
+                BOOL ok = [in appendSampleBuffer:sb];
+                CFRelease(sb);
+                if (!ok) { failed = YES; done = YES; [in markAsFinished]; dispatch_group_leave(g); return; }
+            }
+        }];
+    }
+    while (dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC)) != 0) {
+        if (progress && progress(dur > 0 ? MIN(vdone / dur, 0.99) : 0, ctx) != 0) cancelled = YES;
+    }
+    if (failed || cancelled || reader.status == AVAssetReaderStatusFailed) {
+        [reader cancelReading]; [writer cancelWriting];
+        [NSFileManager.defaultManager removeItemAtURL:dst error:nil];
+        rec_set_err(err, errcap, cancelled ? @"cancelled" : (writer.error.localizedDescription ?: reader.error.localizedDescription ?: @"HEVC export failed"));
+        return BHC_ERR_GENERIC;
+    }
+    dispatch_semaphore_t fin = dispatch_semaphore_create(0);
+    [writer finishWritingWithCompletionHandler:^{ dispatch_semaphore_signal(fin); }];
+    if (!rec_wait(fin, 60) || writer.status != AVAssetWriterStatusCompleted) {
+        rec_set_err(err, errcap, writer.error.localizedDescription ?: @"could not finish the HEVC file");
+        return BHC_ERR_GENERIC;
+    }
+    if (progress) progress(1.0, ctx);
+    return BHC_OK;
+}
+
+int32_t bhc_export_video(const char *src_path, const char *dst_path, int32_t kind,
+                         int32_t (*progress)(double, void *), void *ctx, char *err, int32_t errcap) {
+    @autoreleasepool {
+        if (kind == 1) {
+            NSURL *s1 = [NSURL fileURLWithPath:[NSString stringWithUTF8String:src_path]];
+            NSURL *d1 = [NSURL fileURLWithPath:[NSString stringWithUTF8String:dst_path]];
+            [NSFileManager.defaultManager removeItemAtURL:d1 error:nil];
+            return rec_export_hevc(s1, d1, progress, ctx, err, errcap);
+        }
+        NSURL *src = [NSURL fileURLWithPath:[NSString stringWithUTF8String:src_path]];
+        NSURL *dst = [NSURL fileURLWithPath:[NSString stringWithUTF8String:dst_path]];
+        [NSFileManager.defaultManager removeItemAtURL:dst error:nil];
+        AVURLAsset *asset = [AVURLAsset URLAssetWithURL:src options:nil];
+        NSString *preset = AVAssetExportPresetPassthrough;
+        AVAssetExportSession *ex = [AVAssetExportSession exportSessionWithAsset:asset presetName:preset];
+        if (!ex) { rec_set_err(err, errcap, @"this Mac cannot export in that format"); return BHC_ERR_UNSUPPORTED; }
+        ex.outputURL = dst;
+        ex.outputFileType = AVFileTypeQuickTimeMovie;
+        ex.shouldOptimizeForNetworkUse = YES;   /* index at the front: starts playing before it downloads */
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        [ex exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(done); }];
+        while (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC)) != 0) {
+            if (progress && progress(ex.progress, ctx) != 0) { [ex cancelExport]; }
+        }
+        if (ex.status == AVAssetExportSessionStatusCancelled) {
+            [NSFileManager.defaultManager removeItemAtURL:dst error:nil];
+            rec_set_err(err, errcap, @"cancelled"); return BHC_ERR_GENERIC;
+        }
+        if (ex.status != AVAssetExportSessionStatusCompleted) {
+            [NSFileManager.defaultManager removeItemAtURL:dst error:nil];
+            rec_set_err(err, errcap, ex.error.localizedDescription ?: @"export failed"); return BHC_ERR_GENERIC;
+        }
+        if (progress) progress(1.0, ctx);
+        return BHC_OK;
+    }
+}

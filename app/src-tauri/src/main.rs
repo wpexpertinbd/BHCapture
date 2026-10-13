@@ -1043,13 +1043,21 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     }
     *FORMAT_ITEMS.lock().unwrap() = checks;
     let fmt_refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = format_items.iter().map(|i| i as _).collect();
-    let format_menu = Submenu::with_items(app, "Format", true, &fmt_refs)?;
+    let format_menu = Submenu::with_items(app, "Image Format", true, &fmt_refs)?;
+    // Recordings: the popular upload formats (decision 22). Acts only in a recording window.
+    let export_menu = Submenu::with_items(app, "Export Recording As", true, &[
+        &MenuItem::with_id(app, "ed:export:mp4", "MP4 (H.264) — plays everywhere…", true, None::<&str>)?,
+        &MenuItem::with_id(app, "ed:export:hevc", "MP4 (HEVC) — smaller file…", true, None::<&str>)?,
+        &MenuItem::with_id(app, "ed:export:mov", "MOV — for Final Cut / iMovie…", true, None::<&str>)?,
+        &MenuItem::with_id(app, "ed:export:gif", "Animated GIF — for chats and READMEs…", true, Some("Shift+CmdOrCtrl+E"))?,
+    ])?;
 
     let file = Submenu::with_items(app, "File", true, &[
         &MenuItem::with_id(app, "ed:save", "Save", true, Some("CmdOrCtrl+S"))?,
         &MenuItem::with_id(app, "ed:save-as", "Save As…", true, Some("Shift+CmdOrCtrl+S"))?,
         &PredefinedMenuItem::separator(app)?,
         &format_menu,
+        &export_menu,
         &PredefinedMenuItem::separator(app)?,
         &MenuItem::with_id(app, "ed:close", "Close", true, Some("CmdOrCtrl+W"))?,
     ])?;
@@ -1290,7 +1298,7 @@ fn main() {
             editor_info, editor_pixels, editor_save, editor_copy, editor_close, editor_format_changed,
             recording::recorder_info, recording::recorder_option, recording::recorder_start,
             recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel, recording::recorder_hide, recording::recorder_restart,
-            recording::video_info, recording::video_save, recording::video_close
+            recording::video_info, recording::video_save, recording::video_close, recording::video_export
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

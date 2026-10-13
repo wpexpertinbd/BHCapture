@@ -14,7 +14,9 @@ serde_json = "1"
 # formats offered, which keeps the build and the binary small.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tiff", "gif"] }
 nnnoiseless = { version = "0.5.2", default-features = false }
+gif = "0.14"
 
 [dev-dependencies]
+gif = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tiff", "gif"] }
 serde_json = "1"

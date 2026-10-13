@@ -7,7 +7,7 @@ use bhcapture_core::geom::{Display, DisplayId, DisplayLayout, LogRect, PhysSize,
 use bhcapture_core::image::Frame;
 
 mod rec;
-pub use rec::{microphone_supported, mix_audio_tracks, unwatch_clicks, watch_clicks, MacRecorder};
+pub use rec::{export_video, microphone_supported, mix_audio_tracks, unwatch_clicks, video_frames, watch_clicks, MacRecorder, VideoExport};
 
 use crate::{CaptureError, Capturer, Targets, WindowId, WindowInfo};
 
