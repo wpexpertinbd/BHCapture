@@ -1,0 +1,8 @@
+#!/bin/bash
+# Tauri `--runner` for Windows cross-builds: `npx tauri build --runner ../scripts/xwin-runner --target x86_64-pc-windows-msvc`.
+# Uses rustup's cargo (Homebrew's has no Windows std) with cargo-xwin and Homebrew LLVM.
+set -euo pipefail
+TC="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin"
+export PATH="$TC/bin:$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:$PATH"
+export RUSTC="$TC/bin/rustc"
+exec "$TC/bin/cargo" xwin "$@"

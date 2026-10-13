@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 mod recording;
 
-use bhcapture_capture::{macos::MacCapturer, CaptureError, Capturer, Snapshot};
+use bhcapture_capture::{platform::{self, PlatformCapturer}, CaptureError, Capturer, Snapshot};
 use bhcapture_core::geom::{DisplayId, DisplayLayout, LogPoint, LogRect};
 use bhcapture_core::image::Frame;
 use bhcapture_core::naming::{Fields, Pattern, Stamp, unique_path};
@@ -36,7 +36,7 @@ const SETTINGS_WINDOW: &str = "settings";
 const EDITOR_PREFIX: &str = "editor-";
 
 struct AppState {
-    capturer: MacCapturer,
+    capturer: PlatformCapturer,
     settings: Mutex<SettingsStore>,
     /// Cached so the hotkey path never pays ~29 ms to re-enumerate displays.
     /// Refreshed on display reconfiguration, not per capture.
@@ -269,7 +269,7 @@ fn sync_dock(app: &tauri::AppHandle, closing: Option<&str>) {
         let _ = app.set_activation_policy(policy);
         if any_window && !was_regular {
             // Without this the File/Edit menus draw but do not open (macOS bug, see the shim).
-            let _ = app.run_on_main_thread(bhcapture_capture::macos::refresh_menu_bar);
+            let _ = app.run_on_main_thread(platform::refresh_menu_bar);
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -453,9 +453,33 @@ fn cancel_selector(app: &tauri::AppHandle, state: &AppState) {
 ///
 /// A private file, not the Keychain (family rule): every new self-signed build looks like a
 /// different app to the Keychain, so it would prompt after every update.
-fn settings_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-    home.join("Library").join("Application Support").join("BHCapture").join("settings.json")
+fn settings_path() -> std::path::PathBuf { app_data_dir().join("settings.json") }
+
+/// The user's home folder: `HOME` on macOS/Linux, `USERPROFILE` on Windows.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from)
+}
+
+/// BHCapture's private data folder: `~/Library/Application Support/BHCapture` on macOS,
+/// `%APPDATA%\BHCapture` on Windows, `$XDG_DATA_HOME/BHCapture` (or `~/.local/share`) on Linux.
+fn app_data_dir() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    let base = home_dir().map(|h| h.join("Library").join("Application Support"));
+    #[cfg(windows)]
+    let base = std::env::var_os("APPDATA").map(std::path::PathBuf::from).or_else(|| home_dir().map(|h| h.join("AppData").join("Roaming")));
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let base = std::env::var_os("XDG_DATA_HOME").map(std::path::PathBuf::from).or_else(|| home_dir().map(|h| h.join(".local").join("share")));
+    base.unwrap_or_else(std::env::temp_dir).join("BHCapture")
+}
+
+/// The OS window behind a Tauri window: `NSWindow*` on macOS, `HWND` on Windows.
+fn native_handle(w: &tauri::WebviewWindow) -> Option<*mut std::ffi::c_void> {
+    #[cfg(target_os = "macos")]
+    { w.ns_window().ok() }
+    #[cfg(windows)]
+    { w.hwnd().ok().map(|h| h.0 as *mut std::ffi::c_void) }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    { let _ = w; None }
 }
 
 /// Push settings that the capture backend owns into it.
@@ -479,7 +503,7 @@ fn default_capture_dir() -> std::path::PathBuf {
         let _ = std::fs::create_dir_all(&dir);
         return dir;
     }
-    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    let home = home_dir();
     let dir = home.as_ref()
         .map(|h| h.join("Pictures").join("BHCapture"))
         .unwrap_or_else(std::env::temp_dir);
@@ -495,6 +519,13 @@ fn default_capture_dir() -> std::path::PathBuf {
 /// Local wall-clock time. Core does no platform discovery, so the shell resolves the time zone
 /// and hands it components -- `localtime_r` rather than UTC, because a file named with UTC is
 /// wrong for everyone not on it.
+#[cfg(windows)]
+fn local_stamp() -> Stamp {
+    let t = bhcapture_capture::windows::local_time();
+    Stamp { year: t.0, month: t.1, day: t.2, hour: t.3, minute: t.4, second: t.5 }
+}
+
+#[cfg(not(windows))]
 fn local_stamp() -> Stamp {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as libc::time_t;
@@ -665,13 +696,13 @@ fn open_editor(app: &tauri::AppHandle, state: &Arc<AppState>, frame: Frame) -> R
     let (a, l) = (app.clone(), label.clone());
     let (tx, rx) = std::sync::mpsc::channel();
     let queued = app.run_on_main_thread(move || {
-        let r = WebviewWindowBuilder::new(&a, &l, WebviewUrl::App("index.html".into()))
+        let b = WebviewWindowBuilder::new(&a, &l, WebviewUrl::App("index.html".into()))
             .title(format!("BHCapture — {w} × {h}"))
             .inner_size(ww, wh)
             .min_inner_size(640.0, 420.0)
             .center()
-            .resizable(true)
-            .build();
+            .resizable(true);
+        let r = with_window_menu(&a, b).build();
         let _ = tx.send(match r {
             Ok(win) => {
                 // A real window: the Dock icon appears (decision 10), and regular mode lets it focus.
@@ -841,6 +872,7 @@ fn report_overlay_focus(window: tauri::Window, focused: bool) {
 /// Opens System Settings at Screen & System Audio Recording.
 #[tauri::command]
 fn open_privacy_settings() {
+    #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("/usr/bin/open")
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
         .spawn();
@@ -854,6 +886,7 @@ fn open_privacy_settings() {
 /// into the command string.
 #[tauri::command]
 fn relaunch_app(app: tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
     if let Ok(exe) = std::env::current_exe() {
         if let Some(bundle) = exe.ancestors().find(|p| p.extension().map_or(false, |e| e == "app")) {
             let _ = std::process::Command::new("/bin/sh")
@@ -1045,12 +1078,17 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let fmt_refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = format_items.iter().map(|i| i as _).collect();
     let format_menu = Submenu::with_items(app, "Image Format", true, &fmt_refs)?;
     // Recordings: the popular upload formats (decision 22). Acts only in a recording window.
-    let export_menu = Submenu::with_items(app, "Export Recording As", true, &[
-        &MenuItem::with_id(app, "ed:export:mp4", "MP4 (H.264) — plays everywhere…", true, None::<&str>)?,
-        &MenuItem::with_id(app, "ed:export:hevc", "MP4 (HEVC) — smaller file…", true, None::<&str>)?,
-        &MenuItem::with_id(app, "ed:export:mov", "MOV — for Final Cut / iMovie…", true, None::<&str>)?,
-        &MenuItem::with_id(app, "ed:export:gif", "Animated GIF — for chats and READMEs…", true, Some("Shift+CmdOrCtrl+E"))?,
-    ])?;
+    let mut exports = vec![
+        MenuItem::with_id(app, "ed:export:mp4", "MP4 (H.264) — plays everywhere…", true, None::<&str>)?,
+        MenuItem::with_id(app, "ed:export:hevc", "MP4 (HEVC) — smaller file…", true, None::<&str>)?,
+    ];
+    // MOV is Apple's container; Windows' Media Foundation cannot write it.
+    if cfg!(target_os = "macos") {
+        exports.push(MenuItem::with_id(app, "ed:export:mov", "MOV — for Final Cut / iMovie…", true, None::<&str>)?);
+    }
+    exports.push(MenuItem::with_id(app, "ed:export:gif", "Animated GIF — for chats and READMEs…", true, Some("Shift+CmdOrCtrl+E"))?);
+    let export_refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = exports.iter().map(|i| i as _).collect();
+    let export_menu = Submenu::with_items(app, "Export Recording As", true, &export_refs)?;
 
     let file = Submenu::with_items(app, "File", true, &[
         &MenuItem::with_id(app, "ed:save", "Save", true, Some("CmdOrCtrl+S"))?,
@@ -1079,6 +1117,16 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         &PredefinedMenuItem::fullscreen(app, None)?,
     ])?;
     Menu::with_items(app, &[&app_menu, &file, &edit, &window])
+}
+
+/// Give a document window (editor, playback) its menu on Windows/Linux, where menus live inside
+/// windows. On macOS the app menu bar serves every window, so the builder is returned unchanged.
+fn with_window_menu<'a>(app: &tauri::AppHandle, b: WebviewWindowBuilder<'a, tauri::Wry, tauri::AppHandle>)
+    -> WebviewWindowBuilder<'a, tauri::Wry, tauri::AppHandle> {
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(m) = build_app_menu(app) { return b.menu(m); }
+    let _ = app;
+    b
 }
 
 /// Send a menu action to the editor the user is working in. Nothing happens if no editor has focus
@@ -1148,16 +1196,15 @@ fn sync_overlays(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result
         println!("[display] {label}: {}x{} pt at ({},{}) scale {:.2}",
             d.bounds.size.w, d.bounds.size.h, d.bounds.min_x(), d.bounds.min_y(), d.scale.get());
 
-        #[cfg(target_os = "macos")]
-        if let Ok(ptr) = w.ns_window() {
-            // Make it a non-activating panel so it can take keystrokes from a global hotkey.
-            // Idempotent, and it refuses (returns -1) rather than risk a memory overrun.
-            let r = unsafe { bhcapture_capture::macos::make_overlay_panel(ptr) };
-            if r != 1 { eprintln!("[panel] {label}: could not convert to a panel (code {r}); keyboard focus may need a click"); }
-
-            // Register the overlay with the capturer so it is excluded from captures.
-            // Without this the selector photographs its own scrim.
-            let id = unsafe { bhcapture_capture::macos::cgwindow_id(ptr) };
+        if let Some(ptr) = native_handle(&w) {
+            // macOS: a non-activating panel, so it can take keystrokes from a global hotkey (idempotent;
+            // refuses rather than risk a memory overrun). Windows: kept out of every capture.
+            if !unsafe { platform::prepare_tool_window(ptr) } {
+                eprintln!("[panel] {label}: could not prepare the overlay; keyboard focus may need a click");
+            }
+            // Register the overlay with the capturer so it is excluded from captures (macOS's list;
+            // Windows does it per window above). Without this the selector photographs its own scrim.
+            let id = unsafe { platform::window_id(ptr) };
             if id != 0 { ids.push(id); }
         }
     }
@@ -1234,7 +1281,7 @@ fn show_overlays(app: &tauri::AppHandle) {
 }
 
 fn main() {
-    let capturer = MacCapturer::new();
+    let capturer = PlatformCapturer::new();
     let layout = capturer.list_displays().unwrap_or_default();
 
     let (store, outcome) = SettingsStore::load(settings_path());
@@ -1306,6 +1353,10 @@ fn main() {
             // bundled app; stating it here makes an unbundled dev run behave the same.
             sync_dock(&handle, None);
             // The menu bar for editor/Settings windows. macOS shows it only in regular mode.
+            // macOS: ONE menu bar for the app. Windows/Linux put a menu INSIDE each window, and an
+            // app-wide one would land on every window -- the selector overlays and the recording bar
+            // too -- so there the editor and playback windows get theirs (`with_window_menu`).
+            #[cfg(target_os = "macos")]
             match build_app_menu(&handle) {
                 Ok(m) => { let _ = app.set_menu(m); }
                 Err(e) => eprintln!("[menu] could not build the menu bar: {e}"),
@@ -1316,7 +1367,7 @@ fn main() {
 
             // Keep the overlays matched to the real displays for the life of the process.
             let h_watch = handle.clone();
-            bhcapture_capture::macos::watch_displays(move || on_displays_changed(&h_watch));
+            platform::watch_displays(move || on_displays_changed(&h_watch));
 
             // Tray: without it there is no way to reach settings, since every window is an
             // overlay that hides itself.

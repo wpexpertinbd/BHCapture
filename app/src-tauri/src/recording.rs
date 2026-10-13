@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use bhcapture_capture::macos::{microphone_supported, MacCapturer, MacRecorder};
+use bhcapture_capture::platform::{self, microphone_supported, PlatformCapturer, Recorder};
 use bhcapture_capture::record::{RecordOptions, RecordState};
 use bhcapture_core::geom::{DisplayId, LogRect, LogSize};
 use bhcapture_core::naming::{unique_path, Fields, Pattern};
@@ -44,12 +44,11 @@ pub(crate) static TRAY_BAR_ITEM: Mutex<Option<MainThreadOnly<tauri::menu::MenuIt
 pub(crate) static TRAY_PAUSE_ITEM: Mutex<Option<MainThreadOnly<tauri::menu::MenuItem<tauri::Wry>>>> = Mutex::new(None);
 /// Pause/Resume shortcut. Registered ONLY while a recording runs, so ⌃⌘6 belongs to other apps the
 /// rest of the time. Not macOS's own (⇧⌘6 is; ⌃⌘6 is not) and no Option (blocked since macOS 15).
-pub(crate) const PAUSE_SHORTCUT: &str = "Ctrl+Cmd+6";
+pub(crate) const PAUSE_SHORTCUT: &str = bhcapture_core::hotkey::PAUSE_HOTKEY;
 pub(crate) static PAUSE_HOTKEY_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn pause_hotkey() -> global_hotkey::hotkey::HotKey {
-    use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-    HotKey::new(Some(Modifiers::CONTROL | Modifiers::SUPER), Code::Digit6)
+    crate::to_platform_hotkey(&bhcapture_core::hotkey::Chord::parse(PAUSE_SHORTCUT).expect("the pause default is valid"))
 }
 
 /// Main thread only (the hotkey manager lives there).
@@ -78,7 +77,7 @@ struct Session {
     /// Pixels the file will have (before the encoder's even-size rounding), for the bar's readout.
     px: (u32, u32),
     phase: Phase,
-    recorder: Option<MacRecorder>,
+    recorder: Option<Recorder>,
     file: Option<PathBuf>,
     /// System audio AND microphone: two tracks that must be mixed into one when finished.
     two_tracks: bool,
@@ -100,8 +99,7 @@ fn videos<R>(f: impl FnOnce(&mut HashMap<u64, VideoDoc>) -> R) -> R {
 
 /// `~/Library/Application Support/BHCapture/Recordings`, private (0700).
 pub(crate) fn recordings_dir() -> PathBuf {
-    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-    let dir = home.join("Library").join("Application Support").join("BHCapture").join("Recordings");
+    let dir = crate::app_data_dir().join("Recordings");
     let _ = std::fs::create_dir_all(&dir);
     #[cfg(unix)]
     { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)); }
@@ -184,7 +182,7 @@ pub(crate) fn record_shortcut(app: &tauri::AppHandle) {
 /// Enter in the selector, in record mode: put the control bar under the region. Nothing is recorded
 /// yet -- the user still chooses audio and presses Record.
 pub(crate) fn prepare(app: &tauri::AppHandle, state: &Arc<AppState>, rect: LogRect) -> Result<String, CommitError> {
-    if !MacCapturer::has_permission() {
+    if !PlatformCapturer::has_permission() {
         return Err(CommitError::Permission(PERMISSION_MESSAGE.into()));
     }
     if SESSION.lock().unwrap().is_some() {
@@ -263,8 +261,7 @@ fn open_hud(app: &tauri::AppHandle, x: f64, y: f64) -> Result<(), String> {
                 .map(|w| {
                     // A non-activating panel: clicking the bar must not pull focus away from the app
                     // being recorded. (Never call set_focusable on it -- see bhc_make_overlay_panel.)
-                    #[cfg(target_os = "macos")]
-                    if let Ok(ptr) = w.ns_window() { unsafe { bhcapture_capture::macos::make_overlay_panel(ptr); } }
+                    if let Some(ptr) = crate::native_handle(&w) { unsafe { platform::prepare_tool_window(ptr); } }
                     w
                 }),
         };
@@ -370,7 +367,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
     // INTO the picture (the rest of the app stays out).
     let overlay = format!("{OVERLAY_PREFIX}{}", display.0);
     let include_window = if opts.7 { overlay_window_id(app, &overlay) } else { None };
-    let rec = MacRecorder::start(&RecordOptions {
+    let rec = Recorder::start(&RecordOptions {
         display, region: local, fps: opts.3, show_cursor: opts.0,
         system_audio: opts.1, microphone: opts.2, noise_filter: opts.4, auto_level: opts.5, voice_clarity: opts.6, include_window, path: file.clone(),
     }).map_err(|e| match e {
@@ -383,7 +380,9 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
             Some(s) if s.phase == Phase::Ready => {
                 s.recorder = Some(rec);
                 s.file = Some(file.clone());
-                s.two_tracks = opts.1 && opts.2;
+                // macOS records system audio and the mic as two tracks and mixes them when finished;
+                // Windows mixes them live into one.
+                s.two_tracks = cfg!(target_os = "macos") && opts.1 && opts.2;
                 s.phase = Phase::Recording;
             }
             // Cancelled during the start: drop() finishes the file; throw it away.
@@ -396,7 +395,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
     if include_window.is_some() {
         let (a, label) = (app.clone(), overlay.clone());
         let _ = app.run_on_main_thread(move || {
-            bhcapture_capture::macos::watch_clicks(move |x, y, right| {
+            platform::watch_clicks(move |x, y, right| {
                 // Not while paused: a ring appearing in nothing would only confuse the video.
                 if SESSION.lock().unwrap().as_ref().map_or(false, |s| s.phase == Phase::Recording) {
                     let _ = a.emit_to(label.as_str(), "record-click", (x, y, right));
@@ -547,7 +546,7 @@ fn stop(app: &tauri::AppHandle) -> Result<(), String> {
 /// lost, it just plays fully only in players that mix tracks themselves (QuickTime does).
 fn mix_into_one_track(file: &Path) {
     let tmp = file.with_extension("mixing.mp4");
-    match bhcapture_capture::macos::mix_audio_tracks(file, &tmp).and_then(|()| std::fs::rename(&tmp, file)
+    match platform::mix_audio_tracks(file, &tmp).and_then(|()| std::fs::rename(&tmp, file)
             .map_err(|e| bhcapture_capture::CaptureError::Backend(e.to_string()))) {
         Ok(()) => println!("[record] mixed system audio and microphone into one track"),
         Err(e) if e.to_string().contains("nothing to mix") => { let _ = std::fs::remove_file(&tmp); }
@@ -558,9 +557,16 @@ fn mix_into_one_track(file: &Path) {
 /// What one take holds besides the file: the pause key and the click watcher. Released on stop,
 /// cancel and restart alike.
 fn end_take(app: &tauri::AppHandle) {
-    let _ = app.run_on_main_thread(|| {
+    let a = app.clone();
+    let _ = app.run_on_main_thread(move || {
         if PAUSE_HOTKEY_ID.load(Ordering::SeqCst) != 0 { arm_pause_hotkey(false); }
-        bhcapture_capture::macos::unwatch_clicks();
+        platform::unwatch_clicks();
+        // Windows: the overlays go back OUT of captures (one was let in for the click rings).
+        for (l, w) in a.webview_windows() {
+            if l.starts_with(OVERLAY_PREFIX) {
+                if let Some(p) = crate::native_handle(&w) { unsafe { platform::set_window_in_captures(p, false) }; }
+            }
+        }
     });
 }
 
@@ -569,8 +575,11 @@ fn overlay_window_id(app: &tauri::AppHandle, label: &str) -> Option<u32> {
     let (tx, rx) = std::sync::mpsc::channel();
     let (a, l) = (app.clone(), label.to_string());
     app.run_on_main_thread(move || {
-        let id = a.get_webview_window(&l).and_then(|w| w.ns_window().ok())
-            .map(|p| unsafe { bhcapture_capture::macos::cgwindow_id(p) }).filter(|&i| i != 0);
+        let id = a.get_webview_window(&l).and_then(|w| crate::native_handle(&w)).map(|p| {
+            // Windows keeps the overlay out of captures per window: let it IN for this take.
+            unsafe { platform::set_window_in_captures(p, true) };
+            unsafe { platform::window_id(p) }
+        }).filter(|&i| i != 0);
         let _ = tx.send(id);
     }).ok()?;
     rx.recv_timeout(std::time::Duration::from_secs(2)).ok().flatten()
@@ -655,13 +664,13 @@ pub(crate) fn open_video(app: &tauri::AppHandle, file: PathBuf, note: Option<Str
     let (a, l) = (app.clone(), label.clone());
     let (tx, rx) = std::sync::mpsc::channel();
     app.run_on_main_thread(move || {
-        let r = WebviewWindowBuilder::new(&a, &l, WebviewUrl::App("index.html".into()))
+        let b = WebviewWindowBuilder::new(&a, &l, WebviewUrl::App("index.html".into()))
             .title("BHCapture — Recording")
             .inner_size(960.0, 640.0)
             .min_inner_size(520.0, 360.0)
             .center()
-            .resizable(true)
-            .build();
+            .resizable(true);
+        let r = crate::with_window_menu(&a, b).build();
         let _ = tx.send(match r {
             Ok(w) => { sync_dock(&a, None); let _ = w.set_focus(); Ok(()) }
             Err(e) => Err(e.to_string()),
@@ -751,7 +760,7 @@ pub(crate) async fn video_export(app: tauri::AppHandle, window: tauri::WebviewWi
     let (ext, label) = match kind.as_str() {
         "mp4" => ("mp4", "MPEG-4 Video (H.264)"),
         "hevc" => ("mp4", "MPEG-4 Video (HEVC)"),
-        "mov" => ("mov", "QuickTime Movie"),
+        "mov" if cfg!(target_os = "macos") => ("mov", "QuickTime Movie"),
         "gif" => ("gif", "Animated GIF"),
         _ => return Err(CommitError::Failed(format!("unknown export format {kind}"))),
     };
@@ -781,7 +790,7 @@ pub(crate) async fn video_export(app: tauri::AppHandle, window: tauri::WebviewWi
         ExportProgress { percent: (p.clamp(0.0, 1.0) * 100.0) as u32, kind: k.clone() }); true };
     let (s2, t2, k2) = (src.clone(), tmp.clone(), kind.clone());
     let result = tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
-        use bhcapture_capture::macos::{export_video, VideoExport};
+        use bhcapture_capture::platform::{export_video, VideoExport};
         let mut report = report;
         match k2.as_str() {
             "mp4" => { std::fs::copy(&s2, &t2).map(|_| ()).map_err(|e| e.to_string()) }
@@ -809,7 +818,7 @@ fn export_gif(src: &Path, dst: &Path, report: &mut dyn FnMut(f64) -> bool) -> Re
     let mut w: Option<GifWriter<std::io::BufWriter<std::fs::File>>> = None;
     let (mut end, mut failure) = (0.0, None::<String>);
     let mut last_report = -1.0;
-    bhcapture_capture::macos::video_frames(src, DEFAULT_FPS, DEFAULT_MAX_SIDE, |px, wd, ht, t, dur| {
+    platform::video_frames(src, DEFAULT_FPS, DEFAULT_MAX_SIDE, |px, wd, ht, t, dur| {
         if w.is_none() {
             match std::fs::File::create(dst).map_err(|e| e.to_string())
                 .and_then(|f| GifWriter::new(std::io::BufWriter::new(f), wd, ht).map_err(|e| e.to_string())) {

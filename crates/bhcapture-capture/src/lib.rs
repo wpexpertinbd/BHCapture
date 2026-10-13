@@ -16,6 +16,64 @@ pub use snapshot::Snapshot;
 
 #[cfg(target_os = "macos")]
 pub mod macos;
+#[cfg(windows)]
+pub mod windows;
+
+/// The current OS's backend under ONE set of names, so the shell never names an OS. Every item
+/// here exists on every supported OS; what differs is only how it is done.
+pub mod platform {
+    #[cfg(target_os = "macos")]
+    pub use crate::macos::{
+        export_video, microphone_supported, mix_audio_tracks, unwatch_clicks, video_frames, watch_clicks,
+        watch_displays, MacCapturer as PlatformCapturer, MacRecorder as Recorder, VideoExport,
+    };
+    #[cfg(windows)]
+    pub use crate::windows::{
+        export_video, microphone_supported, mix_audio_tracks, unwatch_clicks, video_frames, watch_clicks,
+        watch_displays, VideoExport, WinCapturer as PlatformCapturer, WinRecorder as Recorder,
+    };
+
+    /// Prepare one of OUR tool windows (selector overlay, recording bar): on macOS a non-activating
+    /// panel; on Windows, kept out of captures. Returns false if it could not be done.
+    ///
+    /// # Safety
+    /// `handle` is the live native window (`NSWindow*` / `HWND`); main thread.
+    pub unsafe fn prepare_tool_window(handle: *mut std::ffi::c_void) -> bool {
+        #[cfg(target_os = "macos")]
+        { unsafe { crate::macos::make_overlay_panel(handle) == 1 } }
+        #[cfg(windows)]
+        { unsafe { crate::windows::set_excluded_from_capture(handle, true) } }
+    }
+
+    /// Let a tool window be IN recordings (the click-highlight layer) or keep it out. Only Windows
+    /// needs this per window; macOS includes it through the recorder's filter instead.
+    ///
+    /// # Safety
+    /// As [`prepare_tool_window`].
+    pub unsafe fn set_window_in_captures(handle: *mut std::ffi::c_void, included: bool) {
+        #[cfg(windows)]
+        { unsafe { crate::windows::set_excluded_from_capture(handle, !included); } }
+        #[cfg(target_os = "macos")]
+        { let _ = (handle, included); }
+    }
+
+    /// The backend's id for one of our windows (CGWindowID / HWND).
+    ///
+    /// # Safety
+    /// `handle` is a live native window.
+    pub unsafe fn window_id(handle: *mut std::ffi::c_void) -> u32 {
+        #[cfg(target_os = "macos")]
+        { unsafe { crate::macos::cgwindow_id(handle) } }
+        #[cfg(windows)]
+        { unsafe { crate::windows::window_id(handle) } }
+    }
+
+    /// macOS: make the menu bar respond after the app turns regular at run time. Elsewhere nothing.
+    pub fn refresh_menu_bar() {
+        #[cfg(target_os = "macos")]
+        crate::macos::refresh_menu_bar();
+    }
+}
 
 /// An OS window handle. Opaque: `CGWindowID` on macOS, `HWND` on Windows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]

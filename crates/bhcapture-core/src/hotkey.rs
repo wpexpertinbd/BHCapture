@@ -25,10 +25,37 @@ pub struct Chord {
     pub key: Key,
 }
 
+/// Which OS's shortcut rules apply. Everything below is plain data, so the Windows rules are tested
+/// on the Mac too; [`Os::CURRENT`] picks the running one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Os { Mac, Windows, Linux }
+
+impl Os {
+    #[cfg(target_os = "macos")]
+    pub const CURRENT: Os = Os::Mac;
+    #[cfg(windows)]
+    pub const CURRENT: Os = Os::Windows;
+    #[cfg(not(any(target_os = "macos", windows)))]
+    pub const CURRENT: Os = Os::Linux;
+}
+
+/// Capture: on macOS ⌃⌘4 (⌃⇧⌘4 and ⇧⌘4 are the system's own). On Windows and Linux Ctrl+Shift+4:
+/// Windows reserves Win+number for the taskbar, and the digits keep the two apps in step.
+#[cfg(target_os = "macos")]
 pub const DEFAULT_REGION_HOTKEY: &str = "Ctrl+Cmd+4";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_REGION_HOTKEY: &str = "Ctrl+Shift+4";
 /// Start a screen recording. The same family as the capture shortcut, one key over, and likewise
-/// not one macOS owns (⇧⌘5 is the system's; ⌃⌘5 is not).
+/// not one the OS owns (⇧⌘5 is macOS's; ⌃⌘5 is not).
+#[cfg(target_os = "macos")]
 pub const DEFAULT_RECORD_HOTKEY: &str = "Ctrl+Cmd+5";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_RECORD_HOTKEY: &str = "Ctrl+Shift+5";
+/// Pause/resume while recording (registered only then).
+#[cfg(target_os = "macos")]
+pub const PAUSE_HOTKEY: &str = "Ctrl+Cmd+6";
+#[cfg(not(target_os = "macos"))]
+pub const PAUSE_HOTKEY: &str = "Ctrl+Shift+6";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HotkeyError {
@@ -54,7 +81,8 @@ impl std::fmt::Display for HotkeyError {
             HotkeyError::NoKey => write!(f, "the shortcut has modifiers but no key"),
             HotkeyError::TwoKeys => write!(f, "the shortcut names more than one key"),
             HotkeyError::NeedsModifier => write!(f, "a shortcut needs Cmd, Ctrl or Option, or it would steal ordinary typing"),
-            HotkeyError::TakenBySystem(what) => write!(f, "macOS already uses this shortcut for {what}"),
+            HotkeyError::TakenBySystem(what) => write!(f, "{} already uses this shortcut for {what}",
+                match Os::CURRENT { Os::Mac => "macOS", Os::Windows => "Windows", Os::Linux => "the system" }),
             HotkeyError::UsesOption => write!(f, "macOS blocks app shortcuts that use Option, so it would never fire"),
         }
     }
@@ -64,7 +92,10 @@ impl std::error::Error for HotkeyError {}
 impl Chord {
     /// Accepts the forms people actually type: `Ctrl+Option+Cmd+4`, `cmd + shift + s`, `⌃⌥⌘4`,
     /// `Control-Alt-Command-F5`. Case-insensitive; `+`, `-`, spaces and the Mac glyphs all work.
-    pub fn parse(s: &str) -> Result<Chord, HotkeyError> {
+    pub fn parse(s: &str) -> Result<Chord, HotkeyError> { Self::parse_for(s, Os::CURRENT) }
+
+    /// [`parse`](Chord::parse) under a given OS's rules.
+    pub fn parse_for(s: &str, os: Os) -> Result<Chord, HotkeyError> {
         // Turn glyphs into words so one tokenizer handles both styles.
         let spelled = s.replace('⌘', "+cmd+").replace('⌃', "+ctrl+").replace('⌥', "+alt+").replace('⇧', "+shift+");
         let parts: Vec<String> = spelled.split(|c: char| c == '+' || c == '-' || c.is_whitespace())
@@ -75,7 +106,7 @@ impl Chord {
         let mut key: Option<Key> = None;
         for p in &parts {
             match p.as_str() {
-                "cmd" | "command" | "super" | "meta" => cmd = true,
+                "cmd" | "command" | "super" | "meta" | "win" | "windows" => cmd = true,
                 "ctrl" | "control" | "ctl" => ctrl = true,
                 "alt" | "option" | "opt" => alt = true,
                 "shift" => shift = true,
@@ -91,21 +122,39 @@ impl Chord {
         if !(cmd || ctrl || alt) && !matches!(key, Key::F(_)) {
             return Err(HotkeyError::NeedsModifier);
         }
-        if alt { return Err(HotkeyError::UsesOption); }
+        // Option is only blocked on macOS; on Windows/Linux Alt is an ordinary modifier.
+        if alt && os == Os::Mac { return Err(HotkeyError::UsesOption); }
         let chord = Chord { cmd, ctrl, alt, shift, key };
-        if let Some(what) = chord.macos_conflict() {
+        let conflict = match os { Os::Mac => chord.macos_conflict(), Os::Windows => chord.windows_conflict(), Os::Linux => None };
+        if let Some(what) = conflict {
             return Err(HotkeyError::TakenBySystem(what));
         }
         Ok(chord)
     }
 
-    /// Canonical spelling, in macOS menu order (Ctrl, Option, Shift, Cmd).
-    pub fn display(&self) -> String {
+    /// Windows reserves the Win key for itself (Start, Snipping Tool's Win+Shift+S, taskbar
+    /// Win+number, Game Bar...) and RegisterHotKey refuses or loses most of them, so none are offered.
+    /// Plus the few non-Win chords a capture tool would collide with.
+    pub fn windows_conflict(&self) -> Option<&'static str> {
+        if self.cmd { return Some("its own Win-key shortcuts"); }
+        match ((self.ctrl, self.alt, self.shift), self.key) {
+            ((true, true, false), Key::Letter('S')) => None,
+            ((false, true, false), Key::F(4)) => Some("closing the window (Alt+F4)"),
+            ((true, false, false), Key::Letter('C' | 'V' | 'X' | 'Z' | 'S' | 'W')) => Some("an editing shortcut every app uses"),
+            _ => None,
+        }
+    }
+
+    /// Canonical spelling for the running OS: macOS menu order (Ctrl, Option, Shift, Cmd); Windows
+    /// and Linux as their own UIs write it (Ctrl, Alt, Shift, Win).
+    pub fn display(&self) -> String { self.display_for(Os::CURRENT) }
+
+    pub fn display_for(&self, os: Os) -> String {
         let mut v: Vec<String> = Vec::new();
         if self.ctrl { v.push("Ctrl".into()); }
-        if self.alt { v.push("Option".into()); }
+        if self.alt { v.push(if os == Os::Mac { "Option" } else { "Alt" }.into()); }
         if self.shift { v.push("Shift".into()); }
-        if self.cmd { v.push("Cmd".into()); }
+        if self.cmd { v.push(if os == Os::Mac { "Cmd" } else { "Win" }.into()); }
         v.push(match self.key {
             Key::Letter(c) => c.to_string(),
             Key::Digit(d) => d.to_string(),

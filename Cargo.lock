@@ -157,6 +157,7 @@ dependencies = [
  "bhcapture-core",
  "cc",
  "png 0.17.16",
+ "windows",
 ]
 
 [[package]]

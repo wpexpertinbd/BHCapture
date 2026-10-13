@@ -68,3 +68,19 @@ fn option_shortcuts_are_refused_because_macos_never_delivers_them() {
         assert_eq!(Chord::parse(s).unwrap_err(), HotkeyError::UsesOption, "{s}");
     }
 }
+
+#[test]
+fn windows_rules_allow_alt_refuse_win_and_name_keys_the_windows_way() {
+    use bhcapture_core::hotkey::{Chord, HotkeyError, Os};
+    // Alt is fine on Windows (macOS blocks Option).
+    let c = Chord::parse_for("Ctrl+Alt+4", Os::Windows).unwrap();
+    assert_eq!(c.display_for(Os::Windows), "Ctrl+Alt+4");
+    assert_eq!(Chord::parse_for("Ctrl+Alt+4", Os::Mac), Err(HotkeyError::UsesOption));
+    // The Win key is Windows' own.
+    assert!(matches!(Chord::parse_for("Win+Shift+S", Os::Windows), Err(HotkeyError::TakenBySystem(_))));
+    assert!(matches!(Chord::parse_for("Ctrl+C", Os::Windows), Err(HotkeyError::TakenBySystem(_))));
+    // The Windows defaults are valid Windows chords.
+    for d in ["Ctrl+Shift+4", "Ctrl+Shift+5", "Ctrl+Shift+6"] {
+        assert!(Chord::parse_for(d, Os::Windows).is_ok(), "{d}");
+    }
+}
