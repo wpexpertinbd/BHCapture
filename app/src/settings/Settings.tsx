@@ -11,6 +11,8 @@ type SettingsData = {
   include_cursor: boolean;
   region_hotkey: string;
   theme: Theme;
+  image_format: "jpeg" | "png" | "webp" | "tiff" | "bmp" | "gif";
+  jpeg_quality: number;
 };
 
 type SettingsView = {
@@ -78,7 +80,7 @@ export function Settings() {
   return (
     <div className="settings" data-theme={draft.theme}>
       <h1>BHCapture Settings</h1>
-      <p className="sub">Captures are saved as PNG. Recording settings arrive with Phase 3.</p>
+      <p className="sub">A capture opens in the editor; it is saved only when you save it there.</p>
 
       {!view.writable && (
         <div className="banner">
@@ -100,7 +102,7 @@ export function Settings() {
         </div>
         <div className="help">
           Leave empty for the default, <code>{view.default_dir}</code>. Must be a full path.
-          You can still send any single capture elsewhere with <code>⇧Enter</code>.
+          Any single capture can go elsewhere with <b>Save As</b> (<code>⇧⌘S</code>) in the editor.
         </div>
       </div>
 
@@ -108,7 +110,7 @@ export function Settings() {
         <label className="title" htmlFor="pat">File name</label>
         <input id="pat" type="text" value={draft.pattern}
                onChange={(e) => set("pattern", e.target.value)} />
-        <div className="preview">{previewName(draft.pattern)}.png</div>
+        <div className="preview">{previewName(draft.pattern)}.{({ jpeg: "jpg" } as Record<string, string>)[draft.image_format] ?? draft.image_format}</div>
         <div className="help">
           Tokens: {TOKENS.map((t) => <code key={t}>{`{${t}}`}</code>)}.
           {patternBad && " — this pattern has an unknown token and will be reset on save."}
@@ -135,6 +137,25 @@ export function Settings() {
           <span><span className="t">Include the mouse pointer</span>
             <span className="d">Off by default — most screenshots are of content, not of where the pointer was.</span></span>
         </label>
+      </div>
+
+      <div className="row">
+        <label className="title" htmlFor="fmt">Default file format</label>
+        <div className="with-button">
+          <select id="fmt" value={draft.image_format}
+                  onChange={(e) => set("image_format", e.target.value as SettingsData["image_format"])}>
+            <option value="jpeg">JPEG — smallest files (default)</option>
+            <option value="png">PNG — exact pixels, larger</option>
+            <option value="webp">WebP — exact pixels, smaller than PNG</option>
+            <option value="tiff">TIFF</option>
+            <option value="bmp">BMP</option>
+            <option value="gif">GIF</option>
+          </select>
+          <input type="text" inputMode="numeric" style={{ maxWidth: 70 }} value={String(draft.jpeg_quality)}
+                 title="JPEG quality, 1-100"
+                 onChange={(e) => set("jpeg_quality", Number(e.target.value.replace(/[^0-9]/g, "")) || 0)} />
+        </div>
+        <div className="help">The editor starts on this format; you can pick another per capture. The number is JPEG quality (1-100, default 90). JPEG has no transparency, so transparent areas become white.</div>
       </div>
 
       <div className="row">

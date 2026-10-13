@@ -1240,6 +1240,82 @@ fn main() {
                 });
             }
 
+            if std::env::args().any(|a| a == "--demo-editor") {
+                let (h, st) = (handle.clone(), state.clone());
+                std::thread::spawn(move || {
+                    let ms = |n| std::thread::sleep(std::time::Duration::from_millis(n));
+                    let js = |t: &str, x: f64, y: f64| format!(
+                        "(()=>{{const el=document.elementFromPoint({x},{y})||document.body;\
+                         el.dispatchEvent(new MouseEvent('{t}',{{bubbles:true,cancelable:true,\
+                         clientX:{x},clientY:{y},button:0}}));}})()");
+                    ms(2500);
+                    open_selector(&h);
+                    ms(1000);
+                    let ov = h.get_webview_window("overlay-1").expect("overlay-1");
+                    let _ = ov.eval(&js("mousedown", 200.0, 150.0));
+                    for i in 1..=6 { let _ = ov.eval(&js("mousemove", 200.0 + 100.0 * i as f64, 150.0 + 60.0 * i as f64)); ms(40); }
+                    let _ = ov.eval(&js("mouseup", 800.0, 510.0));
+                    ms(400);
+                    // Enter in the selector: must open the EDITOR, not save anything.
+                    let label = match commit(&h, &st, false) {
+                        Ok(l) => l, Err(e) => { println!("[edtest] commit FAILED {e}"); h.exit(1); return; }
+                    };
+                    println!("[edtest] Enter opened {label}; files saved so far = {}", std::fs::read_dir(default_capture_dir()).map(|d| d.count()).unwrap_or(0));
+                    ms(1800);
+                    let ed = h.get_webview_window(&label).expect("editor window");
+                    #[cfg(target_os = "macos")]
+                    if let Ok(ptr) = ed.ns_window() {
+                        println!("[edtest] editor CGWindowID={}", unsafe { bhcapture_capture::macos::cgwindow_id(ptr) });
+                    }
+                    // Draw an arrow and a box on the editor canvas with real pointer events.
+                    // Switch tool, let React apply it, THEN drag -- as a person does. Doing both in one
+                    // instant tests nothing a user can do and draws with the previous tool.
+                    let draw = |tool: &str, fx1: f64, fy1: f64, fx2: f64, fy2: f64| {
+                        let _ = ed.eval(&format!("window.dispatchEvent(new KeyboardEvent('keydown',{{key:'{tool}',bubbles:true}}))"));
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        format!(r#"(()=>{{
+                        const c=document.querySelector('canvas.ed-canvas'); const r=c.getBoundingClientRect();
+                        const at=(fx,fy)=>({{clientX:r.left+r.width*fx, clientY:r.top+r.height*fy, bubbles:true, pointerId:1, button:0}});
+                        c.dispatchEvent(new PointerEvent('pointerdown',at({fx1},{fy1})));
+                        for(let i=1;i<=8;i++) c.dispatchEvent(new PointerEvent('pointermove',at({fx1}+({fx2}-{fx1})*i/8,{fy1}+({fy2}-{fy1})*i/8)));
+                        c.dispatchEvent(new PointerEvent('pointerup',at({fx2},{fy2})));
+                    }})()"#)
+                    };
+                    let _ = ed.eval(&draw("a", 0.15, 0.80, 0.55, 0.30));
+                    ms(300);
+                    let _ = ed.eval(&draw("r", 0.60, 0.15, 0.92, 0.60));
+                    ms(300);
+                    let _ = ed.eval(&draw("p", 0.42, 0.0, 0.98, 0.22));
+                    ms(500);
+                    println!("[edtest] HOLD-EDITOR");
+                    ms(4000);
+                    // ⌘W on an UNSAVED capture must ask, not close. Esc must then keep the editor.
+                    let _ = ed.eval("window.dispatchEvent(new KeyboardEvent('keydown',{key:'w',metaKey:true,bubbles:true}))");
+                    ms(500);
+                    println!("[edtest] HOLD-MODAL (editor still open = {})", h.get_webview_window(&label).is_some());
+                    ms(3000);
+                    let _ = ed.eval("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))");
+                    ms(500);
+                    println!("[edtest] after Esc on the dialog: editor still open = {}, capture still held = {}",
+                        h.get_webview_window(&label).is_some(), st.editors.lock().unwrap().len() == 1);
+                    let save_key = "window.dispatchEvent(new KeyboardEvent('keydown',{key:'s',metaKey:true,bubbles:true}))";
+                    let _ = ed.eval(save_key);                       // ⌘S in the default format (JPEG)
+                    ms(2000);
+                    let _ = ed.eval("(()=>{const el=document.querySelector('select.ed-format');\
+                        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(el,'png');\
+                        el.dispatchEvent(new Event('change',{bubbles:true}));})()");
+                    ms(300);
+                    let _ = ed.eval(save_key);                       // ⌘S again, now PNG
+                    ms(2000);
+                    let _ = ed.eval("window.dispatchEvent(new KeyboardEvent('keydown',{key:'w',metaKey:true,bubbles:true}))");
+                    ms(1500);
+                    println!("[edtest] after ⌘W: editor window open = {}, captures held in memory = {}",
+                        h.get_webview_window(&label).is_some(), st.editors.lock().unwrap().len());
+                    ms(300);
+                    h.exit(0);
+                });
+            }
+
             if std::env::args().any(|a| a == "--demo-focus") {
                 let h = handle.clone();
                 std::thread::spawn(move || {
