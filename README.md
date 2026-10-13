@@ -8,6 +8,10 @@
 
 <p align="center"><i>Built and maintained by <a href="https://www.biswashost.com">BiswasHost</a> 🇧🇩</i></p>
 
+<p align="center">
+  <img src="docs/images/bhcapture-editor.jpg" alt="The BHCapture editor on macOS: a screenshot of a coastline and the Golden Gate Bridge annotated with arrows, a double arrow, a box and numbered steps, with the tool bar along the top" width="900">
+</p>
+
 ---
 
 ## 📦 Platforms
