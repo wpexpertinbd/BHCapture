@@ -20,6 +20,17 @@ fn main() {
         .flag("-Wall")
         .compile("bhc_sck");
 
+    // `@available(macOS 15, *)` compiles to a call into clang's runtime (`__isPlatformVersionAtLeast`).
+    // Without LTO the linker found it on its own; with LTO (the small release build) it does not, so
+    // link clang's runtime explicitly.
+    if let Ok(out) = std::process::Command::new("xcrun").args(["clang", "--print-runtime-dir"]).output() {
+        let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !dir.is_empty() && std::path::Path::new(&dir).join("libclang_rt.osx.a").exists() {
+            println!("cargo:rustc-link-search=native={dir}");
+            println!("cargo:rustc-link-lib=static=clang_rt.osx");
+        }
+    }
+
     for fw in ["ScreenCaptureKit", "CoreGraphics", "CoreFoundation", "Foundation", "CoreMedia", "CoreVideo", "AppKit", "AVFoundation", "Accelerate"] {
         println!("cargo:rustc-link-lib=framework={fw}");
     }

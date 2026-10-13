@@ -7,3 +7,4 @@ build.noindex/
 *.p12
 *.cer
 .voice-test/
+.win-test/

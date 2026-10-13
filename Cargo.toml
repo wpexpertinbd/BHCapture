@@ -14,4 +14,32 @@ license = "MIT"
 authors = ["Benjamin Biswas (BiswasHost)"]
 
 [profile.release]
+# Small downloads (decision 25), measured: see docs/PHASE4-NOTES.md.
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+# panic stays "unwind": a panic inside one command must not abort the app and lose captures that
+# are open but not saved.
+
+# Real-time and heavy-number crates keep full speed: the noise filter must keep up with live audio,
+# and GIF/image encoding is the slowest step the user waits for.
+[profile.release.package.nnnoiseless]
+opt-level = 3
+[profile.release.package.rustfft]
+opt-level = 3
+[profile.release.package.color_quant]
+opt-level = 3
+[profile.release.package.gif]
+opt-level = 3
+[profile.release.package.image]
+opt-level = 3
+[profile.release.package.bhcapture-core]
+opt-level = 3
+
+# Symbols for leak/crash hunting (what `debug = true` on release was for):
+# `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
 debug = true
+strip = false

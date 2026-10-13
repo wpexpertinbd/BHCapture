@@ -13,6 +13,7 @@ pub mod image;
 pub mod level;
 pub mod naming;
 pub mod record;
+pub mod resample;
 pub mod settings;
 pub mod snap;
 pub mod voice_eq;
