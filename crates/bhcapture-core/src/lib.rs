@@ -14,3 +14,4 @@ pub mod naming;
 pub mod record;
 pub mod settings;
 pub mod snap;
+pub mod voice_eq;

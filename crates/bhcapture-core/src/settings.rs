@@ -60,6 +60,8 @@ pub struct Settings {
     pub record_noise_filter: bool,
     /// Bring a quiet microphone voice up to a standard level (see `bhcapture_core::level`).
     pub record_auto_level: bool,
+    /// Voice EQ on the microphone: less boom, more clarity (see `bhcapture_core::voice_eq`).
+    pub record_voice_clarity: bool,
     pub record_countdown: bool,
     /// 1-60.
     pub record_fps: u32,
@@ -84,6 +86,7 @@ impl Default for Settings {
             record_microphone: true,
             record_noise_filter: true,
             record_auto_level: true,
+            record_voice_clarity: true,
             record_countdown: true,
             record_fps: 30,
         }

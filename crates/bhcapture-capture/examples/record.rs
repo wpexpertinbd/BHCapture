@@ -19,7 +19,7 @@ fn main() {
                  else { LogRect::new(0.0, 0.0, d.bounds.size.w, d.bounds.size.h) };
     let rec = MacRecorder::start(&RecordOptions {
         display: d.id, region, fps: 30, show_cursor: true,
-        system_audio: flag("--sys"), microphone: flag("--mic"), noise_filter: !flag("--raw"), auto_level: !flag("--raw"), path: out.clone(),
+        system_audio: flag("--sys"), microphone: flag("--mic"), noise_filter: !flag("--raw"), auto_level: !flag("--raw"), voice_clarity: !flag("--raw"), path: out.clone(),
     }).expect("start");
     let step = Duration::from_millis(250);
     let mut t = 0.0;

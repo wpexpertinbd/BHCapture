@@ -25,6 +25,7 @@ typedef struct {
     int32_t     microphone;     /* 0/1; needs macOS 15 -- refused below that rather than faked */
     int32_t     noise_filter;   /* 0/1; RNNoise on the microphone (48 kHz float only) */
     int32_t     auto_level;     /* 0/1; automatic voice level on the microphone */
+    int32_t     voice_clarity;  /* 0/1; voice EQ on the microphone */
     const char *path;           /* UTF-8; the .mp4 to create. Must not exist. */
 } BhcRecordOptions;
 
@@ -62,5 +63,9 @@ void   bhc_denoise_free(void *d);
 void  *bhc_level_new(uint32_t sample_rate);
 void   bhc_level_process(void *l, float *samples, size_t n);
 void   bhc_level_free(void *l);
+/* Voice EQ (bhcapture_core::voice_eq). */
+void  *bhc_eq_new(uint32_t sample_rate);
+void   bhc_eq_process(void *e, float *samples, size_t n);
+void   bhc_eq_free(void *e);
 
 #endif /* BHC_REC_H */

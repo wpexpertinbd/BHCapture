@@ -358,7 +358,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
         let s = st.get();
         (Pattern::parse(&s.pattern).unwrap_or_default(),
          (s.record_cursor, s.record_system_audio, s.record_microphone && microphone_supported(), s.record_fps,
-          s.record_noise_filter, s.record_auto_level))
+          s.record_noise_filter, s.record_auto_level, s.record_voice_clarity))
     };
     let dir = recordings_dir();
     let stem = pattern.render(local_stamp(), &Fields { width: px.0, height: px.1, ..Default::default() });
@@ -366,7 +366,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
 
     let rec = MacRecorder::start(&RecordOptions {
         display, region: local, fps: opts.3, show_cursor: opts.0,
-        system_audio: opts.1, microphone: opts.2, noise_filter: opts.4, auto_level: opts.5, path: file.clone(),
+        system_audio: opts.1, microphone: opts.2, noise_filter: opts.4, auto_level: opts.5, voice_clarity: opts.6, path: file.clone(),
     }).map_err(|e| match e {
         bhcapture_capture::CaptureError::PermissionDenied => PERMISSION_MESSAGE.to_string(),
         other => format!("Could not start recording: {other}"),

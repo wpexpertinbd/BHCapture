@@ -6,3 +6,4 @@ build.noindex/
 .DS_Store
 *.p12
 *.cer
+.voice-test/

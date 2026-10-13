@@ -210,6 +210,7 @@ fn record_defaults_and_repairs() {
     assert_eq!(s.record_fps, 30);
     assert!(s.record_noise_filter, "noise filter on by default");
     assert!(s.record_auto_level, "auto level on by default");
+    assert!(s.record_voice_clarity, "voice clarity on by default");
 
     // The record shortcut may not be the capture shortcut.
     let mut t = Settings::default();

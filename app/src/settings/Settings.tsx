@@ -16,6 +16,7 @@ type SettingsData = {
   record_microphone: boolean;
   record_noise_filter: boolean;
   record_auto_level: boolean;
+  record_voice_clarity: boolean;
   record_countdown: boolean;
   record_fps: number;
   theme: Theme;
@@ -138,6 +139,12 @@ export function Settings() {
                  onChange={(e) => set("copy_to_clipboard", e.target.checked)} />
           <span><span className="t">Also copy to the clipboard</span>
             <span className="d">The file is still written either way.</span></span>
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={draft.record_voice_clarity}
+                 onChange={(e) => set("record_voice_clarity", e.target.checked)} />
+          <span><span className="t">Voice clarity (recordings)</span>
+            <span className="d">Takes the boom out of a laptop microphone and brings out the consonants, so a voice sounds natural instead of deep and muffled.</span></span>
         </label>
         <label className="check">
           <input type="checkbox" checked={draft.record_auto_level}

@@ -92,6 +92,8 @@ static float rec_peak(CMSampleBufferRef sb) {
     int64_t _sysBufs, _micBufs;
     BOOL _denoise;            /* noise filter on the microphone */
     BOOL _level;              /* automatic voice level on the microphone */
+    BOOL _eq;                 /* voice EQ on the microphone */
+    void *_eqs[2];            /* one voice EQ per mic channel */
     void *_dn[2];             /* one RNNoise state per mic channel */
     void *_lv[2];             /* one auto-level state per mic channel */   /* audio buffers RECEIVED, for diagnosing "no sound" */
     float _lvlSys, _lvlMic;
@@ -101,13 +103,14 @@ static float rec_peak(CMSampleBufferRef sb) {
 
 - (void)dealloc {
     if (_lastFrame) CFRelease(_lastFrame);
-    for (int i = 0; i < 2; i++) { if (_dn[i]) bhc_denoise_free(_dn[i]); if (_lv[i]) bhc_level_free(_lv[i]); }
+    for (int i = 0; i < 2; i++) { if (_dn[i]) bhc_denoise_free(_dn[i]); if (_lv[i]) bhc_level_free(_lv[i]); if (_eqs[i]) bhc_eq_free(_eqs[i]); }
 }
 
-/* Run one mic channel through the noise filter, then the auto level -- in that order, so the level
- * follows the VOICE and not the fan the filter just removed. */
+/* One mic channel: noise filter, then voice EQ, then auto level. The level comes last so it sets
+ * the loudness of what is actually written, and follows the VOICE, not the fan the filter removed. */
 - (void)processChannel:(UInt32)c samples:(float *)p count:(size_t)n rate:(Float64)rate {
     if (_denoise) { if (!_dn[c]) _dn[c] = bhc_denoise_new(); bhc_denoise_process(_dn[c], p, n); }
+    if (_eq)      { if (!_eqs[c]) _eqs[c] = bhc_eq_new((uint32_t)rate); bhc_eq_process(_eqs[c], p, n); }
     if (_level)   { if (!_lv[c]) _lv[c] = bhc_level_new((uint32_t)rate); bhc_level_process(_lv[c], p, n); }
 }
 
@@ -122,13 +125,13 @@ static float rec_peak(CMSampleBufferRef sb) {
         fprintf(stderr, "[rec] microphone processing off: format is %.0f Hz, %u ch, %u-bit%s\n",
                 a ? a->mSampleRate : 0, a ? a->mChannelsPerFrame : 0, a ? a->mBitsPerChannel : 0,
                 (a && (a->mFormatFlags & kAudioFormatFlagIsFloat)) ? " float" : "");
-        _denoise = NO; _level = NO;
+        _denoise = NO; _level = NO; _eq = NO;
         return NULL;
     }
     if (_denoise && (int)a->mSampleRate != 48000) {
         fprintf(stderr, "[rec] noise filter off: the microphone runs at %.0f Hz, the filter needs 48000\n", a->mSampleRate);
         _denoise = NO;
-        if (!_level) return NULL;
+        if (!_level && !_eq) return NULL;
     }
     BOOL planar = (a->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0;
     UInt32 ch = a->mChannelsPerFrame;
@@ -227,7 +230,7 @@ static float rec_peak(CMSampleBufferRef sb) {
     if (@available(macOS 15.0, *)) { isMic = (type == SCStreamOutputTypeMicrophone); }
     /* Filter the mic first, so the meter and the file both carry what the filter let through --
      * the meter going quiet when only the fan is running is how the user sees it working. */
-    CMSampleBufferRef filtered = (isMic && (_denoise || _level)) ? [self processedMic:sb] : NULL;
+    CMSampleBufferRef filtered = (isMic && (_denoise || _level || _eq)) ? [self processedMic:sb] : NULL;
     if (filtered) sb = filtered;
     float pk = rec_peak(sb);
     if (isMic) { _micBufs++; if (pk > _lvlMic) _lvlMic = pk; } else { _sysBufs++; if (pk > _lvlSys) _lvlSys = pk; }
@@ -318,6 +321,7 @@ BhcRecorder *bhc_rec_start(const BhcRecordOptions *opt, int32_t *code, char *err
         r->_w = W; r->_h = H; r->_fps = fps;
         r->_denoise = opt->microphone && opt->noise_filter;
         r->_level = opt->microphone && opt->auto_level;
+        r->_eq = opt->microphone && opt->voice_clarity;
 
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:opt->path]];
         if ([NSFileManager.defaultManager fileExistsAtPath:url.path]) {
