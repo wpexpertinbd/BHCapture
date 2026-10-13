@@ -1,33 +1,40 @@
 //! Streaming MP4 writer for H.264 video + Opus audio, for platforms with no system muxer (Linux).
 //!
-//! Every frame is written to the file the moment it arrives; memory holds only the sample index
-//! (a few bytes per frame). That is the point of this module: the first muxer tried (muxide) keeps
-//! every encoded frame in memory until the end -- over 1 GB for an hour -- and its streaming mode
-//! carries no audio. Built on Shiguredo's `shiguredo_mp4`, which lays out the boxes; this module
+//! **Fragmented MP4, crash-safe.** The file is an init segment (`ftyp` + `moov` without sample
+//! tables) followed by self-contained `moof` + `mdat` fragments of about two seconds, each written
+//! and flushed to disk as soon as it is complete. A crash, a power cut or a full disk loses at most
+//! the last fragment: everything before it plays (the same guarantee macOS gets from AVAssetWriter's
+//! `movieFragmentInterval`). A long tutorial must never be lost to one bad moment at the end.
+//! Memory holds only the fragment being built.
+//!
+//! Built on Shiguredo's `shiguredo_mp4` (`Fmp4SegmentMuxer`), which lays out the boxes; this module
 //! converts the encoder's output into what MP4 stores:
 //!
 //! - H.264 arrives as Annex B (start codes); MP4 wants each NAL prefixed by its 4-byte length, and the
 //!   SPS/PPS in the `avcC` box, taken from the first keyframe.
 //! - A video frame's duration is only known when the NEXT frame arrives (screen capture is variable
-//!   frame rate: nothing changes, nothing is sent), so ONE encoded frame is held back and written
-//!   together with its index entry. (The library needs bytes and index entries in the same order;
-//!   writing the bytes early while holding the entry failed with "Position mismatch".)
+//!   frame rate: nothing changes, nothing is sent), so ONE encoded frame is held back.
 
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::Path;
 
 use shiguredo_mp4::boxes::{
     AudioSampleEntryFields, Avc1Box, AvccBox, DopsBox, OpusBox, SampleEntry, VisualSampleEntryFields,
 };
-use shiguredo_mp4::mux::{Mp4FileMuxer, Sample};
+use shiguredo_mp4::mux::{Fmp4SegmentMuxer, Sample};
 use shiguredo_mp4::{FixedPointNumber, TrackKind, Uint};
 
 /// 90 kHz: the usual video timescale, fine enough for any frame rate.
 const VIDEO_TIMESCALE: u32 = 90_000;
 /// Opus always runs at 48 kHz.
 pub const OPUS_RATE: u32 = 48_000;
+/// A fragment is closed once it holds this much video (and starts the next at a video sample).
+const FRAGMENT_TICKS: u64 = 2 * VIDEO_TIMESCALE as u64;
+/// With audio expected, the first fragment waits (up to this long) for audio to arrive, so the
+/// init segment declares both tracks.
+const FIRST_AUDIO_WAIT_TICKS: u64 = 5 * VIDEO_TIMESCALE as u64;
 
 #[derive(Debug)]
 pub struct Mp4Error(pub String);
@@ -60,10 +67,12 @@ pub fn annexb_nals(data: &[u8]) -> Vec<&[u8]> {
 
 struct Held { pts: u64, body: Vec<u8>, keyframe: bool, entry: Option<SampleEntry> }
 
+/// One sample waiting in the open fragment.
+struct Pending { kind: TrackKind, entry: Option<SampleEntry>, keyframe: bool, timescale: u32, duration: u32, body: Vec<u8> }
+
 pub struct Mp4Writer {
     file: File,
-    muxer: Mp4FileMuxer,
-    pos: u64,
+    muxer: Fmp4SegmentMuxer,
     width: u16,
     height: u16,
     video_entry_sent: bool,
@@ -74,16 +83,18 @@ pub struct Mp4Writer {
     audio_entry: Option<SampleEntry>,
     audio_entry_sent: bool,
     frame_period: u64,
+    /// The fragment being built, in arrival order.
+    pending: Vec<Pending>,
+    pending_video_ticks: u64,
+    /// Whether the init segment is on disk yet.
+    started: bool,
 }
 
 impl Mp4Writer {
-    /// `audio_pre_skip`: the Opus encoder's lookahead in 48 kHz samples (None = no audio track).
+    /// `audio`: (channels, Opus pre-skip in 48 kHz samples); None = no audio track.
     pub fn create(path: &Path, width: u32, height: u32, fps: u32, audio: Option<(u16, u16)>) -> Result<Self, Mp4Error> {
-        let mut file = File::create(path).map_err(err)?;
-        let muxer = Mp4FileMuxer::new().map_err(|e| err(format!("{e:?}")))?;
-        let init = muxer.initial_boxes_bytes();
-        file.write_all(init).map_err(err)?;
-        let pos = init.len() as u64;
+        let file = File::create(path).map_err(err)?;
+        let muxer = Fmp4SegmentMuxer::new().map_err(|e| err(format!("{e:?}")))?;
         let audio_entry = audio.map(|(channels, pre_skip)| SampleEntry::Opus(OpusBox {
             audio: AudioSampleEntryFields {
                 data_reference_index: NonZeroU16::MIN,
@@ -95,33 +106,12 @@ impl Mp4Writer {
             unknown_boxes: Vec::new(),
         }));
         Ok(Self {
-            file, muxer, pos, width: width as u16, height: height as u16,
+            file, muxer, width: width as u16, height: height as u16,
             video_entry_sent: false, sps: None, pps: None, held: None, first_pts: None,
             audio_entry, audio_entry_sent: false,
             frame_period: (VIDEO_TIMESCALE / fps.max(1)) as u64,
+            pending: Vec::new(), pending_video_ticks: 0, started: false,
         })
-    }
-
-    fn put(&mut self, bytes: &[u8]) -> Result<u64, Mp4Error> {
-        let at = self.pos;
-        self.file.write_all(bytes).map_err(err)?;
-        self.pos += bytes.len() as u64;
-        Ok(at)
-    }
-
-    fn append(&mut self, kind: TrackKind, entry: Option<SampleEntry>, keyframe: bool, timescale: u32,
-              duration: u32, offset: u64, size: usize) -> Result<(), Mp4Error> {
-        let s = Sample {
-            track_kind: kind,
-            sample_entry: entry,
-            keyframe,
-            timescale: NonZeroU32::new(timescale).unwrap(),
-            duration,
-            composition_time_offset: None,
-            data_offset: offset,
-            data_size: size,
-        };
-        self.muxer.append_sample(&s).map_err(|e| err(format!("{e:?}")))
     }
 
     /// One encoded frame (Annex B), shown from `pts` seconds. Frames before the first keyframe are
@@ -176,16 +166,22 @@ impl Mp4Writer {
                 unknown_boxes: Vec::new(),
             }))
         } else { None };
-        self.flush_held(Some(ticks))?;
+        self.release_held(Some(ticks))?;
         self.held = Some(Held { pts: ticks, body, keyframe, entry });
         Ok(())
     }
 
-    fn flush_held(&mut self, next: Option<u64>) -> Result<(), Mp4Error> {
-        if let Some(h) = self.held.take() {
-            let dur = next.map(|n| n.saturating_sub(h.pts)).unwrap_or(self.frame_period).max(1);
-            let offset = self.put(&h.body)?;
-            self.append(TrackKind::Video, h.entry, h.keyframe, VIDEO_TIMESCALE, dur.min(u32::MAX as u64) as u32, offset, h.body.len())?;
+    /// The held frame now has a duration: queue it, and close the fragment when it is long enough.
+    fn release_held(&mut self, next: Option<u64>) -> Result<(), Mp4Error> {
+        let Some(h) = self.held.take() else { return Ok(()) };
+        let dur = next.map(|n| n.saturating_sub(h.pts)).unwrap_or(self.frame_period).max(1);
+        let dur = dur.min(u32::MAX as u64);
+        self.pending.push(Pending { kind: TrackKind::Video, entry: h.entry, keyframe: h.keyframe, timescale: VIDEO_TIMESCALE, duration: dur as u32, body: h.body });
+        self.pending_video_ticks += dur;
+        if self.pending_video_ticks >= FRAGMENT_TICKS {
+            let waiting_for_audio = !self.started && self.audio_entry.is_some() && !self.audio_entry_sent
+                && self.pending_video_ticks < FIRST_AUDIO_WAIT_TICKS;
+            if !waiting_for_audio { self.flush_fragment()?; }
         }
         Ok(())
     }
@@ -194,27 +190,69 @@ impl Mp4Writer {
     /// dropped (players start the movie at the first frame).
     pub fn write_audio(&mut self, packet: &[u8], samples: u32) -> Result<(), Mp4Error> {
         if self.first_pts.is_none() || packet.is_empty() { return Ok(()); }
-        let entry = if !self.audio_entry_sent { self.audio_entry_sent = true; self.audio_entry.clone() } else { None };
         if self.audio_entry.is_none() { return Ok(()); }
-        let offset = self.put(packet)?;
-        self.append(TrackKind::Audio, entry, true, OPUS_RATE, samples, offset, packet.len())
+        let entry = if !self.audio_entry_sent { self.audio_entry_sent = true; self.audio_entry.clone() } else { None };
+        self.pending.push(Pending { kind: TrackKind::Audio, entry, keyframe: true, timescale: OPUS_RATE, duration: samples, body: packet.to_vec() });
+        Ok(())
     }
 
-    /// Write the index and close. `end` (seconds, same clock as the frames) sets how long the last
-    /// frame lasts -- a still screen sends nothing after it, so without this it would be one frame long.
+    /// Write the open fragment (moof + mdat) and flush it to disk. Payloads are laid out track by
+    /// track (all video, then all audio), as the muxer requires.
+    fn flush_fragment(&mut self) -> Result<(), Mp4Error> {
+        if self.pending.is_empty() { return Ok(()); }
+        let mut samples = Vec::with_capacity(self.pending.len());
+        let mut offset = 0u64;
+        for kind in [TrackKind::Video, TrackKind::Audio] {
+            for p in self.pending.iter().filter(|p| p.kind == kind) {
+                samples.push(Sample {
+                    track_kind: kind,
+                    sample_entry: p.entry.clone(),
+                    keyframe: p.keyframe,
+                    timescale: NonZeroU32::new(p.timescale).unwrap(),
+                    duration: p.duration,
+                    composition_time_offset: None,
+                    data_offset: offset,
+                    data_size: p.body.len(),
+                });
+                offset += p.body.len() as u64;
+            }
+        }
+        let meta = self.muxer.create_media_segment_metadata(&samples).map_err(|e| err(format!("{e:?}")))?;
+        if !self.started {
+            let init = self.muxer.init_segment_bytes().map_err(|e| err(format!("{e:?}")))?;
+            self.file.write_all(&init).map_err(err)?;
+            self.started = true;
+        }
+        let mut out = Vec::with_capacity(meta.len() + offset as usize);
+        out.extend_from_slice(&meta);
+        for kind in [TrackKind::Video, TrackKind::Audio] {
+            for p in self.pending.iter().filter(|p| p.kind == kind) { out.extend_from_slice(&p.body); }
+        }
+        self.file.write_all(&out).map_err(err)?;
+        // On disk now, not just in the page cache: this is the crash-safety guarantee.
+        self.file.sync_data().map_err(err)?;
+        self.pending.clear();
+        self.pending_video_ticks = 0;
+        Ok(())
+    }
+
+    /// Write the last fragment and the random-access index, and close. `end` (seconds, same clock
+    /// as the frames) sets how long the last frame lasts -- a still screen sends nothing after it, so
+    /// without this it would be one frame long.
     pub fn finish(mut self, end: Option<f64>) -> Result<(), Mp4Error> {
         let end_ticks = match (end, self.first_pts) {
             (Some(e), Some(f)) => Some(((e - f).max(0.0) * VIDEO_TIMESCALE as f64).round() as u64),
             _ => None,
         };
         let next = end_ticks.filter(|e| self.held.as_ref().map_or(false, |h| *e > h.pts));
-        self.flush_held(next)?;
-        if !self.video_entry_sent { return Err(Mp4Error("no video was recorded".into())); }
-        let fin = self.muxer.finalize().map_err(|e| err(format!("{e:?}")))?;
-        for (offset, bytes) in fin.offset_and_bytes_pairs() {
-            self.file.seek(SeekFrom::Start(offset)).map_err(err)?;
-            self.file.write_all(bytes).map_err(err)?;
+        if let Some(h) = self.held.take() {
+            let dur = next.map(|n| n.saturating_sub(h.pts)).unwrap_or(self.frame_period).max(1).min(u32::MAX as u64);
+            self.pending.push(Pending { kind: TrackKind::Video, entry: h.entry, keyframe: h.keyframe, timescale: VIDEO_TIMESCALE, duration: dur as u32, body: h.body });
         }
+        if !self.video_entry_sent { return Err(Mp4Error("no video was recorded".into())); }
+        self.flush_fragment()?;
+        // mfra: lets players seek quickly in a long file (optional for playback).
+        if let Ok(mfra) = self.muxer.mfra_bytes() { self.file.write_all(&mfra).map_err(err)?; }
         self.file.sync_all().map_err(err)
     }
 }

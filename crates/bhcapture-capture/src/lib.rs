@@ -12,6 +12,8 @@ pub mod error;
 pub mod snapshot;
 pub mod record;
 pub mod camera;
+pub mod awake;
+pub mod disk;
 pub use error::CaptureError;
 pub use snapshot::Snapshot;
 

@@ -262,6 +262,43 @@ fn start_camera(s: &Settings, opts: Arc<Mutex<FrameOptions>>, channel: Arc<Mutex
         let mask = if compare_masks() && model.is_some() { model } else { vision.or(model) };
         let Some(rgba) = cam::render(&Source { bgra: f.bgra, w: f.width, h: f.height, stride: f.stride }, mask.as_ref(), &o)
             else { return };
+        // Test builds: a white block stepping one place per frame along the top edge, so a recording
+        // shows whether every bubble frame made it into the video (BHC_CAM_COUNTER=1).
+        #[cfg(feature = "demo")]
+        let rgba = {
+            let mut rgba = rgba;
+            if std::env::var_os("BHC_CAM_COUNTER").is_some() {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
+                let (w, h) = (o.out_w as usize, o.out_h as usize);
+                let slot = n % 20; let bw = w / 20;
+                for y in h / 2 - 20..h / 2 + 20 { for x in 0..w {
+                    let on = x / bw.max(1) == slot;
+                    let subtle = std::env::var("BHC_CAM_COUNTER").as_deref() == Ok("subtle");
+                    let i = (y * w + x) * 4; let v = match (subtle, on) { (true, true) => 132, (true, false) => 120, (false, true) => 255, _ => 0 };
+                    rgba[i] = v; rgba[i + 1] = v; rgba[i + 2] = v;
+                } }
+            }
+            rgba
+        };
+        // Test builds: how much each bubble frame differs from the one before (mean abs, centre
+        // half of the picture), logged per second, to compare with the recorded video.
+        #[cfg(feature = "demo")]
+        if std::env::var_os("BHC_CAM_DIFFLOG").is_some() {
+            static PREV: Mutex<Option<(Vec<u8>, Instant, f64, u32)>> = Mutex::new(None);
+            let mut g = PREV.lock().unwrap();
+            let (w, h) = (o.out_w as usize, o.out_h as usize);
+            let e = g.get_or_insert_with(|| (rgba.clone(), Instant::now(), 0.0, 0));
+            if e.0.len() == rgba.len() {
+                let (mut sum, mut n) = (0u64, 0u64);
+                for y in h / 4..h * 3 / 4 { for x in w / 4..w * 3 / 4 {
+                    let i = (y * w + x) * 4; sum += (rgba[i + 1] as i32 - e.0[i + 1] as i32).unsigned_abs() as u64; n += 1;
+                } }
+                e.2 += sum as f64 / n.max(1) as f64; e.3 += 1;
+            }
+            e.0.copy_from_slice(&rgba);
+            if e.1.elapsed() >= Duration::from_secs(1) { println!("[difflog] sent {:.2}", e.2 / e.3.max(1) as f64); e.1 = Instant::now(); e.2 = 0.0; e.3 = 0; }
+        }
         // 8-byte header (width, height, little-endian) so the page never guesses the size.
         let mut msg = Vec::with_capacity(8 + rgba.len());
         msg.extend_from_slice(&o.out_w.to_le_bytes());

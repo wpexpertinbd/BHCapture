@@ -1824,7 +1824,7 @@ fn main() {
                         let s = g.get().clone();
                         let bg = std::env::var("BHC_CAM_BG").unwrap_or_else(|_| "blur".into());
                         g.set(Settings { camera_enabled: true, camera_background: bg, camera_shape: std::env::var("BHC_CAM_SHAPE").unwrap_or_else(|_| "circle".into()),
-                                         record_countdown: false, record_microphone: false, record_system_audio: false, ..s });
+                                         record_countdown: false, record_microphone: std::env::var_os("BHC_CAM_AUDIO").is_some(), record_system_audio: std::env::var_os("BHC_CAM_AUDIO").is_some(), ..s });
                     }
                     ms(2500);
                     open_selector(&h, true);
@@ -1857,8 +1857,16 @@ fn main() {
                     ms(800);
                     let r = tauri::async_runtime::block_on(recording::recorder_start(h.clone(), h.state::<Arc<AppState>>()));
                     println!("[camtest] record start: {r:?}");
-                    ms(4000);
+                    let secs: u64 = std::env::var("BHC_CAM_REC_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+                    for i in 0..secs {
+                        let (a0, b0) = (camera_bubble::FRAMES_IN.load(Ordering::Relaxed), camera_bubble::FRAMES_SENT.load(Ordering::Relaxed));
+                        ms(1000);
+                        if (i + 1) % 60 == 0 || i < 3 { println!("[camtest] rec {:>4}s: camera {} fps, sent {} fps", i + 1,
+                            camera_bubble::FRAMES_IN.load(Ordering::Relaxed) - a0, camera_bubble::FRAMES_SENT.load(Ordering::Relaxed) - b0); }
+                    }
+                    let t_stop = std::time::Instant::now();
                     let r = tauri::async_runtime::block_on(recording::recorder_stop(h.clone()));
+                    println!("[camtest] stopping + saving took {:.1} s", t_stop.elapsed().as_secs_f64());
                     ms(1000);
                     println!("[camtest] record stop: {r:?}; bubble still open 1 s later = {}", camera_bubble::is_open(&h));
                     // Second take: the hidden bubble is reused and its camera starts again.

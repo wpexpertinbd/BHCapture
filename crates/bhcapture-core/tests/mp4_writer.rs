@@ -69,24 +69,54 @@ fn writes_a_complete_mp4_with_video_and_audio_tracks() {
     let top = boxes(&bytes);
     assert_eq!(top.first().map(String::as_str), Some("ftyp"), "{top:?}");
     assert!(top.iter().any(|b| b == "mdat") && top.iter().any(|b| b == "moov"), "{top:?}");
+    assert!(top.iter().any(|b| b == "moof"), "fragmented: {top:?}");
+    assert_eq!(top.last().map(String::as_str), Some("mfra"), "seek index at the end: {top:?}");
     let s = String::from_utf8_lossy(&bytes);
-    for tag in ["avc1", "avcC", "Opus", "dOps", "stss"] { assert!(s.contains(tag), "missing {tag}"); }
+    for tag in ["avc1", "avcC", "Opus", "dOps", "mvex", "trun"] { assert!(s.contains(tag), "missing {tag}"); }
 }
 
 #[test]
-fn memory_does_not_hold_the_video_the_file_grows_as_frames_arrive() {
+fn a_crash_leaves_every_finished_fragment_playable() {
+    // 4 s of video, then the writer is dropped WITHOUT finish(): what a crash or power cut does.
+    let p = tmp("crash");
+    let frames = encode(120);
+    {
+        let mut w = Mp4Writer::create(&p, 320, 240, 30, Some((2, 312))).unwrap();
+        for (i, f) in frames.iter().enumerate() {
+            w.write_video(i as f64 / 30.0, f).unwrap();
+            w.write_audio(&[0xfc, 0xff, 0xfe], 1600).unwrap();
+        }
+        // dropped here
+    }
+    let bytes = std::fs::read(&p).unwrap();
+    let top = boxes(&bytes);
+    assert_eq!(&top[..2], &["ftyp".to_string(), "moov".to_string()], "{top:?}");
+    let fragments = top.iter().filter(|b| *b == "moof").count();
+    assert!(fragments >= 1, "at least the first 2 s are on disk: {top:?}");
+    // Every box is complete: the walk ends exactly at the end of the file.
+    let mut i = 0usize;
+    while i + 8 <= bytes.len() {
+        let size = u32::from_be_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+        assert!(size >= 8 && i + size <= bytes.len(), "box at {i} runs past the end");
+        i += size;
+    }
+    assert_eq!(i, bytes.len(), "no partial box at the end");
+}
+
+#[test]
+fn memory_holds_at_most_one_fragment_the_file_grows_as_frames_arrive() {
+    // 5 s of video, no finish yet: the first two 2-second fragments must already be on disk.
     let p = tmp("stream");
-    let frames = encode(30);
+    let frames = encode(150);
     let mut w = Mp4Writer::create(&p, 320, 240, 30, None).unwrap();
-    let start = std::fs::metadata(&p).unwrap().len();
     for (i, f) in frames.iter().enumerate() { w.write_video(i as f64 / 30.0, f).unwrap(); }
-    let during = std::fs::metadata(&p).unwrap().len();
+    let bytes = std::fs::read(&p).unwrap();
+    let on_disk_frames = boxes(&bytes).iter().filter(|b| *b == "moof").count();
+    assert!(on_disk_frames >= 2, "fragments on disk before finish: {:?}", boxes(&bytes));
     let encoded: usize = frames.iter().map(|f| f.len()).sum();
-    // Everything encoded so far is ALREADY on disk (minus start codes and the ONE frame held back for
-    // its duration), before finish().
-    let last = frames.last().unwrap().len() as u64;
-    assert!(during - start + 200 + last >= encoded as u64 * 9 / 10, "only {} of {} bytes written", during - start, encoded);
-    w.finish(Some(1.0)).unwrap();
+    let last_2s: usize = frames[90..].iter().map(|f| f.len()).sum();
+    assert!(bytes.len() + last_2s + 4096 >= encoded * 9 / 10, "only {} of {} bytes written", bytes.len(), encoded);
+    w.finish(Some(5.0)).unwrap();
 }
 
 #[test]

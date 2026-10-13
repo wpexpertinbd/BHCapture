@@ -857,3 +857,14 @@ int32_t bhc_export_video(const char *src_path, const char *dst_path, int32_t kin
         return BHC_OK;
     }
 }
+
+/* Keep the display (and so the Mac) awake while recording; 0 = refused. */
+#include <IOKit/pwr_mgt/IOPMLib.h>
+uint32_t bhc_awake_hold(const char *reason) {
+    IOPMAssertionID id = 0;
+    CFStringRef r = CFStringCreateWithCString(NULL, reason ? reason : "Recording", kCFStringEncodingUTF8);
+    IOReturn ok = IOPMAssertionCreateWithName(kIOPMAssertPreventUserIdleDisplaySleep, kIOPMAssertionLevelOn, r, &id);
+    if (r) CFRelease(r);
+    return ok == kIOReturnSuccess ? (uint32_t)id : 0;
+}
+void bhc_awake_release(uint32_t id) { if (id) IOPMAssertionRelease((IOPMAssertionID)id); }

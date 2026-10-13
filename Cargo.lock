@@ -265,7 +265,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bhcapture-app"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -284,11 +284,12 @@ dependencies = [
 
 [[package]]
 name = "bhcapture-capture"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "bhcapture-core",
  "cc",
  "image",
+ "libc",
  "libpulse-binding",
  "libpulse-simple-binding",
  "openh264",
@@ -298,11 +299,12 @@ dependencies = [
  "v4l",
  "windows",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]
 name = "bhcapture-core"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "gif",
  "image",

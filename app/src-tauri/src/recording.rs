@@ -93,9 +93,21 @@ struct Session {
     file: Option<PathBuf>,
     /// System audio AND microphone: two tracks that must be mixed into one when finished.
     two_tracks: bool,
+    /// Keeps the display awake while recording (a long tutorial must not end on a locked screen).
+    /// Released when the session ends.
+    awake: Option<bhcapture_capture::awake::KeepAwake>,
 }
 
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+
+/// A recording needs room to grow: refuse to start below this, and stop (keeping everything) below
+/// the second -- a full disk would otherwise end it badly (decision 37).
+const MIN_FREE_TO_START: u64 = 1024 * 1024 * 1024;
+const MIN_FREE_WHILE_RECORDING: u64 = 300 * 1024 * 1024;
+/// Why the status loop stopped a recording, shown with the result.
+static STOP_NOTE: Mutex<Option<String>> = Mutex::new(None);
+
+fn gb(b: u64) -> String { format!("{:.1} GB", b as f64 / 1e9) }
 
 /// One finished recording, open in a playback window. `file` is the private working copy; a save
 /// COPIES it out, so the window keeps playing from a path that never changes.
@@ -214,7 +226,7 @@ pub(crate) fn prepare(app: &tauri::AppHandle, state: &Arc<AppState>, rect: LogRe
 
     *SESSION.lock().unwrap() = Some(Session {
         display: target.display, local: target.local, global: target.global, px,
-        phase: Phase::Ready, recorder: None, file: None, two_tracks: false,
+        phase: Phase::Ready, recorder: None, file: None, two_tracks: false, awake: None,
     });
     show_frame(app, target.display, Some(target.global));
     let at = place_bar(d.bounds, target.global, HUD_SIZE);
@@ -384,6 +396,11 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
           s.record_noise_filter, s.record_auto_level, s.record_voice_clarity, s.record_click_highlight))
     };
     let dir = recordings_dir();
+    if let Some(free) = bhcapture_capture::disk::free_bytes(&dir) {
+        if free < MIN_FREE_TO_START {
+            return Err(format!("Only {} free on the disk. Free up some space before recording (at least {}).", gb(free), gb(MIN_FREE_TO_START)));
+        }
+    }
     let stem = pattern.render(local_stamp(), &Fields { width: px.0, height: px.1, ..Default::default() });
     let file = unique_path(&dir, &stem, "mp4", &|p| bhcapture_core::private_file::occupied(p));
 
@@ -418,6 +435,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
                 // Windows mixes them live into one.
                 s.two_tracks = cfg!(target_os = "macos") && opts.1 && opts.2;
                 s.phase = Phase::Recording;
+                if s.awake.is_none() { s.awake = Some(bhcapture_capture::awake::KeepAwake::hold("BHCapture is recording the screen")); }
             }
             // Cancelled during the start: drop() finishes the file; throw it away.
             _ => { drop(rec); let _ = std::fs::remove_file(&file); return Err("Recording was cancelled.".into()); }
@@ -452,6 +470,7 @@ struct StatusPayload { seconds: f64, level_system: f32, level_mic: f32, paused: 
 /// display unplugged) -- that one is finished and opened like a normal stop, so what was recorded
 /// is kept.
 fn spawn_status(app: tauri::AppHandle) {
+    let mut ticks = 0u32;
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let st = {
@@ -466,6 +485,19 @@ fn spawn_status(app: tauri::AppHandle) {
             eprintln!("[record] stopped by an error: {:?}", st.error);
             let _ = stop(&app);
             return;
+        }
+        // Every few seconds: is the disk about to fill? Stop in time, keeping everything.
+        ticks += 1;
+        if ticks % 25 == 0 {
+            if let Some(free) = bhcapture_capture::disk::free_bytes(&recordings_dir()) {
+                if free < MIN_FREE_WHILE_RECORDING {
+                    eprintln!("[record] disk almost full ({} left): stopping", gb(free));
+                    *STOP_NOTE.lock().unwrap() = Some(format!(
+                        "The recording was stopped because the disk is almost full ({} left). Everything recorded up to then is kept.", gb(free)));
+                    let _ = stop(&app);
+                    return;
+                }
+            }
         }
         set_tray_time(&app, st.seconds, st.state == RecordState::Paused);
         let _ = app.emit_to(HUD, "recorder-status", StatusPayload {
@@ -563,7 +595,7 @@ fn stop(app: &tauri::AppHandle) -> Result<(), String> {
     let Some(file) = file else { return Ok(()) };
     let usable = std::fs::metadata(&file).map(|m| m.len() > 0).unwrap_or(false);
     match (&result, usable) {
-        (Ok(()), true) => { open_video(app, file, None)?; Ok(()) }
+        (Ok(()), true) => { open_video(app, file, STOP_NOTE.lock().unwrap().take())?; Ok(()) }
         // Cut short (disk full, display gone): keep and show what was written, and say why.
         (Err(e), true) => {
             open_video(app, file, Some(format!("The recording stopped early: {e}. What was recorded up to then is kept.")))?;

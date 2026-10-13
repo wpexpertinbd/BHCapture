@@ -7,6 +7,7 @@ authors.workspace = true
 description = "One capture trait, with per-OS backends behind cfg()."
 
 [dependencies]
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 bhcapture-core = { path = "../bhcapture-core" }
 
@@ -22,7 +23,7 @@ cc = "1"
 # Same major as Tauri's own (0.62), so the build carries one copy.
 windows = { version = "0.62", features = [
   "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging",
-  "Win32_UI_HiDpi", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Com",
+  "Win32_UI_HiDpi", "Win32_System_Threading", "Win32_System_Power", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Com",
   "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Media_MediaFoundation",
   "Win32_Media_Audio", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia",
   "Win32_UI_Input_KeyboardAndMouse", "Win32_System_SystemInformation",
@@ -42,3 +43,5 @@ libpulse-simple-binding = { version = "2.29", default-features = false }
 v4l = "0.14"
 # MJPEG webcam frames: the JPEG decoder screenshots already build in (no new codec).
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# Keep the desktop awake while recording (org.freedesktop.ScreenSaver); already in the tree.
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }

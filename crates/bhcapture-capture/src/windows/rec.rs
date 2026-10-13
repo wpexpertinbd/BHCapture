@@ -220,7 +220,21 @@ unsafe fn create_writer(path: &std::path::Path, w: u32, h: u32, fps: u32, audio:
         MFCreateAttributes(&mut attrs, 4)?;
         let attrs = attrs.unwrap();
         attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
-        let writer = MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attrs)?;
+        // Fragmented MP4: written to disk piece by piece, so a crash, power cut or full disk keeps
+        // everything recorded before it -- a plain MP4 writes its index only at the end and loses
+        // the whole recording (decision 37: long recordings must never be lost). Windows 10+; if the
+        // system refuses it, record a plain MP4 rather than not at all.
+        let frag = attrs.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_FMPEG4)
+            .and_then(|_| MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attrs));
+        let writer = match frag {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("[rec] fragmented MP4 unavailable ({e}); writing a plain MP4");
+                let _ = std::fs::remove_file(path);
+                let _ = attrs.DeleteItem(&MF_TRANSCODE_CONTAINERTYPE);
+                MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attrs)?
+            }
+        };
 
         let bps = ((w as f64 * h as f64 * fps as f64 * 0.1).clamp(2e6, 50e6)) as u32;
         let vout = MFCreateMediaType()?;

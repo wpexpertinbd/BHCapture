@@ -34,7 +34,7 @@ fn main() {
         }
     }
 
-    for fw in ["ScreenCaptureKit", "CoreGraphics", "CoreFoundation", "Foundation", "CoreMedia", "CoreVideo", "AppKit", "AVFoundation", "Accelerate", "Vision"] {
+    for fw in ["ScreenCaptureKit", "CoreGraphics", "CoreFoundation", "Foundation", "CoreMedia", "CoreVideo", "AppKit", "AVFoundation", "Accelerate", "Vision", "IOKit"] {
         println!("cargo:rustc-link-lib=framework={fw}");
     }
 }
