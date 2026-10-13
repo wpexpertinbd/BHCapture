@@ -16,6 +16,12 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 nnnoiseless = { version = "0.5.2", default-features = false }
 gif = "0.14"
 shiguredo_mp4 = "=2026.5.0"
+# Camera background on Windows/Linux (`segment`): MediaPipe's selfie segmenter run by tract, a
+# lightly patched copy (third_party/tract-tflite/BHCAPTURE-PATCH.md). macOS uses Vision instead.
+tract-tflite = { path = "../../third_party/tract-tflite", optional = true }
+
+[features]
+segment = ["dep:tract-tflite"]
 
 [dev-dependencies]
 gif = "0.14"

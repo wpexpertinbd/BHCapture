@@ -82,6 +82,25 @@ pub struct Settings {
     pub record_countdown: bool,
     /// 1-60.
     pub record_fps: u32,
+    /// Camera bubble in recordings (decision 34). Off until the user turns it on.
+    pub camera_enabled: bool,
+    /// Camera id from the OS ("" = the default camera).
+    pub camera_device: String,
+    /// "circle" | "rounded" | "square" | "wide" (16:9).
+    pub camera_shape: String,
+    /// Bubble height in points, 120-480.
+    pub camera_size: u32,
+    /// Starting corner: "bottom-right" | "bottom-left" | "top-right" | "top-left".
+    pub camera_corner: String,
+    pub camera_mirror: bool,
+    /// Auto light + a little colour (bhcapture_core::camera).
+    pub camera_enhance: bool,
+    /// "none" | "blur" | "color" | "preset:<name>" | "image" (decision 35).
+    pub camera_background: String,
+    /// "#rrggbb" for the "color" background.
+    pub camera_bg_color: String,
+    /// The user's own background picture, for "image".
+    pub camera_bg_image: Option<PathBuf>,
     /// Look for a newer release at launch and every few hours (BHServe's model). On by default.
     pub auto_update_check: bool,
     /// Unix seconds of the last AUTOMATIC check, so restarts do not each ask GitHub.
@@ -119,6 +138,16 @@ impl Default for Settings {
             record_click_highlight: true,
             record_countdown: true,
             record_fps: 30,
+            camera_enabled: false,
+            camera_device: String::new(),
+            camera_shape: "circle".into(),
+            camera_size: 200,
+            camera_corner: "bottom-right".into(),
+            camera_mirror: true,
+            camera_enhance: true,
+            camera_background: "none".into(),
+            camera_bg_color: "#1f6feb".into(),
+            camera_bg_image: None,
             auto_update_check: true,
             last_update_check: 0,
             notified_update: String::new(),
@@ -188,6 +217,33 @@ impl Settings {
         if !(1..=60).contains(&self.record_fps) {
             fixed.push(format!("recording frame rate {} is outside 1-60; reset to 30", self.record_fps));
             self.record_fps = 30;
+        }
+        if !["circle", "rounded", "square", "wide"].contains(&self.camera_shape.as_str()) {
+            fixed.push(format!("camera shape {:?} is unknown; reset to circle", self.camera_shape));
+            self.camera_shape = "circle".into();
+        }
+        if !["bottom-right", "bottom-left", "top-right", "top-left"].contains(&self.camera_corner.as_str()) {
+            fixed.push(format!("camera position {:?} is unknown; reset to bottom-right", self.camera_corner));
+            self.camera_corner = "bottom-right".into();
+        }
+        if !(120..=480).contains(&self.camera_size) {
+            let v = self.camera_size.clamp(120, 480);
+            fixed.push(format!("camera size {} is outside 120-480; set to {v}", self.camera_size));
+            self.camera_size = v;
+        }
+        let bg_ok = ["none", "blur", "color", "image"].contains(&self.camera_background.as_str())
+            || self.camera_background.strip_prefix("preset:").map_or(false, |p| crate::camera::PRESETS.iter().any(|(id, _)| *id == p));
+        if !bg_ok {
+            fixed.push(format!("camera background {:?} is unknown; reset to none", self.camera_background));
+            self.camera_background = "none".into();
+        }
+        if crate::camera::parse_hex_color(&self.camera_bg_color).is_none() {
+            fixed.push(format!("camera background colour {:?} is not #rrggbb; reset", self.camera_bg_color));
+            self.camera_bg_color = "#1f6feb".into();
+        }
+        if self.camera_bg_image.as_ref().map_or(false, |p| !p.is_absolute()) {
+            fixed.push("camera background picture must be a full path; cleared".into());
+            self.camera_bg_image = None;
         }
         fixed
     }

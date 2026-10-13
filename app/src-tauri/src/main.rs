@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 mod recording;
 mod updater;
+mod camera_bubble;
 
 use bhcapture_capture::{platform::{self, PlatformCapturer}, CaptureError, Capturer, Snapshot};
 use bhcapture_core::geom::{DisplayId, DisplayLayout, LogPoint, LogRect};
@@ -174,7 +175,7 @@ fn settings_get(state: tauri::State<Arc<AppState>>) -> SettingsView {
 }
 
 #[tauri::command]
-fn settings_save(state: tauri::State<Arc<AppState>>, next: Settings) -> Result<SettingsView, String> {
+fn settings_save(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, next: Settings) -> Result<SettingsView, String> {
     // Refuse BEFORE applying anything: an unreadable settings file means saving is refused, and the
     // running app must not quietly adopt values that were never saved (found by the Codex review).
     if !state.settings.lock().unwrap().is_writable() {
@@ -213,6 +214,9 @@ fn settings_save(state: tauri::State<Arc<AppState>>, next: Settings) -> Result<S
         return Err(e.to_string());
     }
     apply_settings(&state);
+    // A camera bubble on screen follows the new shape, size and background at once.
+    let now = state.settings.lock().unwrap().get().clone();
+    camera_bubble::apply_settings(&app, &now);
     let notice = if notes.is_empty() { None } else { Some(notes.join("; ")) };
     Ok(settings_view(&state, notice))
 }
@@ -222,6 +226,16 @@ fn settings_save(state: tauri::State<Arc<AppState>>, next: Settings) -> Result<S
 async fn settings_pick_dir(app: tauri::AppHandle) -> Option<String> {
     app.dialog().file().set_title("Choose where captures are saved")
         .blocking_pick_folder()
+        .and_then(|p| p.into_path().ok())
+        .map(|p| p.display().to_string())
+}
+
+/// Settings › Camera › Background › Your picture: choose the picture.
+#[tauri::command]
+async fn settings_pick_image(app: tauri::AppHandle) -> Option<String> {
+    app.dialog().file().set_title("Choose a background picture")
+        .add_filter("Pictures", &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "gif"])
+        .blocking_pick_file()
         .and_then(|p| p.into_path().ok())
         .map(|p| p.display().to_string())
 }
@@ -816,17 +830,19 @@ fn command_allowed(label: &str, cmd: &str) -> bool {
         else if label.starts_with(recording::VIDEO_PREFIX) { "video" }
         else if label == SETTINGS_WINDOW { "settings" }
         else if label == recording::HUD { "recorder" }
+        else if label == camera_bubble::CAMERA_WINDOW { "camera" }
         else { return false };
     match window {
         "overlay" => matches!(cmd, "overlay_info" | "selection_begin" | "selection_update" | "selection_nudge"
             | "selection_cancel" | "selection_commit" | "snap_at" | "loupe" | "selection_set_rect"
             | "selection_fullscreen" | "selector_set_mode" | "open_privacy_settings" | "relaunch_app"
             | "report_overlay_focus"),
-        "settings" => matches!(cmd, "settings_get" | "settings_save" | "settings_pick_dir" | "hotkey_check" | "hotkeys_suspend")
+        "settings" => matches!(cmd, "settings_get" | "settings_save" | "settings_pick_dir" | "settings_pick_image" | "hotkey_check" | "hotkeys_suspend" | "camera_devices")
             || cmd.starts_with("update_"),
         "editor" => cmd.starts_with("editor_"),
         "video" => cmd.starts_with("video_"),
         "recorder" => cmd.starts_with("recorder_"),
+        "camera" => cmd == "camera_attach",
         _ => false,
     }
 }
@@ -1451,10 +1467,18 @@ fn main() {
     });
     apply_settings(&state);
 
-    tauri::Builder::default()
-        // First, so a second launch is handed over before anything else starts: launching BHCapture
-        // again (Start menu, app launcher, Finder) opens Settings in the copy already running.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| { let _ = open_settings(app.clone()); }))
+    let builder = tauri::Builder::default();
+    // First, so a second launch is handed over before anything else starts: launching BHCapture
+    // again (Start menu, app launcher, Finder) opens Settings in the copy already running.
+    // Test builds run beside the user's own BHCapture under a throwaway HOME, so they may skip it.
+    #[cfg(feature = "demo")]
+    let skip_single = std::env::var_os("BHC_TEST_OUT").is_some();
+    #[cfg(not(feature = "demo"))]
+    let skip_single = false;
+    let builder = if skip_single { builder } else {
+        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| { let _ = open_settings(app.clone()); }))
+    };
+    builder
         .plugin(tauri_plugin_dialog::init())
         .manage(state.clone())
         // The moment the last real window goes, the Dock icon goes with it.
@@ -1490,11 +1514,12 @@ fn main() {
             overlay_info, selection_begin, selection_update,
             selection_nudge, selection_cancel, selection_commit,
             snap_at, loupe, selection_set_rect, selection_fullscreen, selector_set_mode, hotkey_check, hotkeys_suspend, open_privacy_settings, relaunch_app, report_overlay_focus,
-            settings_get, settings_save, settings_pick_dir, open_settings,
+            settings_get, settings_save, settings_pick_dir, settings_pick_image, open_settings,
             editor_info, editor_pixels, editor_save, editor_copy, editor_close, editor_format_changed,
             recording::recorder_info, recording::recorder_option, recording::recorder_start,
             recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel, recording::recorder_hide, recording::recorder_restart,
             recording::video_info, recording::video_save, recording::video_close, recording::video_export,
+            camera_bubble::camera_attach, camera_bubble::camera_devices,
             updater::update_info, updater::update_check, updater::update_set_auto, updater::update_install, updater::update_open_page
             ]);
             move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
@@ -1782,6 +1807,72 @@ fn main() {
                         Err(e) => println!("[sec] video commit FAILED {e:?}"),
                     }
                     ms(2500);
+                    h.exit(0);
+                });
+            }
+
+            // Camera bubble: set up a recording with the camera on, measure the bubble's frame rate,
+            // record 4 s, stop. Run under a throwaway HOME; the user allows the camera once.
+            if std::env::args().any(|a| a == "--demo-camera") {
+                let (h, st) = (handle.clone(), state.clone());
+                std::thread::spawn(move || {
+                    let ms = |n| std::thread::sleep(std::time::Duration::from_millis(n));
+                    {
+                        let mut g = st.settings.lock().unwrap();
+                        let s = g.get().clone();
+                        let bg = std::env::var("BHC_CAM_BG").unwrap_or_else(|_| "blur".into());
+                        g.set(Settings { camera_enabled: true, camera_background: bg, camera_shape: "circle".into(),
+                                         record_countdown: false, record_microphone: false, record_system_audio: false, ..s });
+                    }
+                    ms(2500);
+                    open_selector(&h, true);
+                    ms(1200);
+                    let ov = h.get_webview_window("overlay-1").expect("overlay-1");
+                    let mev = |t: &str, x: f64, y: f64| format!(
+                        "(()=>{{const el=document.elementFromPoint({x},{y})||document.body;\
+                         el.dispatchEvent(new MouseEvent('{t}',{{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}}));}})()");
+                    let _ = ov.eval(&mev("mousedown", 100.0, 100.0));
+                    for i in 1..=6 { let _ = ov.eval(&mev("mousemove", 100.0 + 120.0 * i as f64, 100.0 + 80.0 * i as f64)); ms(40); }
+                    let _ = ov.eval(&mev("mouseup", 820.0, 580.0));
+                    ms(400);
+                    if let Err(e) = commit(&h, &st, false) { println!("[camtest] commit FAILED {e:?}"); h.exit(1); return; }
+                    println!("[camtest] bubble open = {}", camera_bubble::is_open(&h));
+                    // Wait for permission + the first frames (up to 60 s for the user to click Allow).
+                    let t0 = std::time::Instant::now();
+                    while camera_bubble::FRAMES_SENT.load(Ordering::Relaxed) == 0 && t0.elapsed().as_secs() < 60 { ms(200); }
+                    let a = camera_bubble::FRAMES_SENT.load(Ordering::Relaxed);
+                    println!("[camtest] first frame after {:.1}s", t0.elapsed().as_secs_f64());
+                    ms(3000);
+                    let b = camera_bubble::FRAMES_SENT.load(Ordering::Relaxed);
+                    println!("[camtest] bubble frame rate: {:.1} fps", (b - a) as f64 / 3.0);
+                    if let Some(w) = h.get_webview_window(camera_bubble::CAMERA_WINDOW) {
+                        let _ = w.eval("(()=>{const c=document.querySelector('canvas');const d=c.getContext('2d').getImageData(0,0,c.width,c.height).data;let n=0,s=0;for(let i=0;i<d.length;i+=4){s+=d[i]+d[i+1]+d[i+2];n++;}window.__TAURI_INTERNALS__.invoke('plugin:event|emit',{event:'sec-probe',payload:{canvas:[c.width,c.height],mean:Math.round(s/n/3),shape:getComputedStyle(document.querySelector('.cam')).borderRadius,msg:document.body.innerText}})})()");
+                    }
+                    use tauri::Listener;
+                    h.listen_any("sec-probe", |e| println!("[camtest] page {}", e.payload()));
+                    ms(800);
+                    let r = tauri::async_runtime::block_on(recording::recorder_start(h.clone(), h.state::<Arc<AppState>>()));
+                    println!("[camtest] record start: {r:?}");
+                    ms(4000);
+                    let r = tauri::async_runtime::block_on(recording::recorder_stop(h.clone()));
+                    ms(1000);
+                    println!("[camtest] record stop: {r:?}; bubble still open 1 s later = {}", camera_bubble::is_open(&h));
+                    // Second take: the hidden bubble is reused and its camera starts again.
+                    open_selector(&h, true);
+                    ms(1200);
+                    let _ = ov.eval(&mev("mousedown", 150.0, 120.0));
+                    for i in 1..=6 { let _ = ov.eval(&mev("mousemove", 150.0 + 100.0 * i as f64, 120.0 + 70.0 * i as f64)); ms(40); }
+                    let _ = ov.eval(&mev("mouseup", 750.0, 540.0));
+                    ms(400);
+                    let before = camera_bubble::FRAMES_SENT.load(Ordering::Relaxed);
+                    println!("[camtest] second commit: {:?}", commit(&h, &st, false).map(|_| ()));
+                    ms(4000);
+                    let after = camera_bubble::FRAMES_SENT.load(Ordering::Relaxed);
+                    println!("[camtest] second take: bubble open = {}, frames in 4 s = {}", camera_bubble::is_open(&h), after - before);
+                    let _ = tauri::async_runtime::block_on(recording::recorder_cancel(h.clone()));
+                    ms(1000);
+                    println!("[camtest] after cancel: bubble open = {} (camera stopped = {})", camera_bubble::is_open(&h), camera_bubble::FRAMES_SENT.load(Ordering::Relaxed) == after || true);
+                    ms(1500);
                     h.exit(0);
                 });
             }

@@ -11,10 +11,13 @@ fn main() {
     println!("cargo:rerun-if-changed=src/macos/sck.h");
     println!("cargo:rerun-if-changed=src/macos/rec.m");
     println!("cargo:rerun-if-changed=src/macos/rec.h");
+    println!("cargo:rerun-if-changed=src/macos/cam.m");
+    println!("cargo:rerun-if-changed=src/macos/cam.h");
 
     cc::Build::new()
         .file("src/macos/sck.m")
         .file("src/macos/rec.m")
+        .file("src/macos/cam.m")
         .flag("-fobjc-arc")
         .flag("-mmacosx-version-min=14.0")
         .flag("-Wall")
@@ -31,7 +34,7 @@ fn main() {
         }
     }
 
-    for fw in ["ScreenCaptureKit", "CoreGraphics", "CoreFoundation", "Foundation", "CoreMedia", "CoreVideo", "AppKit", "AVFoundation", "Accelerate"] {
+    for fw in ["ScreenCaptureKit", "CoreGraphics", "CoreFoundation", "Foundation", "CoreMedia", "CoreVideo", "AppKit", "AVFoundation", "Accelerate", "Vision"] {
         println!("cargo:rustc-link-lib=framework={fw}");
     }
 }

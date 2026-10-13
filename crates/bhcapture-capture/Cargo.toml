@@ -7,6 +7,7 @@ authors.workspace = true
 description = "One capture trait, with per-OS backends behind cfg()."
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
 bhcapture-core = { path = "../bhcapture-core" }
 
 [dev-dependencies]
@@ -37,3 +38,7 @@ opus = "0.4"
 # PulseAudio API for system sound (monitor source) and the microphone; PipeWire serves it too.
 libpulse-binding = { version = "2.29", default-features = false }
 libpulse-simple-binding = { version = "2.29", default-features = false }
+# Webcams (Video4Linux2). Its bindings are generated at build time, so CI needs libclang.
+v4l = "0.14"
+# MJPEG webcam frames: the JPEG decoder screenshots already build in (no new codec).
+image = { version = "0.25", default-features = false, features = ["jpeg"] }

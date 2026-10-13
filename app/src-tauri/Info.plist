@@ -10,6 +10,10 @@
        terminates the app the moment it touches the microphone. -->
   <key>NSMicrophoneUsageDescription</key>
   <string>BHCapture records your microphone into screen recordings when you turn Microphone on.</string>
+  <!-- Shown the first time the camera bubble is turned on. Without it macOS ends the app the moment
+       it touches the camera. -->
+  <key>NSCameraUsageDescription</key>
+  <string>BHCapture shows your camera in a bubble in screen recordings when you turn Camera on.</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
 </dict>

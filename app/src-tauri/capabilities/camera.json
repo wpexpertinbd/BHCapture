@@ -1,0 +1,8 @@
+{
+  "identifier": "camera",
+  "description": "The camera bubble moves when dragged.",
+  "windows": ["camera"],
+  "permissions": [
+    "core:window:allow-start-dragging"
+  ]
+}

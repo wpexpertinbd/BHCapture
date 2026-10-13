@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ShortcutField } from "./ShortcutField";
 import { Updates } from "./Updates";
+import { CameraSettings } from "./CameraSettings";
 
 type Theme = "system" | "light" | "dark";
 
@@ -25,6 +26,9 @@ type SettingsData = {
   record_click_highlight: boolean;
   record_countdown: boolean;
   record_fps: number;
+  camera_enabled: boolean; camera_device: string; camera_shape: string; camera_size: number;
+  camera_corner: string; camera_mirror: boolean; camera_enhance: boolean; camera_background: string;
+  camera_bg_color: string; camera_bg_image: string | null;
   theme: Theme;
   image_format: "jpeg" | "png" | "webp" | "tiff" | "bmp" | "gif";
   jpeg_quality: number;
@@ -59,7 +63,7 @@ export function Settings() {
   const [view, setView] = useState<SettingsView | null>(null);
   const [draft, setDraft] = useState<SettingsData | null>(null);
   // Tabs, so nothing important sits below the fold of a long page (the shortcuts used to).
-  const [tab, setTab] = useState<"general" | "shortcuts" | "recording">("general");
+  const [tab, setTab] = useState<"general" | "shortcuts" | "recording" | "camera">("general");
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -111,9 +115,9 @@ export function Settings() {
       {error && <div className="banner"><b>Could not save</b>{error}</div>}
 
       <div className="tabs" role="tablist">
-        {(["general", "shortcuts", "recording"] as const).map((t) => (
+        {(["general", "shortcuts", "recording", "camera"] as const).map((t) => (
           <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>
-            {({ general: "General", shortcuts: "Shortcuts", recording: "Recording" })[t]}
+            {({ general: "General", shortcuts: "Shortcuts", recording: "Recording", camera: "Camera" })[t]}
           </button>
         ))}
       </div>
@@ -282,6 +286,8 @@ export function Settings() {
         </label>
       </div>
       </>)}
+
+      {tab === "camera" && <CameraSettings draft={draft} set={set} />}
 
       <div className="footer">
         <span className="path">{view.path}</span>

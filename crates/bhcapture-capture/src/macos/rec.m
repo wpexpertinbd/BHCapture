@@ -298,12 +298,14 @@ BhcRecorder *bhc_rec_start(const BhcRecordOptions *opt, int32_t *code, char *err
         NSMutableArray<SCRunningApplication *> *skip = [NSMutableArray array];
         for (SCRunningApplication *a in content.applications)
             if (me && [a.bundleIdentifier isEqualToString:me]) [skip addObject:a];
-        /* ...except the one window asked for: the overlay that draws click rings, which must be IN
-         * the video while the control bar stays out. */
+        /* ...except the windows asked for: the overlay that draws click rings and the camera
+         * bubble, which must be IN the video while the control bar stays out. */
         NSMutableArray<SCWindow *> *keep = [NSMutableArray array];
-        if (opt->include_window) {
-            for (SCWindow *w in content.windows) if ((uint32_t)w.windowID == opt->include_window) { [keep addObject:w]; break; }
-            if (keep.count == 0) fprintf(stderr, "[rec] the click-highlight window %u is not on screen; clicks will not show\n", opt->include_window);
+        for (int32_t k = 0; k < opt->include_count && k < 4; k++) {
+            uint32_t want = opt->include_windows[k];
+            BOOL found = NO;
+            for (SCWindow *w in content.windows) if ((uint32_t)w.windowID == want) { [keep addObject:w]; found = YES; break; }
+            if (!found) fprintf(stderr, "[rec] window %u to include is not on screen; it will not show\n", want);
         }
         SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:disp excludingApplications:skip exceptingWindows:keep];
 

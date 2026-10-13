@@ -34,6 +34,8 @@ use crate::{CaptureError, Capturer, Targets, WindowId, WindowInfo};
 
 mod rec;
 mod media;
+mod cam;
+pub use cam::{camera_devices, camera_permission, camera_request_permission, WinCamera};
 pub use rec::{microphone_supported, WinRecorder};
 pub use media::{export_video, mix_audio_tracks, video_frames, VideoExport};
 pub use rec::{unwatch_clicks, watch_clicks};

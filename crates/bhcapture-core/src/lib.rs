@@ -4,6 +4,7 @@
 //! The shell injects every path and every display it finds; this crate only does arithmetic,
 //! which is what makes the hard parts testable without a screen attached.
 
+pub mod camera;
 pub mod denoise;
 pub mod export;
 pub mod geom;
@@ -16,6 +17,8 @@ pub mod naming;
 pub mod private_file;
 pub mod record;
 pub mod resample;
+#[cfg(feature = "segment")]
+pub mod segment;
 pub mod settings;
 pub mod snap;
 pub mod update;

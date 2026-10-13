@@ -19,7 +19,8 @@ struct BhcRecordOptions {
     noise_filter: i32,
     auto_level: i32,
     voice_clarity: i32,
-    include_window: u32,
+    include_windows: [u32; 4],
+    include_count: i32,
     path: *const c_char,
 }
 
@@ -159,7 +160,8 @@ impl MacRecorder {
             noise_filter: opt.noise_filter as i32,
             auto_level: opt.auto_level as i32,
             voice_clarity: opt.voice_clarity as i32,
-            include_window: opt.include_window.unwrap_or(0),
+            include_windows: { let mut a = [0u32; 4]; for (i, w) in opt.include_windows.iter().take(4).enumerate() { a[i] = *w; } a },
+            include_count: opt.include_windows.len().min(4) as i32,
             path: path.as_ptr(),
         };
         let mut code = 0i32;

@@ -114,3 +114,13 @@
 /* More specific than `.with-button input { flex: 1 }`, which squeezed this to ~20 px next to the select. */
 .settings .with-button input.quality { flex: 0 0 72px; width: 72px; }
 .settings .with-button select { flex: 1; min-width: 0; }
+
+/* Settings › Camera */
+.cam-shapes { display: flex; gap: 8px; flex-wrap: wrap; }
+.cam-shapes button { display: flex; align-items: center; gap: 6px; }
+.cam-shapes button.on { outline: 2px solid var(--accent, #1f6feb); }
+.cam-shape-ico { display: inline-block; width: 14px; height: 14px; background: currentColor; opacity: .7; }
+.cam-shape-ico.circle { border-radius: 50%; }
+.cam-shape-ico.rounded { border-radius: 4px; }
+.cam-shape-ico.square { border-radius: 1px; }
+.cam-shape-ico.wide { width: 20px; height: 11px; border-radius: 2px; }

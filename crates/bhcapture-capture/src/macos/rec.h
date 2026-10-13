@@ -26,7 +26,8 @@ typedef struct {
     int32_t     noise_filter;   /* 0/1; RNNoise on the microphone (48 kHz float only) */
     int32_t     auto_level;     /* 0/1; automatic voice level on the microphone */
     int32_t     voice_clarity;  /* 0/1; voice EQ on the microphone */
-    uint32_t    include_window; /* CGWindowID of OUR window to keep in the picture (click rings); 0 = none */
+    uint32_t    include_windows[4]; /* CGWindowIDs of OUR windows to keep IN the picture (click rings, camera) */
+    int32_t     include_count;
     const char *path;           /* UTF-8; the .mp4 to create. Must not exist. */
 } BhcRecordOptions;
 

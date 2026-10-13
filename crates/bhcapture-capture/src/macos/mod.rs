@@ -7,6 +7,8 @@ use bhcapture_core::geom::{Display, DisplayId, DisplayLayout, LogRect, PhysSize,
 use bhcapture_core::image::Frame;
 
 mod rec;
+mod cam;
+pub use cam::{camera_devices, camera_permission, camera_request_permission, MacCamera};
 pub use rec::{export_video, microphone_supported, mix_audio_tracks, unwatch_clicks, video_frames, watch_clicks, MacRecorder, VideoExport};
 
 use crate::{CaptureError, Capturer, Targets, WindowId, WindowInfo};

@@ -23,7 +23,11 @@ tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2"
 base64 = "0.22"
 
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# Camera background without Vision: the segmentation model (decision 36).
+bhcapture-core = { path = "../../crates/bhcapture-core", features = ["segment"] }
+
 [features]
 # Test harness only (--demo, --demo-snap, --settings). Off in shipped builds: it drives the real
 # command paths with synthetic input and writes into the user's Pictures folder.
-demo = []
+demo = ["bhcapture-core/segment"]

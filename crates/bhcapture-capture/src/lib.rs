@@ -11,6 +11,7 @@ use bhcapture_core::image::{Frame, FrameError};
 pub mod error;
 pub mod snapshot;
 pub mod record;
+pub mod camera;
 pub use error::CaptureError;
 pub use snapshot::Snapshot;
 
@@ -28,16 +29,19 @@ pub mod platform {
     pub use crate::macos::{
         export_video, microphone_supported, mix_audio_tracks, unwatch_clicks, video_frames, watch_clicks,
         watch_displays, MacCapturer as PlatformCapturer, MacRecorder as Recorder, VideoExport,
+        camera_devices, camera_permission, camera_request_permission, MacCamera as Camera,
     };
     #[cfg(windows)]
     pub use crate::windows::{
         export_video, microphone_supported, mix_audio_tracks, unwatch_clicks, video_frames, watch_clicks,
         watch_displays, VideoExport, WinCapturer as PlatformCapturer, WinRecorder as Recorder,
+        camera_devices, camera_permission, camera_request_permission, WinCamera as Camera,
     };
     #[cfg(target_os = "linux")]
     pub use crate::linux::{
         export_video, microphone_supported, mix_audio_tracks, unwatch_clicks, video_frames, watch_clicks,
         watch_displays, LinuxCapturer as PlatformCapturer, LinuxRecorder as Recorder, VideoExport,
+        camera_devices, camera_permission, camera_request_permission, LinuxCamera as Camera,
     };
 
     /// True where a capture cannot leave our own windows out (X11). The selector must then take its

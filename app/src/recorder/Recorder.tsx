@@ -6,7 +6,7 @@ type Phase = "ready" | "recording" | "paused" | "finishing";
 type Info = {
   phase: Phase | null;
   width: number; height: number;
-  cursor: boolean; system_audio: boolean; microphone: boolean; noise_filter: boolean; clicks: boolean; countdown: boolean;
+  cursor: boolean; system_audio: boolean; microphone: boolean; noise_filter: boolean; clicks: boolean; camera: boolean; countdown: boolean;
   mic_supported: boolean;
   shortcut: string;
   pause_shortcut: string;
@@ -117,6 +117,8 @@ export function Recorder() {
           <Toggle on={info.cursor} label="Cursor" onChange={(v) => toggle("cursor", v)} disabled={count !== null} />
           <Toggle on={info.clicks} label="Clicks" onChange={(v) => toggle("clicks", v)} disabled={count !== null}
                   title="Shows a ring in the video wherever you click" />
+          <Toggle on={info.camera} label="Camera" onChange={(v) => toggle("camera", v)} disabled={count !== null}
+                  title="Shows your camera in a bubble you can drag anywhere in the recording" />
           <Toggle on={info.system_audio} label="System audio" onChange={(v) => toggle("system_audio", v)} disabled={count !== null} />
           <Toggle on={info.microphone} label="Microphone" onChange={(v) => toggle("microphone", v)}
                   disabled={count !== null || !info.mic_supported}

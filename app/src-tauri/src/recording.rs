@@ -84,6 +84,8 @@ enum Phase { Ready, Recording, Paused, Finishing }
 struct Session {
     display: DisplayId,
     local: LogRect,
+    /// The same area on the global desktop (where the camera bubble is placed).
+    global: LogRect,
     /// Pixels the file will have (before the encoder's even-size rounding), for the bar's readout.
     px: (u32, u32),
     phase: Phase,
@@ -211,12 +213,16 @@ pub(crate) fn prepare(app: &tauri::AppHandle, state: &Arc<AppState>, rect: LogRe
     hide_overlays(app);
 
     *SESSION.lock().unwrap() = Some(Session {
-        display: target.display, local: target.local, px,
+        display: target.display, local: target.local, global: target.global, px,
         phase: Phase::Ready, recorder: None, file: None, two_tracks: false,
     });
     show_frame(app, target.display, Some(target.global));
     let at = place_bar(d.bounds, target.global, HUD_SIZE);
     open_hud(app, at.x, at.y).map_err(CommitError::Failed)?;
+    // The camera bubble, when it is on: shown now, so it can be placed before recording starts.
+    if state.settings.lock().unwrap().get().camera_enabled {
+        if let Err(e) = crate::camera_bubble::open(app, target.global) { eprintln!("[camera] {e}"); }
+    }
     println!("[record] ready: {}x{} pt at ({},{}) on display {} -> ~{}x{} px",
         target.global.size.w, target.global.size.h, target.global.min_x(), target.global.min_y(), target.display.0, px.0, px.1);
     Ok(HUD.to_string())
@@ -300,6 +306,7 @@ pub(crate) struct HudInfo {
     microphone: bool,
     noise_filter: bool,
     clicks: bool,
+    camera: bool,
     countdown: bool,
     mic_supported: bool,
     shortcut: String,
@@ -315,6 +322,7 @@ pub(crate) fn recorder_info(state: tauri::State<Arc<AppState>>) -> HudInfo {
         width: g.as_ref().map_or(0, |s| s.px.0), height: g.as_ref().map_or(0, |s| s.px.1),
         cursor: s.record_cursor, system_audio: s.record_system_audio,
         microphone: s.record_microphone && microphone_supported(), noise_filter: s.record_noise_filter, clicks: s.record_click_highlight,
+        camera: s.camera_enabled,
         countdown: s.record_countdown,
         mic_supported: microphone_supported(), shortcut: s.record_hotkey,
         pause_shortcut: s.pause_hotkey.clone(),
@@ -323,7 +331,7 @@ pub(crate) fn recorder_info(state: tauri::State<Arc<AppState>>) -> HudInfo {
 
 /// A toggle on the bar. Remembered, so the next recording starts the way this one was set up.
 #[tauri::command]
-pub(crate) fn recorder_option(state: tauri::State<Arc<AppState>>, name: String, value: bool) -> Result<(), String> {
+pub(crate) fn recorder_option(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, name: String, value: bool) -> Result<(), String> {
     if SESSION.lock().unwrap().as_ref().map_or(false, |s| s.phase != Phase::Ready) {
         return Err("Options can only change before recording starts.".into());
     }
@@ -339,9 +347,16 @@ pub(crate) fn recorder_option(state: tauri::State<Arc<AppState>>, name: String, 
         "countdown" => s.record_countdown = value,
         "noise_filter" => s.record_noise_filter = value,
         "clicks" => s.record_click_highlight = value,
+        "camera" => s.camera_enabled = value,
         _ => return Err(format!("unknown option {name}")),
     }
     st.set(s);
+    if name == "camera" {
+        let region = SESSION.lock().unwrap().as_ref().map(|s| s.global);
+        let a = app.clone();
+        // Off a sync command's main thread: opening the bubble waits on the main thread.
+        std::thread::spawn(move || if let Err(e) = crate::camera_bubble::set_enabled(&a, value, region) { eprintln!("[camera] {e}"); });
+    }
     // An unreadable settings file refuses saves (see SettingsStore); the option still applies to
     // this recording, it just is not remembered.
     if let Err(e) = st.save() { eprintln!("[record] option not saved: {e}"); }
@@ -376,10 +391,13 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
     // Click highlight: the overlay that already outlines the region draws the rings, and it is let
     // INTO the picture (the rest of the app stays out).
     let overlay = format!("{OVERLAY_PREFIX}{}", display.0);
-    let include_window = if opts.7 { overlay_window_id(app, &overlay) } else { None };
+    let click_window = if opts.7 { overlay_window_id(app, &overlay) } else { None };
+    // The camera bubble is let into the picture too (on Windows this also clears its exclusion).
+    let camera_window = if crate::camera_bubble::is_open(app) { overlay_window_id(app, crate::camera_bubble::CAMERA_WINDOW) } else { None };
+    let include_windows: Vec<u32> = click_window.into_iter().chain(camera_window).collect();
     let rec = Recorder::start(&RecordOptions {
         display, region: local, fps: opts.3, show_cursor: opts.0,
-        system_audio: opts.1, microphone: opts.2, noise_filter: opts.4, auto_level: opts.5, voice_clarity: opts.6, include_window, path: file.clone(),
+        system_audio: opts.1, microphone: opts.2, noise_filter: opts.4, auto_level: opts.5, voice_clarity: opts.6, include_windows, path: file.clone(),
     }).map_err(|e| match e {
         bhcapture_capture::CaptureError::PermissionDenied => PERMISSION_MESSAGE.to_string(),
         other => format!("Could not start recording: {other}"),
@@ -403,7 +421,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
     set_tray_label(app, true);
     let spec = pause_shortcut(app);
     let _ = app.run_on_main_thread(move || arm_pause_hotkey(Some(spec)));
-    if include_window.is_some() {
+    if click_window.is_some() {
         let (a, label) = (app.clone(), overlay.clone());
         let _ = app.run_on_main_thread(move || {
             // A stop that landed before this ran has already queued end_take: do not arm after it.
@@ -643,6 +661,7 @@ fn end_session(app: &tauri::AppHandle) {
     BAR_HIDDEN.store(false, Ordering::SeqCst);
     end_take(app);
     hide_hud(app);
+    crate::camera_bubble::close(app);
     if let Some(d) = display { show_frame(app, d, None); }
     set_tray_label(app, false);
 }

@@ -21,8 +21,10 @@ pub struct RecordOptions {
     pub auto_level: bool,
     /// Voice EQ on the microphone (see `bhcapture_core::voice_eq`).
     pub voice_clarity: bool,
-    /// An OS window id of ours to keep IN the picture (the click-highlight layer). `None` = all of ours stay out.
-    pub include_window: Option<u32>,
+    /// OS window ids of ours to keep IN the picture (click-highlight layer, camera bubble); empty =
+    /// all of ours stay out. macOS applies this in the capture filter; Windows per window
+    /// (`platform::set_window_in_captures`); X11 sees every window anyway.
+    pub include_windows: Vec<u32>,
     /// The `.mp4` to create. Must not already exist.
     pub path: PathBuf,
 }
