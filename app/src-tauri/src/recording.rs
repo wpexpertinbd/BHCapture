@@ -38,6 +38,36 @@ pub(crate) static VIDEO_MODE: AtomicBool = AtomicBool::new(false);
 /// The tray's record item, so it can read "Stop Recording" while one runs.
 pub(crate) static TRAY_RECORD_ITEM: Mutex<Option<MainThreadOnly<tauri::menu::MenuItem<tauri::Wry>>>> = Mutex::new(None);
 
+/// The tray's "Hide/Show Recording Bar" item, enabled only while recording.
+pub(crate) static TRAY_BAR_ITEM: Mutex<Option<MainThreadOnly<tauri::menu::MenuItem<tauri::Wry>>>> = Mutex::new(None);
+/// The tray's "Pause/Resume Recording" item, enabled only while recording.
+pub(crate) static TRAY_PAUSE_ITEM: Mutex<Option<MainThreadOnly<tauri::menu::MenuItem<tauri::Wry>>>> = Mutex::new(None);
+/// Pause/Resume shortcut. Registered ONLY while a recording runs, so ⌃⌘6 belongs to other apps the
+/// rest of the time. Not macOS's own (⇧⌘6 is; ⌃⌘6 is not) and no Option (blocked since macOS 15).
+pub(crate) const PAUSE_SHORTCUT: &str = "Ctrl+Cmd+6";
+pub(crate) static PAUSE_HOTKEY_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn pause_hotkey() -> global_hotkey::hotkey::HotKey {
+    use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+    HotKey::new(Some(Modifiers::CONTROL | Modifiers::SUPER), Code::Digit6)
+}
+
+/// Main thread only (the hotkey manager lives there).
+fn arm_pause_hotkey(on: bool) {
+    let hk = pause_hotkey();
+    if let Some(m) = crate::HOTKEY_MANAGER.lock().unwrap().as_ref() {
+        let r = if on { m.0.register(hk) } else { m.0.unregister(hk) };
+        match r {
+            Ok(()) => PAUSE_HOTKEY_ID.store(if on { hk.id() } else { 0 }, Ordering::SeqCst),
+            Err(e) => eprintln!("[record] pause shortcut {PAUSE_SHORTCUT} {}: {e}", if on { "unavailable" } else { "release failed" }),
+        }
+    }
+}
+
+/// The user hid the control bar. The recording goes on; the menu-bar icon shows a red dot and the
+/// time instead, and ⌃⌘5 or the tray still stops it.
+static BAR_HIDDEN: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Phase { Ready, Recording, Paused, Finishing }
@@ -79,11 +109,58 @@ pub(crate) fn recordings_dir() -> PathBuf {
 }
 
 fn set_tray_label(app: &tauri::AppHandle, recording: bool) {
+    let hidden = BAR_HIDDEN.load(Ordering::SeqCst);
+    let paused = SESSION.lock().unwrap().as_ref().map_or(false, |s| s.phase == Phase::Paused);
+    let a = app.clone();
     let _ = app.run_on_main_thread(move || {
         if let Some(it) = TRAY_RECORD_ITEM.lock().unwrap().as_ref() {
             let _ = it.0.set_text(if recording { "Stop Recording" } else { "Record Video" });
         }
+        if let Some(it) = TRAY_PAUSE_ITEM.lock().unwrap().as_ref() {
+            let _ = it.0.set_enabled(recording);
+            let _ = it.0.set_text(if paused { "Resume Recording" } else { "Pause Recording" });
+        }
+        if let Some(it) = TRAY_BAR_ITEM.lock().unwrap().as_ref() {
+            let _ = it.0.set_enabled(recording);
+            let _ = it.0.set_text(if hidden { "Show Recording Bar" } else { "Hide Recording Bar" });
+        }
+        if !recording {
+            if let Some(tray) = a.try_state::<tauri::tray::TrayIcon>() { let _ = tray.set_title(None::<&str>); }
+        }
     });
+}
+
+/// Next to the menu-bar icon while recording: "● 1:23" (or "❚❚ 1:23" when paused). With the bar
+/// hidden this is the only sign a recording is running, so it is always shown, not just when hidden.
+fn set_tray_time(app: &tauri::AppHandle, seconds: f64, paused: bool) {
+    let t = seconds.max(0.0) as u64;
+    let text = format!("{} {}:{:02}", if paused { "❚❚" } else { "●" }, t / 60, t % 60);
+    let a = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(tray) = a.try_state::<tauri::tray::TrayIcon>() { let _ = tray.set_title(Some(text.as_str())); }
+    });
+}
+
+/// Hide the control bar while recording (the Hide button).
+#[tauri::command]
+pub(crate) fn recorder_hide(app: tauri::AppHandle) {
+    set_bar_hidden(&app, true);
+}
+
+/// The tray item: hide the bar, or bring it back.
+pub(crate) fn toggle_bar(app: &tauri::AppHandle) {
+    let recording = SESSION.lock().unwrap().as_ref().map_or(false, |s| matches!(s.phase, Phase::Recording | Phase::Paused));
+    if !recording { return; }
+    set_bar_hidden(app, !BAR_HIDDEN.load(Ordering::SeqCst));
+}
+
+fn set_bar_hidden(app: &tauri::AppHandle, hide: bool) {
+    BAR_HIDDEN.store(hide, Ordering::SeqCst);
+    let a = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(w) = a.get_webview_window(HUD) { let _ = if hide { w.hide() } else { w.show() }; }
+    });
+    set_tray_label(app, true);
 }
 
 fn emit_state(app: &tauri::AppHandle) { let _ = app.emit_to(HUD, "recorder-state", ()); }
@@ -217,6 +294,7 @@ pub(crate) struct HudInfo {
     countdown: bool,
     mic_supported: bool,
     shortcut: String,
+    pause_shortcut: String,
 }
 
 #[tauri::command]
@@ -229,6 +307,7 @@ pub(crate) fn recorder_info(state: tauri::State<Arc<AppState>>) -> HudInfo {
         cursor: s.record_cursor, system_audio: s.record_system_audio,
         microphone: s.record_microphone && microphone_supported(), countdown: s.record_countdown,
         mic_supported: microphone_supported(), shortcut: s.record_hotkey,
+        pause_shortcut: bhcapture_core::hotkey::Chord::parse(PAUSE_SHORTCUT).map(|c| c.display()).unwrap_or_default(),
     }
 }
 
@@ -303,6 +382,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
     }
     println!("[record] started -> {} (system audio {}, microphone {})", file.display(), opts.1, opts.2);
     set_tray_label(app, true);
+    let _ = app.run_on_main_thread(|| arm_pause_hotkey(true));
     emit_state(app);
     spawn_status(app.clone());
     Ok(())
@@ -330,6 +410,7 @@ fn spawn_status(app: tauri::AppHandle) {
             let _ = stop(&app);
             return;
         }
+        set_tray_time(&app, st.seconds, st.state == RecordState::Paused);
         let _ = app.emit_to(HUD, "recorder-status", StatusPayload {
             seconds: st.seconds, level_system: st.level_system, level_mic: st.level_mic,
             paused: st.state == RecordState::Paused,
@@ -338,14 +419,27 @@ fn spawn_status(app: tauri::AppHandle) {
 }
 
 #[tauri::command]
-pub(crate) fn recorder_pause(app: tauri::AppHandle, paused: bool) -> Result<(), String> {
+pub(crate) fn recorder_pause(app: tauri::AppHandle, paused: bool) -> Result<(), String> { set_paused(&app, paused) }
+
+/// ⌃⌘6 and the tray's Pause/Resume item: flip whichever state it is in.
+pub(crate) fn toggle_pause(app: &tauri::AppHandle) {
+    let phase = SESSION.lock().unwrap().as_ref().map(|s| s.phase);
+    match phase {
+        Some(Phase::Recording) => { let _ = set_paused(app, true); }
+        Some(Phase::Paused) => { let _ = set_paused(app, false); }
+        _ => {}
+    }
+}
+
+fn set_paused(app: &tauri::AppHandle, paused: bool) -> Result<(), String> {
     let mut g = SESSION.lock().unwrap();
     let s = g.as_mut().ok_or("Not recording.")?;
     if !matches!(s.phase, Phase::Recording | Phase::Paused) { return Err("Not recording.".into()); }
     if let Some(r) = &s.recorder { r.set_paused(paused); }
     s.phase = if paused { Phase::Paused } else { Phase::Recording };
     drop(g);
-    emit_state(&app);
+    emit_state(app);
+    set_tray_label(app, true);
     Ok(())
 }
 
@@ -435,6 +529,8 @@ pub(crate) async fn recorder_cancel(app: tauri::AppHandle) -> Result<(), String>
 
 fn end_session(app: &tauri::AppHandle) {
     let display = SESSION.lock().unwrap().take().map(|s| s.display);
+    BAR_HIDDEN.store(false, Ordering::SeqCst);
+    if PAUSE_HOTKEY_ID.load(Ordering::SeqCst) != 0 { let _ = app.run_on_main_thread(|| arm_pause_hotkey(false)); }
     hide_hud(app);
     if let Some(d) = display { show_frame(app, d, None); }
     set_tray_label(app, false);

@@ -1289,7 +1289,7 @@ fn main() {
             settings_get, settings_save, settings_pick_dir, open_settings,
             editor_info, editor_pixels, editor_save, editor_copy, editor_close, editor_format_changed,
             recording::recorder_info, recording::recorder_option, recording::recorder_start,
-            recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel,
+            recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel, recording::recorder_hide,
             recording::video_info, recording::video_save, recording::video_close
         ])
         .setup(move |app| {
@@ -1314,11 +1314,16 @@ fn main() {
             // overlay that hides itself.
             let cap_i = MenuItem::with_id(app, "capture", "Capture Region", true, None::<&str>)?;
             let rec_i = MenuItem::with_id(app, "record", "Record Video", true, None::<&str>)?;
+            // Only meaningful while recording; brings back (or hides) the control bar.
+            let pause_i = MenuItem::with_id(app, "pause", "Pause Recording", false, Some(recording::PAUSE_SHORTCUT))?;
+            let bar_i = MenuItem::with_id(app, "toggle-bar", "Hide Recording Bar", false, None::<&str>)?;
             let set_i = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit BHCapture", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&cap_i, &rec_i, &PredefinedMenuItem::separator(app)?, &set_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&cap_i, &rec_i, &pause_i, &bar_i, &PredefinedMenuItem::separator(app)?, &set_i, &quit_i])?;
             *TRAY_CAPTURE_ITEM.lock().unwrap() = Some(MainThreadOnly(cap_i.clone()));
             *recording::TRAY_RECORD_ITEM.lock().unwrap() = Some(MainThreadOnly(rec_i.clone()));
+            *recording::TRAY_BAR_ITEM.lock().unwrap() = Some(MainThreadOnly(bar_i.clone()));
+            *recording::TRAY_PAUSE_ITEM.lock().unwrap() = Some(MainThreadOnly(pause_i.clone()));
             let tray_img = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
             let tray = TrayIconBuilder::new()
                 .icon(tray_img)
@@ -1330,6 +1335,8 @@ fn main() {
                 .on_menu_event(move |app, ev| match ev.id().as_ref() {
                     "capture" => open_selector(app, false),
                     "record" => recording::record_shortcut(app),
+                    "toggle-bar" => recording::toggle_bar(app),
+                    "pause" => recording::toggle_pause(app),
                     "settings" => { let _ = open_settings(app.clone()); }
                     "quit" => app.exit(0),
                     _ => {}
@@ -1378,6 +1385,9 @@ fn main() {
                     } else if ev.id == RECORD_SLOT.id.load(Ordering::SeqCst) {
                         println!("[hotkey] record pressed");
                         recording::record_shortcut(&h);
+                    } else if ev.id != 0 && ev.id == recording::PAUSE_HOTKEY_ID.load(Ordering::SeqCst) {
+                        println!("[hotkey] pause pressed");
+                        recording::toggle_pause(&h);
                     } else if let Some((_, key)) = selector_keys().iter().find(|(k, _)| k.id() == ev.id) {
                         handle_selector_key(&h, *key);
                     }

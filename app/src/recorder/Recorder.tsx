@@ -9,6 +9,7 @@ type Info = {
   cursor: boolean; system_audio: boolean; microphone: boolean; countdown: boolean;
   mic_supported: boolean;
   shortcut: string;
+  pause_shortcut: string;
 };
 type Status = { seconds: number; level_system: number; level_mic: number; paused: boolean };
 
@@ -130,7 +131,7 @@ export function Recorder() {
           <span className="rc-square" /> Stop
         </button>
         <button className="rc-btn" onClick={() => void invoke("recorder_pause", { paused: !paused })}
-                disabled={info.phase === "finishing"}>
+                disabled={info.phase === "finishing"} title={`${paused ? "Resume" : "Pause"} (${info.pause_shortcut})`}>
           {paused ? "▶ Resume" : "❚❚ Pause"}
         </button>
         <span className={`rc-time${paused ? " paused" : ""}`}>
@@ -138,7 +139,10 @@ export function Recorder() {
         </span>
         <span className="rc-chan" title="System audio">🔊 <Meter level={status.level_system} off={!info.system_audio} /></span>
         <span className="rc-chan" title="Microphone">🎙 <Meter level={status.level_mic} off={!info.microphone} /></span>
-        <span className="rc-size">{info.width} × {info.height}</span>
+        <button className="rc-btn" onClick={() => void invoke("recorder_hide")} disabled={info.phase === "finishing"}
+                title={`Hide this bar. Stop with ${info.shortcut} or from the BHCapture menu-bar icon, which also brings the bar back.`}>
+          Hide
+        </button>
         <button className="rc-x" title="Discard this recording" onClick={() => void invoke("recorder_cancel")}
                 disabled={info.phase === "finishing"}>✕</button>
       </div>
