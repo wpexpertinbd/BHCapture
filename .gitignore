@@ -8,3 +8,7 @@ build.noindex/
 *.cer
 .voice-test/
 .win-test/
+# Internal working notes stay on this Mac, like every BH repo (never published).
+CLAUDE.md
+docs/PLAN.md
+docs/PHASE*.md
