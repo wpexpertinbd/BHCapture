@@ -17,7 +17,7 @@ use bhcapture_core::image::Frame;
 use bhcapture_core::naming::{Fields, Pattern, Stamp, unique_path};
 use bhcapture_core::settings::{LoadOutcome, Settings, SettingsStore};
 use bhcapture_core::snap::{snap_window, Candidate};
-use bhcapture_core::hotkey::{Chord, Key, DEFAULT_RECORD_HOTKEY, DEFAULT_REGION_HOTKEY};
+use bhcapture_core::hotkey::{Chord, Key};
 use bhcapture_core::export::{self, ImageFormat, ALL_FORMATS};
 use base64::Engine;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -186,42 +186,25 @@ fn settings_save(state: tauri::State<Arc<AppState>>, next: Settings) -> Result<S
     // The shortcut takes effect NOW (sync commands run on the main thread, where the hotkey API
     // lives). If the OS will not give us the new chord, keep the old one and say so, rather than
     // saving a setting that does nothing.
-    let wanted = state.settings.lock().unwrap().get().region_hotkey.clone();
-    let mut hotkey_changed = false;
-    if wanted != previous.region_hotkey {
-        match set_region_hotkey(&wanted) {
-            Ok(_) => hotkey_changed = true,
-            Err(e) => {
-                notes.push(format!("{e}. Kept {}.", previous.region_hotkey));
-                let mut st = state.settings.lock().unwrap();
-                let mut s = st.get().clone();
-                s.region_hotkey = previous.region_hotkey.clone();
-                st.set(s);
-            }
+    // Shortcuts take effect NOW (sync commands run on the main thread, where the hotkey API lives).
+    // Any the OS refuses go back to their previous value, and the note says so.
+    let next = state.settings.lock().unwrap().get().clone();
+    let kept = apply_hotkeys(&next, Some(&previous));
+    if !kept.is_empty() {
+        let mut st = state.settings.lock().unwrap();
+        let mut s = st.get().clone();
+        for (slot, why) in &kept {
+            notes.push(format!("{why}. Kept {}.", slot.read(&previous)));
+            slot.write(&mut s, slot.read(&previous).to_string());
         }
-    }
-
-    let wanted = state.settings.lock().unwrap().get().record_hotkey.clone();
-    let mut record_changed = false;
-    if wanted != previous.record_hotkey {
-        match set_record_hotkey(&wanted) {
-            Ok(_) => record_changed = true,
-            Err(e) => {
-                notes.push(format!("{e}. Kept {}.", previous.record_hotkey));
-                let mut st = state.settings.lock().unwrap();
-                let mut s = st.get().clone();
-                s.record_hotkey = previous.record_hotkey.clone();
-                st.set(s);
-            }
-        }
+        st.set(s);
     }
 
     // Report a refused save honestly, and roll back everything applied above, so what is running
     // always matches what is on disk.
     if let Err(e) = state.settings.lock().unwrap().save() {
         state.settings.lock().unwrap().set(previous.clone());
-        if hotkey_changed { let _ = set_region_hotkey(&previous.region_hotkey); }
-        if record_changed { let _ = set_record_hotkey(&previous.record_hotkey); }
+        let _ = apply_hotkeys(&previous, None);
         return Err(e.to_string());
     }
     apply_settings(&state);
@@ -304,9 +287,39 @@ fn release_frozen(state: &AppState) {
 
 /// The one way the selector opens, so the hotkey, the tray and the tests behave identically.
 /// `video` picks what Enter does: open the capture in the editor, or set up a recording.
-fn open_selector(app: &tauri::AppHandle, video: bool) {
+fn open_selector(app: &tauri::AppHandle, video: bool) { open_selector_as(app, video, false) }
+
+/// All-in-One: the selector with an Image ⇄ Video switch, starting in the user's default mode.
+fn open_all_in_one(app: &tauri::AppHandle) {
+    let video = app.state::<Arc<AppState>>().settings.lock().unwrap().get().capture_default_mode
+        == bhcapture_core::settings::CaptureMode::Video;
+    open_selector_as(app, video, true);
+}
+
+/// Whether this selector session offers the Image ⇄ Video switch (All-in-One).
+static SWITCHABLE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Serialize, Clone)]
+struct SelectorMode { mode: &'static str, switchable: bool }
+
+fn emit_selector_mode(app: &tauri::AppHandle) {
+    let video = recording::VIDEO_MODE.load(Ordering::SeqCst);
+    let _ = app.emit("selector-mode", SelectorMode { mode: if video { "video" } else { "image" },
+                                                     switchable: SWITCHABLE.load(Ordering::SeqCst) });
+}
+
+/// The All-in-One switch (a click on it, or Tab). Ignored outside All-in-One.
+#[tauri::command]
+fn selector_set_mode(app: tauri::AppHandle, video: bool) {
+    if !SWITCHABLE.load(Ordering::SeqCst) { return; }
     recording::VIDEO_MODE.store(video, Ordering::SeqCst);
-    let _ = app.emit("selector-mode", if video { "video" } else { "image" });
+    emit_selector_mode(&app);
+}
+
+fn open_selector_as(app: &tauri::AppHandle, video: bool, switchable: bool) {
+    recording::VIDEO_MODE.store(video, Ordering::SeqCst);
+    SWITCHABLE.store(switchable, Ordering::SeqCst);
+    emit_selector_mode(app);
     let state = app.state::<Arc<AppState>>().inner().clone();
     *state.drag.lock().unwrap() = None;
     release_frozen(&state);
@@ -916,7 +929,7 @@ fn relaunch_app(app: tauri::AppHandle) {
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
-enum SelectorKey { Cancel, Save { dialog: bool }, Nudge(f64, f64), FullScreen }
+enum SelectorKey { Cancel, Save { dialog: bool }, Nudge(f64, f64), FullScreen, ToggleMode }
 
 /// `GlobalHotKeyManager` holds Carbon handles that must only be touched on the main thread. It is
 /// created there and only ever used inside `run_on_main_thread` closures, which makes this wrapper's
@@ -935,6 +948,8 @@ fn selector_keys() -> &'static [(HotKey, SelectorKey)] {
         v.push((HotKey::new(None, Code::Escape), SelectorKey::Cancel));
         // F = full screen. Plain F is only taken while the selector is open, like Esc and Enter.
         v.push((HotKey::new(None, Code::KeyF), SelectorKey::FullScreen));
+        // Tab flips Image ⇄ Video in All-in-One (does nothing in the single-purpose selectors).
+        v.push((HotKey::new(None, Code::Tab), SelectorKey::ToggleMode));
         for code in [Code::Enter, Code::NumpadEnter] {
             v.push((HotKey::new(None, code), SelectorKey::Save { dialog: false }));
             v.push((HotKey::new(Some(Modifiers::SHIFT), code), SelectorKey::Save { dialog: true }));
@@ -983,6 +998,13 @@ fn handle_selector_key(app: &tauri::AppHandle, key: SelectorKey) {
         SelectorKey::Save { dialog } => run_commit(app, dialog),
         SelectorKey::Nudge(dx, dy) => nudge(app, &st, dx, dy),
         SelectorKey::FullScreen => select_full_display(app, None),
+        SelectorKey::ToggleMode => {
+            if SWITCHABLE.load(Ordering::SeqCst) {
+                let v = !recording::VIDEO_MODE.load(Ordering::SeqCst);
+                recording::VIDEO_MODE.store(v, Ordering::SeqCst);
+                emit_selector_mode(app);
+            }
+        }
     }
 }
 
@@ -1000,8 +1022,69 @@ struct HotkeySlot {
 }
 /// The tray's "Capture Region" item, so its shortcut label follows the setting.
 static TRAY_CAPTURE_ITEM: Mutex<Option<MainThreadOnly<MenuItem<tauri::Wry>>>> = Mutex::new(None);
-static REGION_SLOT: HotkeySlot = HotkeySlot { id: AtomicU32::new(0), key: Mutex::new(None), tray: &TRAY_CAPTURE_ITEM, what: "capture" };
+/// The tray's "All-in-One Capture" item.
+static TRAY_ALLINONE_ITEM: Mutex<Option<MainThreadOnly<MenuItem<tauri::Wry>>>> = Mutex::new(None);
+static CAPTURE_SLOT: HotkeySlot = HotkeySlot { id: AtomicU32::new(0), key: Mutex::new(None), tray: &TRAY_ALLINONE_ITEM, what: "All-in-One" };
+static REGION_SLOT: HotkeySlot = HotkeySlot { id: AtomicU32::new(0), key: Mutex::new(None), tray: &TRAY_CAPTURE_ITEM, what: "screenshot" };
 static RECORD_SLOT: HotkeySlot = HotkeySlot { id: AtomicU32::new(0), key: Mutex::new(None), tray: &recording::TRAY_RECORD_ITEM, what: "record" };
+/// The always-registered shortcuts (pause is registered only while recording).
+static SLOTS: [&HotkeySlot; 3] = [&CAPTURE_SLOT, &REGION_SLOT, &RECORD_SLOT];
+
+impl HotkeySlot {
+    fn read<'s>(&self, s: &'s Settings) -> &'s str {
+        match self.what { "All-in-One" => &s.capture_hotkey, "screenshot" => &s.region_hotkey, _ => &s.record_hotkey }
+    }
+    fn write(&self, s: &mut Settings, v: String) {
+        match self.what { "All-in-One" => s.capture_hotkey = v, "screenshot" => s.region_hotkey = v, _ => s.record_hotkey = v }
+    }
+    /// Release this slot's chord, if any. Main thread.
+    fn release(&self) {
+        let mut cur = self.key.lock().unwrap();
+        if let (Some(k), Some(m)) = (cur.take(), HOTKEY_MANAGER.lock().unwrap().as_ref()) { let _ = m.0.unregister(k); }
+        self.id.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Register every always-on shortcut from `next`. All are released FIRST, so swapping two shortcuts
+/// in one save works (registering one's new chord would otherwise fail while the other still holds
+/// it). A chord the OS refuses falls back to its value in `fallback`, if given. Returns the slots that
+/// could not take their new chord, with the reason. Main thread.
+fn apply_hotkeys(next: &Settings, fallback: Option<&Settings>) -> Vec<(&'static HotkeySlot, String)> {
+    for slot in SLOTS { slot.release(); }
+    let mut kept = Vec::new();
+    for slot in SLOTS {
+        if let Err(e) = set_slot_hotkey(slot, slot.read(next)) {
+            if let Some(prev) = fallback {
+                if set_slot_hotkey(slot, slot.read(prev)).is_err() { eprintln!("[hotkey] {} has no working shortcut", slot.what); }
+            }
+            kept.push((slot, e));
+        }
+    }
+    kept
+}
+
+/// Is this a shortcut BHCapture can use? Returns its canonical spelling, or why not. The Settings
+/// shortcut boxes call it as soon as keys are pressed, before anything is saved.
+#[tauri::command]
+fn hotkey_check(spec: String) -> Result<String, String> {
+    Chord::parse(&spec).map(|c| c.display()).map_err(|e| e.to_string())
+}
+
+/// Switch BHCapture's global shortcuts off while a Settings shortcut box is listening (otherwise
+/// pressing the current capture shortcut to change it would open the selector), and back on.
+/// Sync command: runs on the main thread, where the hotkey API lives.
+#[tauri::command]
+fn hotkeys_suspend(suspended: bool) {
+    static SUSPENDED: AtomicBool = AtomicBool::new(false);
+    if SUSPENDED.swap(suspended, Ordering::SeqCst) == suspended { return; }
+    let guard = HOTKEY_MANAGER.lock().unwrap();
+    let Some(m) = guard.as_ref() else { return };
+    for slot in SLOTS {
+        if let Some(k) = *slot.key.lock().unwrap() {
+            let _ = if suspended { m.0.unregister(k) } else { m.0.register(k) };
+        }
+    }
+}
 
 fn to_platform_hotkey(c: &Chord) -> HotKey {
     let mut m = Modifiers::empty();
@@ -1013,7 +1096,10 @@ fn to_platform_hotkey(c: &Chord) -> HotKey {
         Key::Digit(d) => [Code::Digit0, Code::Digit1, Code::Digit2, Code::Digit3, Code::Digit4,
                           Code::Digit5, Code::Digit6, Code::Digit7, Code::Digit8, Code::Digit9][d as usize],
         Key::F(n) => [Code::F1, Code::F2, Code::F3, Code::F4, Code::F5, Code::F6,
-                      Code::F7, Code::F8, Code::F9, Code::F10, Code::F11, Code::F12][(n - 1) as usize],
+                      Code::F7, Code::F8, Code::F9, Code::F10, Code::F11, Code::F12,
+                      Code::F13, Code::F14, Code::F15, Code::F16, Code::F17, Code::F18,
+                      Code::F19][(n.clamp(1, 19) - 1) as usize],
+        Key::PrintScreen => Code::PrintScreen,
         Key::Letter(ch) => [Code::KeyA, Code::KeyB, Code::KeyC, Code::KeyD, Code::KeyE, Code::KeyF,
                             Code::KeyG, Code::KeyH, Code::KeyI, Code::KeyJ, Code::KeyK, Code::KeyL,
                             Code::KeyM, Code::KeyN, Code::KeyO, Code::KeyP, Code::KeyQ, Code::KeyR,
@@ -1027,8 +1113,6 @@ fn to_platform_hotkey(c: &Chord) -> HotKey {
 ///
 /// Registers the new chord before releasing the old one, so a chord another app already holds
 /// leaves the user with their previous, working shortcut rather than with none.
-fn set_region_hotkey(spec: &str) -> Result<String, String> { set_slot_hotkey(&REGION_SLOT, spec) }
-fn set_record_hotkey(spec: &str) -> Result<String, String> { set_slot_hotkey(&RECORD_SLOT, spec) }
 
 fn set_slot_hotkey(slot: &HotkeySlot, spec: &str) -> Result<String, String> {
     let chord = Chord::parse(spec).map_err(|e| e.to_string())?;
@@ -1037,8 +1121,15 @@ fn set_slot_hotkey(slot: &HotkeySlot, spec: &str) -> Result<String, String> {
     let m = guard.as_ref().ok_or("hotkey manager not ready")?;
     let mut current = slot.key.lock().unwrap();
     if current.map(|c| c.id()) == Some(hk.id()) { return Ok(chord.display()); }
-    m.0.register(hk).map_err(|e| format!(
-        "{} could not be registered (another app may already use it): {e}", chord.display()))?;
+    m.0.register(hk).map_err(|e| {
+        if cfg!(windows) && chord.key == Key::PrintScreen {
+            // Windows 11 gives Print Screen to its own Snipping Tool by default.
+            format!("Windows is keeping Print Screen for itself. To use it for BHCapture, turn off \
+                     Settings › Accessibility › Keyboard › \"Use the Print screen key to open screen capture\" ({e})")
+        } else {
+            format!("{} could not be registered (another app may already use it): {e}", chord.display())
+        }
+    })?;
     if let Some(old) = current.take() { let _ = m.0.unregister(old); }
     *current = Some(hk);
     slot.id.store(hk.id(), Ordering::SeqCst);
@@ -1340,7 +1431,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             overlay_info, selection_begin, selection_update,
             selection_nudge, selection_cancel, selection_commit,
-            snap_at, loupe, selection_set_rect, selection_fullscreen, open_privacy_settings, relaunch_app, report_overlay_focus,
+            snap_at, loupe, selection_set_rect, selection_fullscreen, selector_set_mode, hotkey_check, hotkeys_suspend, open_privacy_settings, relaunch_app, report_overlay_focus,
             settings_get, settings_save, settings_pick_dir, open_settings,
             editor_info, editor_pixels, editor_save, editor_copy, editor_close, editor_format_changed,
             recording::recorder_info, recording::recorder_option, recording::recorder_start,
@@ -1371,15 +1462,18 @@ fn main() {
 
             // Tray: without it there is no way to reach settings, since every window is an
             // overlay that hides itself.
-            let cap_i = MenuItem::with_id(app, "capture", "Capture Region", true, None::<&str>)?;
+            let all_i = MenuItem::with_id(app, "all-in-one", "All-in-One Capture", true, None::<&str>)?;
+            let cap_i = MenuItem::with_id(app, "capture", "Screenshot", true, None::<&str>)?;
             let rec_i = MenuItem::with_id(app, "record", "Record Video", true, None::<&str>)?;
             // Only meaningful while recording; brings back (or hides) the control bar.
-            let pause_i = MenuItem::with_id(app, "pause", "Pause Recording", false, Some(recording::PAUSE_SHORTCUT))?;
+            let pause_key = state.settings.lock().unwrap().get().pause_hotkey.clone();
+            let pause_i = MenuItem::with_id(app, "pause", "Pause Recording", false, Some(pause_key.as_str()))?;
             let bar_i = MenuItem::with_id(app, "toggle-bar", "Hide Recording Bar", false, None::<&str>)?;
             let set_i = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit BHCapture", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&cap_i, &rec_i, &pause_i, &bar_i, &PredefinedMenuItem::separator(app)?, &set_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&all_i, &cap_i, &rec_i, &pause_i, &bar_i, &PredefinedMenuItem::separator(app)?, &set_i, &quit_i])?;
             *TRAY_CAPTURE_ITEM.lock().unwrap() = Some(MainThreadOnly(cap_i.clone()));
+            *TRAY_ALLINONE_ITEM.lock().unwrap() = Some(MainThreadOnly(all_i.clone()));
             *recording::TRAY_RECORD_ITEM.lock().unwrap() = Some(MainThreadOnly(rec_i.clone()));
             *recording::TRAY_BAR_ITEM.lock().unwrap() = Some(MainThreadOnly(bar_i.clone()));
             *recording::TRAY_PAUSE_ITEM.lock().unwrap() = Some(MainThreadOnly(pause_i.clone()));
@@ -1392,6 +1486,7 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(move |app, ev| match ev.id().as_ref() {
+                    "all-in-one" => { if !recording::busy() { open_all_in_one(app); } }
                     "capture" => open_selector(app, false),
                     "record" => recording::record_shortcut(app),
                     "toggle-bar" => recording::toggle_bar(app),
@@ -1407,19 +1502,11 @@ fn main() {
             // Kept (not leaked) so shortcuts can be changed and the selector's keys armed later,
             // always from the main thread; dropping it would unregister everything.
             *HOTKEY_MANAGER.lock().unwrap() = Some(MainThreadOnly(GlobalHotKeyManager::new()?));
-            let wanted = state.settings.lock().unwrap().get().region_hotkey.clone();
-            if let Err(e) = set_region_hotkey(&wanted) {
-                eprintln!("[hotkey] {e}; falling back to {DEFAULT_REGION_HOTKEY}");
-                if let Err(e2) = set_region_hotkey(DEFAULT_REGION_HOTKEY) {
-                    eprintln!("[hotkey] the default could not be registered either: {e2}");
-                }
-            }
-            let wanted = state.settings.lock().unwrap().get().record_hotkey.clone();
-            if let Err(e) = set_record_hotkey(&wanted) {
-                eprintln!("[hotkey] {e}; falling back to {DEFAULT_RECORD_HOTKEY}");
-                if let Err(e2) = set_record_hotkey(DEFAULT_RECORD_HOTKEY) {
-                    eprintln!("[hotkey] the default record shortcut could not be registered either: {e2}");
-                }
+            // Every shortcut from settings; one the OS refuses falls back to its default, and failing
+            // that is reported (the tray still works without it).
+            let wanted = state.settings.lock().unwrap().get().clone();
+            for (slot, why) in apply_hotkeys(&wanted, Some(&Settings::default())) {
+                eprintln!("[hotkey] {} shortcut: {why}", slot.what);
             }
             // Recordings play from the private working folder, and ONLY that folder is exposed to
             // the web views' asset protocol (not $HOME, not the save folder).
@@ -1436,7 +1523,10 @@ fn main() {
                 let rx = GlobalHotKeyEvent::receiver();
                 while let Ok(ev) = rx.recv() {
                     if ev.state != global_hotkey::HotKeyState::Pressed { continue; }
-                    if ev.id == REGION_SLOT.id.load(Ordering::SeqCst) {
+                    if ev.id == CAPTURE_SLOT.id.load(Ordering::SeqCst) {
+                        println!("[hotkey] All-in-One pressed");
+                        if !recording::busy() { open_all_in_one(&h); }
+                    } else if ev.id == REGION_SLOT.id.load(Ordering::SeqCst) {
                         println!("[hotkey] pressed");
                         // While a recording is set up or running, the capture shortcut must not open
                         // a second selector over it.

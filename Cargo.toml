@@ -22,6 +22,12 @@ strip = true
 # panic stays "unwind": a panic inside one command must not abort the app and lose captures that
 # are open but not saved.
 
+# Proc-macros and build scripts are built with this profile. Stripping them removes the symbols
+# rustc needs to LOAD a proc-macro, and every one then fails with "can't find crate for
+# `serde_derive`" (seen with Homebrew's cargo 1.97 on macOS).
+[profile.release.build-override]
+strip = false
+
 # Real-time and heavy-number crates keep full speed: the noise filter must keep up with live audio,
 # and GIF/image encoding is the slowest step the user waits for.
 [profile.release.package.nnnoiseless]

@@ -43,6 +43,8 @@ export function Overlay() {
   const [notice, setNotice] = useState<Notice | null>(null);
   // What Enter starts: an image for the editor, or a recording.
   const [mode, setMode] = useState<"image" | "video">("image");
+  // All-in-One: the user can flip between the two before pressing Enter.
+  const [switchable, setSwitchable] = useState(false);
   // While recording, this overlay only outlines the region (the mouse passes through it).
   const [frame, setFrame] = useState<Rect | null>(null);
   // Click rings while recording (global points), each removed when its animation ends.
@@ -82,7 +84,9 @@ export function Overlay() {
   }, []);
 
   useEffect(() => {
-    const a = listen<"image" | "video">("selector-mode", (e) => { setMode(e.payload); setFrame(null); });
+    const a = listen<{ mode: "image" | "video"; switchable: boolean }>("selector-mode", (e) => {
+      setMode(e.payload.mode); setSwitchable(e.payload.switchable); setFrame(null);
+    });
     const b = listen<Rect | null>("record-frame", (e) => { setFrame(e.payload); setRings([]); });
     const c = listen<[number, number, boolean]>("record-click", (e) => {
       const [x, y, right] = e.payload;
@@ -304,6 +308,16 @@ export function Overlay() {
               <button className="primary" onClick={() => void invoke("relaunch_app")}>Relaunch BHCapture</button>
             </div>
           )}
+        </div>
+      )}
+
+      {/* All-in-One: Image ⇄ Video, chosen before Enter. Tab flips it. */}
+      {switchable && (
+        <div className="mode-switch" style={{ bottom: 116 }}
+             onMouseDown={(e) => e.stopPropagation()} onMouseUp={(e) => e.stopPropagation()}>
+          <button className={mode === "image" ? "on" : ""} onClick={() => void invoke("selector_set_mode", { video: false })}>📷 Image</button>
+          <button className={mode === "video" ? "on" : ""} onClick={() => void invoke("selector_set_mode", { video: true })}>🎬 Video</button>
+          <span className="mode-key"><kbd>Tab</kbd></span>
         </div>
       )}
 

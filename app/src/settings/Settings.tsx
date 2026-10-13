@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ShortcutField } from "./ShortcutField";
 
 type Theme = "system" | "light" | "dark";
 
@@ -11,6 +12,9 @@ type SettingsData = {
   include_cursor: boolean;
   region_hotkey: string;
   record_hotkey: string;
+  capture_hotkey: string;
+  pause_hotkey: string;
+  capture_default_mode: "image" | "video";
   record_cursor: boolean;
   record_system_audio: boolean;
   record_microphone: boolean;
@@ -181,24 +185,31 @@ export function Settings() {
       </div>
 
       <div className="row">
-        <label className="title" htmlFor="hk">Region capture shortcut</label>
-        <input id="hk" type="text" value={draft.region_hotkey}
-               onChange={(e) => set("region_hotkey", e.target.value)} />
+        <div className="title">Shortcuts</div>
+        <div className="help">Click a box and press the keys you want. Shortcuts the system already uses are refused, with the reason.</div>
+        <div className="shortcuts">
+          <label htmlFor="hk-all">All-in-One</label>
+          <ShortcutField id="hk-all" value={draft.capture_hotkey} onChange={(v) => set("capture_hotkey", v)} />
+          <label htmlFor="hk-img">Screenshot</label>
+          <ShortcutField id="hk-img" value={draft.region_hotkey} onChange={(v) => set("region_hotkey", v)} />
+          <label htmlFor="hk-rec">Record video</label>
+          <ShortcutField id="hk-rec" value={draft.record_hotkey} onChange={(v) => set("record_hotkey", v)} />
+          <label htmlFor="hk-pause">Pause / Resume</label>
+          <ShortcutField id="hk-pause" value={draft.pause_hotkey} onChange={(v) => set("pause_hotkey", v)} />
+        </div>
         <div className="help">
-          Takes effect as soon as you save. Shortcuts macOS already uses (like <code>⇧⌘4</code>
-          or <code>⌃⇧⌘4</code>) are refused because both would fire, and so is anything with
-          Option, which macOS silently blocks. Type it as <code>Ctrl+Cmd+4</code> or <code>⌃⌘4</code>.
+          <b>All-in-One</b> opens the selector with an Image / Video switch (Tab flips it). <b>Record video</b>
+          pressed again starts the recording, and once more stops it. <b>Pause / Resume</b> works only while recording.
         </div>
       </div>
 
       <div className="row">
-        <label className="title" htmlFor="rhk">Record video shortcut</label>
-        <input id="rhk" type="text" value={draft.record_hotkey}
-               onChange={(e) => set("record_hotkey", e.target.value)} />
-        <div className="help">
-          Opens the selector for a recording. Pressed again it starts the recording, and once more it
-          stops it. Same rules as above; it must differ from the capture shortcut.
-        </div>
+        <label className="title" htmlFor="aio">All-in-One starts in</label>
+        <select id="aio" value={draft.capture_default_mode}
+                onChange={(e) => set("capture_default_mode", e.target.value as "image" | "video")}>
+          <option value="image">Screenshot</option>
+          <option value="video">Video recording</option>
+        </select>
       </div>
 
       <div className="row">

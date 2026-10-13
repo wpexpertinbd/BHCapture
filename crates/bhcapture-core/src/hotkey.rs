@@ -13,7 +13,9 @@
 pub enum Key {
     Letter(char),   // 'A'..='Z'
     Digit(u8),      // 0..=9
-    F(u8),          // 1..=12
+    F(u8),          // 1..=19 (F13+ is what a PC keyboard's Print Screen sends to a Mac)
+    /// Print Screen: the natural single-key capture on Windows/Linux keyboards.
+    PrintScreen,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +53,12 @@ pub const DEFAULT_REGION_HOTKEY: &str = "Ctrl+Shift+4";
 pub const DEFAULT_RECORD_HOTKEY: &str = "Ctrl+Cmd+5";
 #[cfg(not(target_os = "macos"))]
 pub const DEFAULT_RECORD_HOTKEY: &str = "Ctrl+Shift+5";
+/// All-in-One: the selector with an Image ⇄ Video switch (decision 27). Print Screen on its own on
+/// Windows/Linux; macOS keyboards have no such key, and ⌃⌘3 is free there (⇧⌘3 / ⌃⇧⌘3 are the system's).
+#[cfg(target_os = "macos")]
+pub const DEFAULT_CAPTURE_HOTKEY: &str = "Ctrl+Cmd+3";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_CAPTURE_HOTKEY: &str = "PrintScreen";
 /// Pause/resume while recording (registered only then).
 #[cfg(target_os = "macos")]
 pub const PAUSE_HOTKEY: &str = "Ctrl+Cmd+6";
@@ -117,9 +125,9 @@ impl Chord {
             }
         }
         let key = key.ok_or(HotkeyError::NoKey)?;
-        // Shift alone is not enough; function keys are a deliberate exception (F5 on its own is
-        // not ordinary typing). Option does not count: it is refused below.
-        if !(cmd || ctrl || alt) && !matches!(key, Key::F(_)) {
+        // Shift alone is not enough; function keys and Print Screen are deliberate exceptions (on
+        // their own they are not ordinary typing). Option does not count on macOS: refused below.
+        if !(cmd || ctrl || alt) && !matches!(key, Key::F(_) | Key::PrintScreen) {
             return Err(HotkeyError::NeedsModifier);
         }
         // Option is only blocked on macOS; on Windows/Linux Alt is an ordinary modifier.
@@ -159,6 +167,7 @@ impl Chord {
             Key::Letter(c) => c.to_string(),
             Key::Digit(d) => d.to_string(),
             Key::F(n) => format!("F{n}"),
+            Key::PrintScreen => "PrintScreen".into(),
         });
         v.join("+")
     }
@@ -191,8 +200,9 @@ fn parse_key(s: &str) -> Option<Key> {
         if c.is_ascii_digit() { return Some(Key::Digit(c as u8 - b'0')); }
         return None;
     }
+    if matches!(s, "printscreen" | "prtsc" | "prtscn" | "prtscr" | "print" | "snapshot") { return Some(Key::PrintScreen); }
     if let Some(n) = s.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
-        if (1..=12).contains(&n) { return Some(Key::F(n)); }
+        if (1..=19).contains(&n) { return Some(Key::F(n)); }
     }
     None
 }

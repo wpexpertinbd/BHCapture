@@ -44,22 +44,32 @@ pub(crate) static TRAY_BAR_ITEM: Mutex<Option<MainThreadOnly<tauri::menu::MenuIt
 pub(crate) static TRAY_PAUSE_ITEM: Mutex<Option<MainThreadOnly<tauri::menu::MenuItem<tauri::Wry>>>> = Mutex::new(None);
 /// Pause/Resume shortcut. Registered ONLY while a recording runs, so ⌃⌘6 belongs to other apps the
 /// rest of the time. Not macOS's own (⇧⌘6 is; ⌃⌘6 is not) and no Option (blocked since macOS 15).
-pub(crate) const PAUSE_SHORTCUT: &str = bhcapture_core::hotkey::PAUSE_HOTKEY;
 pub(crate) static PAUSE_HOTKEY_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The chord registered for this recording, so the release unregisters exactly it even if the
+/// setting changes meanwhile.
+static PAUSE_KEY: Mutex<Option<global_hotkey::hotkey::HotKey>> = Mutex::new(None);
 
-fn pause_hotkey() -> global_hotkey::hotkey::HotKey {
-    crate::to_platform_hotkey(&bhcapture_core::hotkey::Chord::parse(PAUSE_SHORTCUT).expect("the pause default is valid"))
+/// The user's pause shortcut (Settings), canonical spelling.
+fn pause_shortcut(app: &tauri::AppHandle) -> String {
+    app.state::<Arc<AppState>>().settings.lock().unwrap().get().pause_hotkey.clone()
 }
 
-/// Main thread only (the hotkey manager lives there).
-fn arm_pause_hotkey(on: bool) {
-    let hk = pause_hotkey();
-    if let Some(m) = crate::HOTKEY_MANAGER.lock().unwrap().as_ref() {
-        let r = if on { m.0.register(hk) } else { m.0.unregister(hk) };
-        match r {
-            Ok(()) => PAUSE_HOTKEY_ID.store(if on { hk.id() } else { 0 }, Ordering::SeqCst),
-            Err(e) => eprintln!("[record] pause shortcut {PAUSE_SHORTCUT} {}: {e}", if on { "unavailable" } else { "release failed" }),
+/// Register (`Some(spec)`) or release (`None`) the pause shortcut. Main thread only.
+fn arm_pause_hotkey(spec: Option<String>) {
+    let guard = crate::HOTKEY_MANAGER.lock().unwrap();
+    let Some(m) = guard.as_ref().map(|m| &m.0) else { return };
+    if let Some(old) = PAUSE_KEY.lock().unwrap().take() { let _ = m.unregister(old); }
+    PAUSE_HOTKEY_ID.store(0, Ordering::SeqCst);
+    let Some(spec) = spec else { return };
+    match bhcapture_core::hotkey::Chord::parse(&spec) {
+        Ok(c) => {
+            let hk = crate::to_platform_hotkey(&c);
+            match m.register(hk) {
+                Ok(()) => { PAUSE_HOTKEY_ID.store(hk.id(), Ordering::SeqCst); *PAUSE_KEY.lock().unwrap() = Some(hk); }
+                Err(e) => eprintln!("[record] pause shortcut {spec} unavailable: {e}"),
+            }
         }
+        Err(e) => eprintln!("[record] pause shortcut {spec} is not usable: {e}"),
     }
 }
 
@@ -307,7 +317,7 @@ pub(crate) fn recorder_info(state: tauri::State<Arc<AppState>>) -> HudInfo {
         microphone: s.record_microphone && microphone_supported(), noise_filter: s.record_noise_filter, clicks: s.record_click_highlight,
         countdown: s.record_countdown,
         mic_supported: microphone_supported(), shortcut: s.record_hotkey,
-        pause_shortcut: bhcapture_core::hotkey::Chord::parse(PAUSE_SHORTCUT).map(|c| c.display()).unwrap_or_default(),
+        pause_shortcut: s.pause_hotkey.clone(),
     }
 }
 
@@ -391,7 +401,8 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
     }
     println!("[record] started -> {} (system audio {}, microphone {}, noise filter {})", file.display(), opts.1, opts.2, opts.2 && opts.4);
     set_tray_label(app, true);
-    let _ = app.run_on_main_thread(|| arm_pause_hotkey(true));
+    let spec = pause_shortcut(app);
+    let _ = app.run_on_main_thread(move || arm_pause_hotkey(Some(spec)));
     if include_window.is_some() {
         let (a, label) = (app.clone(), overlay.clone());
         let _ = app.run_on_main_thread(move || {
@@ -559,7 +570,7 @@ fn mix_into_one_track(file: &Path) {
 fn end_take(app: &tauri::AppHandle) {
     let a = app.clone();
     let _ = app.run_on_main_thread(move || {
-        if PAUSE_HOTKEY_ID.load(Ordering::SeqCst) != 0 { arm_pause_hotkey(false); }
+        arm_pause_hotkey(None);
         platform::unwatch_clicks();
         // Windows: the overlays go back OUT of captures (one was let in for the click rings).
         for (l, w) in a.webview_windows() {

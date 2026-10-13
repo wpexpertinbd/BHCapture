@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::export::{ImageFormat, DEFAULT_JPEG_QUALITY};
-use crate::hotkey::{Chord, DEFAULT_RECORD_HOTKEY, DEFAULT_REGION_HOTKEY};
+use crate::hotkey::{Chord, DEFAULT_CAPTURE_HOTKEY, DEFAULT_RECORD_HOTKEY, DEFAULT_REGION_HOTKEY, PAUSE_HOTKEY};
 use crate::naming::{Pattern, DEFAULT_PATTERN};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -28,6 +28,15 @@ pub enum Theme {
     System,
     Light,
     Dark,
+}
+
+/// What the All-in-One selector does on Enter until the user flips its switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureMode {
+    #[default]
+    Image,
+    Video,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -50,6 +59,12 @@ pub struct Settings {
     pub jpeg_quality: u8,
     /// Shortcut that starts a screen recording (selector first, then the control bar).
     pub record_hotkey: String,
+    /// All-in-One: the selector with an Image ⇄ Video switch (decision 27).
+    pub capture_hotkey: String,
+    /// Pause/resume while recording. Registered only while a recording runs.
+    pub pause_hotkey: String,
+    /// Which mode All-in-One starts in. Screenshot unless the user chooses otherwise.
+    pub capture_default_mode: CaptureMode,
     /// Recording options, remembered from the control bar's toggles.
     pub record_cursor: bool,
     pub record_system_audio: bool,
@@ -83,6 +98,9 @@ impl Default for Settings {
             image_format: ImageFormat::Jpeg,
             jpeg_quality: DEFAULT_JPEG_QUALITY,
             record_hotkey: DEFAULT_RECORD_HOTKEY.to_string(),
+            capture_hotkey: DEFAULT_CAPTURE_HOTKEY.to_string(),
+            pause_hotkey: PAUSE_HOTKEY.to_string(),
+            capture_default_mode: CaptureMode::Image,
             record_cursor: true,
             record_system_audio: true,
             record_microphone: true,
@@ -131,26 +149,48 @@ impl Settings {
                 self.region_hotkey = DEFAULT_REGION_HOTKEY.to_string();
             }
         }
-        match Chord::parse(&self.record_hotkey) {
-            Ok(c) => self.record_hotkey = c.display(),
-            Err(e) => {
-                fixed.push(format!("record shortcut {:?} was not used: {e}. Reset to {}",
-                    self.record_hotkey, DEFAULT_RECORD_HOTKEY));
-                self.record_hotkey = DEFAULT_RECORD_HOTKEY.to_string();
+        for (field, name, default) in [("record", "record shortcut", DEFAULT_RECORD_HOTKEY),
+                                       ("capture", "All-in-One shortcut", DEFAULT_CAPTURE_HOTKEY),
+                                       ("pause", "pause shortcut", PAUSE_HOTKEY)] {
+            let slot = match field { "record" => &mut self.record_hotkey, "capture" => &mut self.capture_hotkey, _ => &mut self.pause_hotkey };
+            match Chord::parse(slot) {
+                Ok(c) => *slot = c.display(),
+                Err(e) => {
+                    fixed.push(format!("{name} {:?} was not used: {e}. Reset to {default}", slot));
+                    *slot = Chord::parse(default).map(|c| c.display()).unwrap_or_else(|_| default.to_string());
+                }
             }
         }
-        // One chord cannot start two things. The capture shortcut is the older one, so it keeps it.
-        if self.record_hotkey == self.region_hotkey {
-            let fallback = if self.region_hotkey == DEFAULT_RECORD_HOTKEY { DEFAULT_REGION_HOTKEY } else { DEFAULT_RECORD_HOTKEY };
-            fixed.push(format!("record shortcut {} is already the capture shortcut; reset to {fallback}", self.record_hotkey));
-            self.record_hotkey = fallback.to_string();
-            if self.record_hotkey == self.region_hotkey { self.record_hotkey = DEFAULT_RECORD_HOTKEY.to_string(); }
+        // One chord cannot start two things. Earlier in this list keeps it; a later one that repeats
+        // it goes back to its own default (and is noted), so a typo never silently disables a shortcut.
+        let order = ["capture", "region", "record", "pause"];
+        for i in 1..order.len() {
+            let taken: Vec<String> = order[..i].iter().map(|k| self.hotkey(k).to_string()).collect();
+            if taken.contains(&self.hotkey(order[i]).to_string()) {
+                let def = Chord::parse(Self::default_hotkey(order[i])).map(|c| c.display()).unwrap_or_default();
+                fixed.push(format!("{} {} is already used by another BHCapture shortcut; reset to {def}",
+                    Self::hotkey_name(order[i]), self.hotkey(order[i])));
+                self.set_hotkey(order[i], def);
+            }
         }
         if !(1..=60).contains(&self.record_fps) {
             fixed.push(format!("recording frame rate {} is outside 1-60; reset to 30", self.record_fps));
             self.record_fps = 30;
         }
         fixed
+    }
+
+    fn hotkey(&self, which: &str) -> &str {
+        match which { "capture" => &self.capture_hotkey, "region" => &self.region_hotkey, "record" => &self.record_hotkey, _ => &self.pause_hotkey }
+    }
+    fn set_hotkey(&mut self, which: &str, v: String) {
+        match which { "capture" => self.capture_hotkey = v, "region" => self.region_hotkey = v, "record" => self.record_hotkey = v, _ => self.pause_hotkey = v }
+    }
+    fn default_hotkey(which: &str) -> &'static str {
+        match which { "capture" => DEFAULT_CAPTURE_HOTKEY, "region" => DEFAULT_REGION_HOTKEY, "record" => DEFAULT_RECORD_HOTKEY, _ => PAUSE_HOTKEY }
+    }
+    fn hotkey_name(which: &str) -> &'static str {
+        match which { "capture" => "All-in-One shortcut", "region" => "screenshot shortcut", "record" => "record shortcut", _ => "pause shortcut" }
     }
 
     pub fn to_json(&self) -> String {

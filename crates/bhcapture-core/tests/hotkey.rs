@@ -43,7 +43,9 @@ fn malformed_shortcuts_say_what_is_wrong() {
     assert_eq!(Chord::parse("ctrl+cmd").unwrap_err(), HotkeyError::NoKey);
     assert_eq!(Chord::parse("ctrl+a+b").unwrap_err(), HotkeyError::TwoKeys);
     assert_eq!(Chord::parse("ctrl+banana").unwrap_err(), HotkeyError::UnknownPart("banana".into()));
-    assert_eq!(Chord::parse("ctrl+f13").unwrap_err(), HotkeyError::UnknownPart("f13".into()));
+    // F13-F19 became valid (a PC keyboard's Print Screen reaches a Mac as F13); F20 is still unknown.
+    assert!(Chord::parse("ctrl+f13").is_ok());
+    assert_eq!(Chord::parse("ctrl+f20").unwrap_err(), HotkeyError::UnknownPart("f20".into()));
 }
 
 #[test]
@@ -83,4 +85,18 @@ fn windows_rules_allow_alt_refuse_win_and_name_keys_the_windows_way() {
     for d in ["Ctrl+Shift+4", "Ctrl+Shift+5", "Ctrl+Shift+6"] {
         assert!(Chord::parse_for(d, Os::Windows).is_ok(), "{d}");
     }
+}
+
+#[test]
+fn print_screen_works_alone_and_f13_to_f19_exist() {
+    use bhcapture_core::hotkey::{Chord, Key, Os};
+    for spelling in ["PrintScreen", "prtsc", "Print", "PrtScn"] {
+        let c = Chord::parse_for(spelling, Os::Windows).unwrap();
+        assert_eq!(c.key, Key::PrintScreen);
+        assert_eq!(c.display_for(Os::Windows), "PrintScreen");
+    }
+    assert!(Chord::parse_for("F13", Os::Mac).is_ok(), "a PC keyboard's Print Screen on a Mac");
+    assert!(Chord::parse_for("F20", Os::Mac).is_err());
+    // A letter on its own still steals typing.
+    assert!(Chord::parse_for("P", Os::Windows).is_err());
 }

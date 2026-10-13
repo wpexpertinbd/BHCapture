@@ -217,7 +217,7 @@ fn record_defaults_and_repairs() {
     let mut t = Settings::default();
     t.record_hotkey = t.region_hotkey.clone();
     let fixed = t.normalise();
-    assert!(fixed.iter().any(|f| f.contains("already the capture shortcut")), "{fixed:?}");
+    assert!(fixed.iter().any(|f| f.contains("already used by another BHCapture shortcut")), "{fixed:?}");
     assert_ne!(t.record_hotkey, t.region_hotkey);
 
     // Frame rate out of range is repaired, not kept.
@@ -230,4 +230,21 @@ fn record_defaults_and_repairs() {
     let old: Settings = serde_json::from_str(r#"{"pattern":"BHCapture {date} at {time}"}"#).unwrap();
     assert_eq!(old.record_fps, 30);
     assert!(old.record_system_audio);
+}
+
+#[test]
+fn all_in_one_defaults_and_duplicate_shortcuts() {
+    use bhcapture_core::settings::CaptureMode;
+    let s = Settings::default();
+    assert_eq!(s.capture_default_mode, CaptureMode::Image, "screenshot is the default (decision 27)");
+    let mut n = Settings::default();
+    assert!(n.normalise().is_empty(), "the four default shortcuts are valid and distinct");
+    // Pause set to the All-in-One chord: All-in-One keeps it, pause goes back to its own default.
+    let mut d = Settings::default();
+    d.pause_hotkey = d.capture_hotkey.clone();
+    let fixed = d.normalise();
+    assert_eq!(fixed.len(), 1, "{fixed:?}");
+    assert_ne!(d.pause_hotkey, d.capture_hotkey);
+    let all = [&d.capture_hotkey, &d.region_hotkey, &d.record_hotkey, &d.pause_hotkey];
+    for i in 0..4 { for j in i + 1..4 { assert_ne!(all[i], all[j]); } }
 }
