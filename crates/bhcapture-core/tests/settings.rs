@@ -19,7 +19,7 @@ fn section0_rig_selfcheck() {
     let s = Settings::default();
     assert_eq!(s.pattern, DEFAULT_PATTERN);
     assert!(s.output_dir.is_none(), "core must not invent a platform path");
-    assert!(s.copy_to_clipboard);
+    assert!(!s.copy_to_clipboard, "copy-on-save is opt-in");
     // Round-trips through JSON unchanged.
     let back: Settings = serde_json::from_str(&s.to_json()).unwrap();
     assert_eq!(back, s);
@@ -130,7 +130,7 @@ fn one_bad_field_does_not_discard_the_others() {
         "pattern": "shot-{yaer}",
         "output_dir": "relative/path",
         "region_hotkey": "   ",
-        "copy_to_clipboard": false,
+        "copy_to_clipboard": true,
         "include_cursor": true
     }"#).unwrap();
 
@@ -143,7 +143,7 @@ fn one_bad_field_does_not_discard_the_others() {
     assert!(s.output_dir.is_none(), "relative path reset -- it would resolve against '/' for a .app");
     assert!(!s.region_hotkey.trim().is_empty());
     // The valid fields must survive.
-    assert!(!s.copy_to_clipboard, "a valid field was lost while repairing another");
+    assert!(s.copy_to_clipboard, "a valid field was lost while repairing another");
     assert!(s.include_cursor, "a valid field was lost while repairing another");
 }
 
@@ -157,7 +157,7 @@ fn unknown_and_missing_keys_fall_back_to_defaults() {
     assert!(matches!(outcome, LoadOutcome::Loaded { .. }), "got {outcome:?}");
     assert!(store.get().include_cursor);
     assert_eq!(store.get().pattern, DEFAULT_PATTERN);
-    assert!(store.get().copy_to_clipboard, "absent keys take the default, not false");
+    assert!(store.get().record_noise_filter, "absent keys take the default, not false");
 }
 
 #[test]

@@ -90,7 +90,9 @@ impl Default for Settings {
             output_dir: None,
             pattern: DEFAULT_PATTERN.to_string(),
             always_ask_where_to_save: false,
-            copy_to_clipboard: true,
+            // Off: the clipboard is readable by every app and by clipboard-history tools, and a
+            // capture can hold anything that was on screen. Opt-in (Benjamin, 2026-10-13).
+            copy_to_clipboard: false,
             include_cursor: false,
             region_hotkey: DEFAULT_REGION_HOTKEY.to_string(),
             theme: Theme::System,

@@ -20,6 +20,7 @@ png = "0.17"
 arboard = "3.4"
 libc = "0.2"
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
 base64 = "0.22"
 
 [features]

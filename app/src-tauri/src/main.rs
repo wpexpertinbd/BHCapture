@@ -1397,6 +1397,8 @@ fn show_overlays(app: &tauri::AppHandle) {
 /// One BHCapture per user. A second copy would fight over the shortcuts, and -- worse -- treat the
 /// first one's LIVE recording in the shared working folder as a crash leftover and rewrite it.
 /// The lock is held for the life of the process and released by the OS however it ends.
+static SECOND_COPY: AtomicBool = AtomicBool::new(false);
+
 fn claim_single_instance() -> Option<std::fs::File> {
     let dir = app_data_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -1405,10 +1407,9 @@ fn claim_single_instance() -> Option<std::fs::File> {
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("instance.lock")).ok()?;
     match f.try_lock() {
         Ok(()) => Some(f),
-        Err(std::fs::TryLockError::WouldBlock) => {
-            eprintln!("[app] BHCapture is already running; this copy exits.");
-            std::process::exit(0);
-        }
+        // Already running: the single-instance plugin hands this launch to the running copy (which
+        // opens Settings) and exits. Should it not (a copy started from another bundle), setup exits.
+        Err(std::fs::TryLockError::WouldBlock) => { SECOND_COPY.store(true, Ordering::SeqCst); None }
         // A filesystem without locks: run anyway rather than refuse to start.
         Err(std::fs::TryLockError::Error(e)) => { eprintln!("[app] could not take the instance lock ({e})"); None }
     }
@@ -1445,6 +1446,9 @@ fn main() {
     apply_settings(&state);
 
     tauri::Builder::default()
+        // First, so a second launch is handed over before anything else starts: launching BHCapture
+        // again (Start menu, app launcher, Finder) opens Settings in the copy already running.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| { let _ = open_settings(app.clone()); }))
         .plugin(tauri_plugin_dialog::init())
         .manage(state.clone())
         // The moment the last real window goes, the Dock icon goes with it.
@@ -1497,6 +1501,10 @@ fn main() {
             }
         })
         .setup(move |app| {
+            if SECOND_COPY.load(Ordering::SeqCst) {
+                eprintln!("[app] BHCapture is already running; this copy exits.");
+                std::process::exit(0);
+            }
             let handle = app.handle().clone();
             // Menu-bar only until a window is opened. Info.plist's LSUIElement does this for the
             // bundled app; stating it here makes an unbundled dev run behave the same.
