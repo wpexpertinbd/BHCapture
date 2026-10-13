@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use serde::Serialize;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
-use tauri::menu::{Menu, MenuItem};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 
 const OVERLAY_PREFIX: &str = "overlay-";
@@ -940,6 +940,84 @@ fn set_region_hotkey(spec: &str) -> Result<String, String> {
     Ok(chord.display())
 }
 
+// ---------------------------------------------------------------------------------------------
+// The menu bar. Shown by macOS only while the app is in regular mode, i.e. while an editor or the
+// Settings window is open (decision 10), so it never appears for a quick capture.
+// ---------------------------------------------------------------------------------------------
+
+/// The File > Format check items, so their ticks can follow the focused editor.
+static FORMAT_ITEMS: Mutex<Vec<MainThreadOnly<(ImageFormat, CheckMenuItem<tauri::Wry>)>>> = Mutex::new(Vec::new());
+
+fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let about = PredefinedMenuItem::about(app, Some("About BHCapture"), None)?;
+    let settings = MenuItem::with_id(app, "app:settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
+    let app_menu = Submenu::with_items(app, "BHCapture", true, &[
+        &about, &PredefinedMenuItem::separator(app)?, &settings, &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::hide(app, None)?, &PredefinedMenuItem::hide_others(app, None)?,
+        &PredefinedMenuItem::separator(app)?, &PredefinedMenuItem::quit(app, None)?,
+    ])?;
+
+    let mut checks = Vec::new();
+    let mut format_items: Vec<CheckMenuItem<tauri::Wry>> = Vec::new();
+    for f in ALL_FORMATS {
+        let it = CheckMenuItem::with_id(app, format!("ed:format:{}", f.extension()), f.label(), true,
+                                        *f == ImageFormat::Jpeg, None::<&str>)?;
+        checks.push(MainThreadOnly((*f, it.clone())));
+        format_items.push(it);
+    }
+    *FORMAT_ITEMS.lock().unwrap() = checks;
+    let fmt_refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = format_items.iter().map(|i| i as _).collect();
+    let format_menu = Submenu::with_items(app, "Format", true, &fmt_refs)?;
+
+    let file = Submenu::with_items(app, "File", true, &[
+        &MenuItem::with_id(app, "ed:save", "Save", true, Some("CmdOrCtrl+S"))?,
+        &MenuItem::with_id(app, "ed:save-as", "Save As…", true, Some("Shift+CmdOrCtrl+S"))?,
+        &PredefinedMenuItem::separator(app)?,
+        &format_menu,
+        &PredefinedMenuItem::separator(app)?,
+        &MenuItem::with_id(app, "ed:close", "Close", true, Some("CmdOrCtrl+W"))?,
+    ])?;
+    // Undo/Redo/Copy are OURS (they act on the drawing), but they hand over to the text box when
+    // one is being typed into. Cut/Paste/Select All are the system's, for that text box.
+    let edit = Submenu::with_items(app, "Edit", true, &[
+        &MenuItem::with_id(app, "ed:undo", "Undo", true, Some("CmdOrCtrl+Z"))?,
+        &MenuItem::with_id(app, "ed:redo", "Redo", true, Some("Shift+CmdOrCtrl+Z"))?,
+        &PredefinedMenuItem::separator(app)?,
+        &PredefinedMenuItem::cut(app, None)?,
+        &MenuItem::with_id(app, "ed:copy", "Copy", true, Some("CmdOrCtrl+C"))?,
+        &PredefinedMenuItem::paste(app, None)?,
+        &PredefinedMenuItem::select_all(app, None)?,
+        &PredefinedMenuItem::separator(app)?,
+        &MenuItem::with_id(app, "ed:delete", "Delete Selected", true, None::<&str>)?,
+    ])?;
+    let window = Submenu::with_items(app, "Window", true, &[
+        &PredefinedMenuItem::minimize(app, None)?,
+        &PredefinedMenuItem::fullscreen(app, None)?,
+    ])?;
+    Menu::with_items(app, &[&app_menu, &file, &edit, &window])
+}
+
+/// Send a menu action to the editor the user is working in. Nothing happens if no editor has focus
+/// (for example while Settings is in front), rather than acting on a window the user cannot see.
+fn route_menu_event(app: &tauri::AppHandle, id: &str) {
+    if id == "app:settings" { let _ = open_settings(app.clone()); return; }
+    let Some(action) = id.strip_prefix("ed:") else { return };
+    let focused = app.webview_windows().into_iter()
+        .find(|(l, w)| l.starts_with(EDITOR_PREFIX) && w.is_focused().unwrap_or(false));
+    if let Some((label, _)) = focused {
+        let _ = app.emit_to(label.as_str(), "editor-menu", action.to_string());
+    }
+}
+
+/// The focused editor reports its format so File > Format ticks the right one. Sync command, so it
+/// runs on the main thread, where menu items must be touched.
+#[tauri::command]
+fn editor_format_changed(format: ImageFormat) {
+    for item in FORMAT_ITEMS.lock().unwrap().iter() {
+        let _ = item.0 .1.set_checked(item.0 .0 == format);
+    }
+}
+
 fn overlay_label(id: DisplayId) -> String { format!("{OVERLAY_PREFIX}{}", id.0) }
 
 /// Make the overlay windows match the current display layout: create what is missing, move and
@@ -1103,6 +1181,7 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(state.clone())
         // The moment the last real window goes, the Dock icon goes with it.
+        .on_menu_event(|app, event| route_menu_event(app, event.id().as_ref()))
         .on_window_event(|window, event| {
             match event {
                 // An editor holds a capture that may not be saved anywhere yet. Closing it with the
@@ -1129,13 +1208,18 @@ fn main() {
             selection_nudge, selection_cancel, selection_commit,
             snap_at, loupe, selection_set_rect, open_privacy_settings, relaunch_app, report_overlay_focus,
             settings_get, settings_save, settings_pick_dir, open_settings,
-            editor_info, editor_pixels, editor_save, editor_copy, editor_close
+            editor_info, editor_pixels, editor_save, editor_copy, editor_close, editor_format_changed
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
             // Menu-bar only until a window is opened. Info.plist's LSUIElement does this for the
             // bundled app; stating it here makes an unbundled dev run behave the same.
             sync_dock(&handle, None);
+            // The menu bar for editor/Settings windows. macOS shows it only in regular mode.
+            match build_app_menu(&handle) {
+                Ok(m) => { let _ = app.set_menu(m); }
+                Err(e) => eprintln!("[menu] could not build the menu bar: {e}"),
+            }
             // Pre-create every overlay hidden AT LAUNCH. Creating a webview window on
             // hotkey-press is visibly slow; spike 0c measured ~25 ms for a pre-created one.
             sync_overlays(&handle, &state)?;
@@ -1288,27 +1372,20 @@ fn main() {
                     let _ = ed.eval(&draw("p", 0.42, 0.0, 0.98, 0.22));
                     ms(500);
                     println!("[edtest] HOLD-EDITOR");
-                    ms(4000);
-                    // ⌘W on an UNSAVED capture must ask, not close. Esc must then keep the editor.
-                    let _ = ed.eval("window.dispatchEvent(new KeyboardEvent('keydown',{key:'w',metaKey:true,bubbles:true}))");
-                    ms(500);
-                    println!("[edtest] HOLD-MODAL (editor still open = {})", h.get_webview_window(&label).is_some());
                     ms(3000);
-                    let _ = ed.eval("window.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}))");
-                    ms(500);
-                    println!("[edtest] after Esc on the dialog: editor still open = {}, capture still held = {}",
+                    // From here the HARNESS sends real keystrokes (⌘W, Esc, ⌘S), so they go through the
+                    // native menu bar exactly as a person's would.
+                    println!("[edtest] HOLD-CLOSE1"); ms(2500);
+                    println!("[edtest] after ⌘W on an unsaved capture: editor still open = {} (expect true: it must ask)",
+                        h.get_webview_window(&label).is_some());
+                    println!("[edtest] HOLD-ESC"); ms(2000);
+                    println!("[edtest] after Esc on the dialog: editor still open = {}, capture held = {}",
                         h.get_webview_window(&label).is_some(), st.editors.lock().unwrap().len() == 1);
-                    let save_key = "window.dispatchEvent(new KeyboardEvent('keydown',{key:'s',metaKey:true,bubbles:true}))";
-                    let _ = ed.eval(save_key);                       // ⌘S in the default format (JPEG)
-                    ms(2000);
-                    let _ = ed.eval("(()=>{const el=document.querySelector('select.ed-format');\
-                        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(el,'png');\
-                        el.dispatchEvent(new Event('change',{bubbles:true}));})()");
-                    ms(300);
-                    let _ = ed.eval(save_key);                       // ⌘S again, now PNG
-                    ms(2000);
-                    let _ = ed.eval("window.dispatchEvent(new KeyboardEvent('keydown',{key:'w',metaKey:true,bubbles:true}))");
-                    ms(1500);
+                    println!("[edtest] HOLD-SAVE"); ms(2500);
+                    route_menu_event(&h, "ed:format:png");   // File > Format > PNG, through the same router
+                    ms(600);
+                    println!("[edtest] HOLD-SAVE2"); ms(2500);
+                    println!("[edtest] HOLD-CLOSE2"); ms(2500);
                     println!("[edtest] after ⌘W: editor window open = {}, captures held in memory = {}",
                         h.get_webview_window(&label).is_some(), st.editors.lock().unwrap().len());
                     ms(300);

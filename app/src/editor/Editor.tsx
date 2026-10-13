@@ -66,7 +66,7 @@ export function Editor() {
 
   // A fresh capture is unsaved by definition, hence dirty from the start.
   const [doc, dispatch] = useReducer(reduce, { shapes: [], undo: [], redo: [], dirty: true, nextId: 1 });
-  const { shapes, undo, redo, dirty } = doc;
+  const { shapes, dirty } = doc;
   const [tool, setTool] = useState<Tool>("arrow");
   const [color, setColor] = useState(COLORS[0]);
   const [width, setWidth] = useState(WIDTHS[1]);
@@ -161,6 +161,37 @@ export function Editor() {
     return () => { un.then((f) => f()); };
   }, [requestClose]);
 
+  // Save, Save As, Copy, Undo, Redo, Close and Format live in the MENU BAR (File / Edit), which owns
+  // their shortcuts; the menu sends the action to whichever editor has focus.
+  const menuAction = useRef<(a: string) => void>(() => {});
+  menuAction.current = (a: string) => {
+    const typing = document.activeElement instanceof HTMLInputElement;
+    if (a === "save") void save(false);
+    else if (a === "save-as") void save(true);
+    else if (a === "close") requestClose();
+    // While a text box is being typed into, Copy/Undo/Redo are for THAT text, not the drawing.
+    else if (a === "copy") { if (typing) document.execCommand("copy"); else void copy(); }
+    else if (a === "undo") { if (typing) document.execCommand("undo"); else doUndo(); }
+    else if (a === "redo") { if (typing) document.execCommand("redo"); else doRedo(); }
+    else if (a === "delete") { if (selected !== null) { dispatch({ t: "remove", id: selected }); setSelected(null); } }
+    else if (a.startsWith("format:")) {
+      const ext = a.slice(7);
+      setFormat((ext === "jpg" ? "jpeg" : ext) as Format);
+    }
+  };
+  useEffect(() => {
+    const un = listen<string>("editor-menu", (e) => menuAction.current(e.payload));
+    return () => { un.then((f) => f()); };
+  }, []);
+
+  // Keep File > Format ticked to THIS editor's format whenever it changes or the window is focused.
+  useEffect(() => {
+    void invoke("editor_format_changed", { format });
+    const onFocus = () => void invoke("editor_format_changed", { format });
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [format]);
+
   useEffect(() => {
     if (!notice) return;
     const t = setTimeout(() => setNotice(null), notice.kind === "error" ? 7000 : 2600);
@@ -251,10 +282,8 @@ export function Editor() {
         if (mod && key === "d") { e.preventDefault(); void invoke("editor_close"); }
         return;
       }
-      if (mod && key === "s") { e.preventDefault(); void save(e.shiftKey); return; }
-      if (mod && key === "c") { e.preventDefault(); void copy(); return; }
-      if (mod && key === "w") { e.preventDefault(); requestClose(); return; }
-      if (mod && key === "z") { e.preventDefault(); e.shiftKey ? doRedo() : doUndo(); return; }
+      // Cmd-S/Shift-Cmd-S/Cmd-C/Cmd-Z/Cmd-W belong to the menu bar. Handling them here as well could
+      // run an action twice.
       if (mod) return;
       if ((e.key === "Backspace" || e.key === "Delete") && selected !== null) {
         e.preventDefault(); dispatch({ t: "remove", id: selected }); setSelected(null); return;
@@ -302,19 +331,6 @@ export function Editor() {
             </button>
           ))}
         </div>
-        <div className="ed-spacer" />
-        <div className="ed-group">
-          <button className="ed-btn" title="Undo (⌘Z)" disabled={!undo.length} onClick={doUndo}>↶</button>
-          <button className="ed-btn" title="Redo (⇧⌘Z)" disabled={!redo.length} onClick={doRedo}>↷</button>
-        </div>
-        <div className="ed-group">
-          <select className="ed-format" value={format} title="File format" onChange={(e) => setFormat(e.target.value as Format)}>
-            {FORMATS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
-          </select>
-          <button className="ed-btn" title="Copy to clipboard (⌘C)" onClick={() => void copy()}>Copy</button>
-          <button className="ed-btn" title="Save As… (⇧⌘S)" disabled={busy} onClick={() => void save(true)}>Save As…</button>
-          <button className="ed-btn primary" title="Save (⌘S)" disabled={busy} onClick={() => void save(false)}>Save</button>
-        </div>
       </div>
 
       <div className="ed-stage">
@@ -335,8 +351,9 @@ export function Editor() {
 
       <div className="ed-status">
         <span>{info.width} × {info.height} px</span>
+        <span className="ed-dim">{FORMATS.find((f) => f.value === format)?.label}</span>
         <span className="ed-dim">{savedTo ? (dirty ? "Edited since last save" : `Saved · ${savedTo.split("/").pop()}`) : "Not saved yet"}</span>
-        <span className="ed-dim ed-keys">⌘S save · ⇧⌘S save as · ⌘C copy · ⌘Z undo · ⌘W close</span>
+        <span className="ed-dim ed-keys">File › Save ⌘S · Save As ⇧⌘S · Format · Edit › Copy ⌘C · Undo ⌘Z</span>
       </div>
 
       {notice && <div className={`ed-notice ${notice.kind}`}>{notice.message}</div>}
