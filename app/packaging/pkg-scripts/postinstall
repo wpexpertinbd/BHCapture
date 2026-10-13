@@ -1,0 +1,21 @@
+#!/bin/sh
+#
+# Reopens the app the preinstall quit, as the person sitting at the Mac -- never as root, which would
+# leave root-owned files in their data folder. Only for an install onto the running system ($3).
+
+[ "$3" = "/" ] || exit 0
+
+APP=/Applications/BHCapture.app
+
+# Refuse a symlink, and check this really is BHCapture before launching it.
+[ -L "$APP" ] && exit 0
+[ -d "$APP" ] || exit 0
+ID=$(/usr/bin/defaults read "$APP/Contents/Info" CFBundleIdentifier 2>/dev/null)
+[ "$ID" = "com.biswashost.bhcapture" ] || exit 0
+
+USER_NAME=$(/usr/bin/stat -f "%Su" /dev/console)
+[ -n "$USER_NAME" ] && [ "$USER_NAME" != "root" ] || exit 0
+UID_NUM=$(/usr/bin/id -u "$USER_NAME" 2>/dev/null) || exit 0
+
+/bin/launchctl asuser "$UID_NUM" /usr/bin/sudo -u "$USER_NAME" /usr/bin/open "$APP" || true
+exit 0
