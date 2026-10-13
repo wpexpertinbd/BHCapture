@@ -280,9 +280,14 @@ fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
 
 /// Release the frozen frames (tens of MB on a Retina panel) and invalidate in-flight work.
 fn release_frozen(state: &AppState) {
+    // The epoch moves under the snapshot lock, so a capture finishing on another thread either sees
+    // the new epoch or lands before the clear -- never stores an old frame into a new session.
+    let mut snap = state.snapshot.lock().unwrap();
     state.epoch.fetch_add(1, Ordering::SeqCst);
-    *state.snapshot.lock().unwrap() = None;
-    state.cands.lock().unwrap().clear();
+    *snap = None;
+    drop(snap);
+    let mut cands = state.cands.lock().unwrap();
+    cands.clear();
 }
 
 /// The one way the selector opens, so the hotkey, the tray and the tests behave identically.
@@ -350,28 +355,30 @@ fn open_selector_as(app: &tauri::AppHandle, video: bool, switchable: bool) {
     if !frozen_first { std::thread::spawn(move || {
         let layout = st.layout.lock().unwrap().clone();
         match Snapshot::take(&st.capturer, &layout) {
-            Ok(snap) if st.epoch.load(Ordering::SeqCst) == epoch => {
-                *st.snapshot.lock().unwrap() = Some(Arc::new(snap));
+            Ok(snap) => {
+                let mut slot = st.snapshot.lock().unwrap();
+                if st.epoch.load(Ordering::SeqCst) != epoch { return; }
+                *slot = Some(Arc::new(snap));
+                drop(slot);
                 // A pointer that has not moved since the overlay opened would otherwise show no
                 // magnifier until its next movement.
                 let _ = app_for_freeze.emit("frozen-ready", ());
             }
-            Ok(_) => {}
             Err(e) => eprintln!("[warn] could not freeze the screen ({e}); the magnifier is off and capture will be live"),
         }
     }); }
     let st = state.clone();
     std::thread::spawn(move || {
         match st.capturer.list_targets() {
-            Ok(t) if st.epoch.load(Ordering::SeqCst) == epoch => {
+            Ok(t) => {
                 let own = st.overlay_ids.lock().unwrap().clone();
-                let cands: Vec<Candidate> = t.windows.iter()
+                let found: Vec<Candidate> = t.windows.iter()
                     .filter(|w| !own.contains(&(w.id.0 as u32)))
                     .map(|w| Candidate { bounds: w.bounds, layer: w.layer, z: w.z_order })
                     .collect();
-                *st.cands.lock().unwrap() = cands;
+                let mut cands = st.cands.lock().unwrap();
+                if st.epoch.load(Ordering::SeqCst) == epoch { *cands = found; }
             }
-            Ok(_) => {}
             Err(e) => eprintln!("[warn] could not list windows ({e}); snap-to-window is off"),
         }
     });
@@ -693,7 +700,7 @@ fn choose_save_path(app: &tauri::AppHandle, state: &AppState, width: u32, height
         }
     } else {
         let _ = std::fs::create_dir_all(&out_dir);
-        Ok((unique_path(&out_dir, &stem, format.extension(), &|p| p.exists()), format))
+        Ok((unique_path(&out_dir, &stem, format.extension(), &|p| bhcapture_core::private_file::occupied(p)), format))
     }
 }
 
@@ -794,22 +801,28 @@ fn png_from_request(request: &tauri::ipc::Request<'_>) -> Result<(Vec<u8>, u32, 
     Ok((bytes.clone(), w, h))
 }
 
-/// Write a capture readable only by this user (0600). A screenshot can hold anything that was on
-/// screen; under a usual 022 umask `fs::write` would make it world-readable (0644) wherever it is
-/// saved, so a capture saved to a shared folder would be readable by other accounts (Codex review).
-/// The user can still share the file deliberately; it is just never exposed by default.
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    { use std::os::unix::fs::OpenOptionsExt; o.mode(0o600); }
-    let mut f = o.open(path)?;
-    f.write_all(bytes)?;
-    // An existing file keeps its old mode on open(), so set it explicitly too.
-    #[cfg(unix)]
-    { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)); }
-    f.sync_all()
+/// Which window may call which command. Every page is our own code, but a webview that ever rendered
+/// something hostile (a crafted window title, say) must not be able to reach commands meant for a
+/// different window -- above all `settings_save`, which picks where captures are written and which
+/// keys are grabbed system-wide. Anything not listed is refused (audit 2026-10-13).
+fn command_allowed(label: &str, cmd: &str) -> bool {
+    let window = if label.starts_with(OVERLAY_PREFIX) { "overlay" }
+        else if label.starts_with(EDITOR_PREFIX) { "editor" }
+        else if label.starts_with(recording::VIDEO_PREFIX) { "video" }
+        else if label == SETTINGS_WINDOW { "settings" }
+        else if label == recording::HUD { "recorder" }
+        else { return false };
+    match window {
+        "overlay" => matches!(cmd, "overlay_info" | "selection_begin" | "selection_update" | "selection_nudge"
+            | "selection_cancel" | "selection_commit" | "snap_at" | "loupe" | "selection_set_rect"
+            | "selection_fullscreen" | "selector_set_mode" | "open_privacy_settings" | "relaunch_app"
+            | "report_overlay_focus"),
+        "settings" => matches!(cmd, "settings_get" | "settings_save" | "settings_pick_dir" | "hotkey_check" | "hotkeys_suspend"),
+        "editor" => cmd.starts_with("editor_"),
+        "video" => cmd.starts_with("video_"),
+        "recorder" => cmd.starts_with("recorder_"),
+        _ => false,
+    }
 }
 
 /// Decode the editor's PNG into straight RGBA8.
@@ -855,7 +868,7 @@ async fn editor_save(app: tauri::AppHandle, window: tauri::WebviewWindow, state:
     let (path, format) = choose_save_path(&app, &state, w, h, save_as, wanted, Some(&window))?;
     let (rgba, rw, rh) = decode_png_rgba(&png).map_err(CommitError::Failed)?;
     let bytes = export::encode(&rgba, rw, rh, format, quality).map_err(|e| CommitError::Failed(e.to_string()))?;
-    write_private(&path, &bytes).map_err(|e| CommitError::Failed(format!("Could not save the file: {e}")))?;
+    bhcapture_core::private_file::write_private(&path, &bytes).map_err(|e| CommitError::Failed(format!("Could not save the file: {e}")))?;
     if let Some(d) = state.editors.lock().unwrap().get_mut(&id) { d.saved_to = Some(path.clone()); }
 
     // Clipboard is a convenience on top of a file that already exists -- never fail the save for it.
@@ -1381,7 +1394,28 @@ fn show_overlays(app: &tauri::AppHandle) {
     });
 }
 
+/// One BHCapture per user. A second copy would fight over the shortcuts, and -- worse -- treat the
+/// first one's LIVE recording in the shared working folder as a crash leftover and rewrite it.
+/// The lock is held for the life of the process and released by the OS however it ends.
+fn claim_single_instance() -> Option<std::fs::File> {
+    let dir = app_data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)); }
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("instance.lock")).ok()?;
+    match f.try_lock() {
+        Ok(()) => Some(f),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("[app] BHCapture is already running; this copy exits.");
+            std::process::exit(0);
+        }
+        // A filesystem without locks: run anyway rather than refuse to start.
+        Err(std::fs::TryLockError::Error(e)) => { eprintln!("[app] could not take the instance lock ({e})"); None }
+    }
+}
+
 fn main() {
+    let _instance = claim_single_instance();
     let capturer = PlatformCapturer::new();
     let layout = capturer.list_displays().unwrap_or_default();
 
@@ -1426,6 +1460,9 @@ fn main() {
                     let _ = window.emit_to(window.label(), "editor-close-requested", ());
                 }
                 tauri::WindowEvent::Destroyed => {
+                    // Settings suspends the shortcuts while a shortcut field is listening; closing it
+                    // mid-listen must not leave them off until the next launch.
+                    if window.label() == SETTINGS_WINDOW { hotkeys_suspend(false); }
                     // Free the pixels the moment their window is gone.
                     if let Ok(id) = recording::video_id_of(window.label()) { recording::forget_video(id); }
                     if let Ok(id) = editor_id_of(window.label()) {
@@ -1438,7 +1475,8 @@ fn main() {
                 _ => {}
             }
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler({
+            let handler: Box<dyn Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync> = Box::new(tauri::generate_handler![
             overlay_info, selection_begin, selection_update,
             selection_nudge, selection_cancel, selection_commit,
             snap_at, loupe, selection_set_rect, selection_fullscreen, selector_set_mode, hotkey_check, hotkeys_suspend, open_privacy_settings, relaunch_app, report_overlay_focus,
@@ -1447,7 +1485,17 @@ fn main() {
             recording::recorder_info, recording::recorder_option, recording::recorder_start,
             recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel, recording::recorder_hide, recording::recorder_restart,
             recording::video_info, recording::video_save, recording::video_close, recording::video_export
-        ])
+            ]);
+            move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
+                let (label, cmd) = (invoke.message.webview_ref().label().to_string(), invoke.message.command().to_string());
+                if !command_allowed(&label, &cmd) {
+                    eprintln!("[ipc] refused {cmd} from window {label}");
+                    invoke.resolver.reject(format!("{cmd} is not available in this window"));
+                    return true;
+                }
+                handler(invoke)
+            }
+        })
         .setup(move |app| {
             let handle = app.handle().clone();
             // Menu-bar only until a window is opened. Info.plist's LSUIElement does this for the
@@ -1594,6 +1642,111 @@ fn main() {
                     println!("[keys] after ESC: overlay visible = {}, armed = {}",
                         w.is_visible().unwrap_or(true), SELECTOR_KEYS_ARMED.load(Ordering::SeqCst));
                     ms(300);
+                    h.exit(0);
+                });
+            }
+
+            // Audit 2026-10-13: every page renders under the CSP, may call its own commands and is
+            // REFUSED another window's. Results come back as "sec-probe" events.
+            if std::env::args().any(|a| a == "--demo-security") {
+                use tauri::Listener;
+                let (h, st) = (handle.clone(), state.clone());
+                h.listen_any("sec-probe", |e| println!("[sec] {}", e.payload()));
+                std::thread::spawn(move || {
+                    let ms = |n| std::thread::sleep(std::time::Duration::from_millis(n));
+                    // `own` must succeed, `foreign` must be refused; also report what rendered.
+                    let probe = |w: &tauri::WebviewWindow, own: &str, foreign: &str| {
+                        let js = format!(r#"(async()=>{{
+                          const I=window.__TAURI_INTERNALS__; const out={{win:{label:?}, html:document.body.innerText.length, text:document.body.innerText.slice(0,60),
+                            styled:getComputedStyle(document.body).margin, csp:window.__cspv||[]}};
+                          try{{ await I.invoke({own:?}); out.own='ok'; }}catch(e){{ out.own='ERR '+e; }}
+                          try{{ await I.invoke({foreign:?}, {{settings:{{}}}}); out.foreign='ALLOWED'; }}catch(e){{ out.foreign='refused: '+e; }}
+                          const v=document.querySelector('video'); if(v) out.video={{ready:v.readyState, err:v.error&&v.error.code, src:v.currentSrc.slice(0,40)}};
+                          await I.invoke('plugin:event|emit',{{event:'sec-probe',payload:out}});
+                        }})()"#, label = w.label());
+                        let _ = w.eval(&js);
+                    };
+                    let watch_csp = "window.__cspv=[];document.addEventListener('securitypolicyviolation',e=>window.__cspv.push(e.violatedDirective+' '+e.blockedURI));";
+                    ms(2500);
+                    // 1. Selector overlay.
+                    open_selector(&h, false);
+                    ms(1200);
+                    let ov = h.get_webview_window("overlay-1").expect("overlay-1");
+                    let _ = ov.eval(watch_csp);
+                    probe(&ov, "overlay_info", "settings_save");
+                    ms(800);
+                    // 2. Editor, from a real selection.
+                    let mev = |t: &str, x: f64, y: f64| format!(
+                        "(()=>{{const el=document.elementFromPoint({x},{y})||document.body;\
+                         el.dispatchEvent(new MouseEvent('{t}',{{bubbles:true,cancelable:true,\
+                         clientX:{x},clientY:{y},button:0}}));}})()");
+                    let _ = ov.eval(&mev("mousedown", 200.0, 150.0));
+                    for i in 1..=6 { let _ = ov.eval(&mev("mousemove", 200.0 + 60.0 * i as f64, 150.0 + 40.0 * i as f64)); ms(40); }
+                    let _ = ov.eval(&mev("mouseup", 560.0, 390.0));
+                    ms(400);
+                    probe(&ov, "overlay_info", "settings_save");
+                    ms(600);
+                    match commit(&h, &st, false) {
+                        Ok(label) => {
+                            ms(2000);
+                            let ed = h.get_webview_window(&label).expect("editor");
+                            let _ = ed.eval(watch_csp);
+                            probe(&ed, "editor_info", "settings_save");
+                            ms(800);
+                            probe(&ed, "editor_info", "hotkeys_suspend");
+                            ms(600);
+                            let _ = h.emit_to(label.as_str(), "editor-menu", "save".to_string());
+                            ms(2000);
+                        }
+                        Err(e) => println!("[sec] editor commit FAILED {e:?}"),
+                    }
+                    ms(1000);
+                    // 3. Settings.
+                    let _ = open_settings(h.clone());
+                    ms(2000);
+                    if let Some(w) = h.get_webview_window(SETTINGS_WINDOW) {
+                        let _ = w.eval(watch_csp);
+                        probe(&w, "settings_get", "recorder_start");
+                    }
+                    ms(800);
+                    // 4. Playback window, on a sample file copied into the working folder.
+                    if let Ok(sample) = std::env::var("BHC_SAMPLE_MP4") {
+                        let dst = recording::recordings_dir().join("sec-probe.mp4");
+                        let _ = std::fs::copy(&sample, &dst);
+                        match recording::open_video(&h, dst, None) {
+                            Ok(label) => {
+                                ms(2500);
+                                let w = h.get_webview_window(&label).expect("video");
+                                let _ = w.eval(watch_csp);
+                                ms(1500);
+                                probe(&w, "video_info", "editor_save");
+                                ms(600);
+                                let _ = h.emit_to(label.as_str(), "editor-menu", "save".to_string());
+                                ms(2000);
+                            }
+                            Err(e) => println!("[sec] video open FAILED {e}"),
+                        }
+                    }
+                    // 5. The recording bar: set up a recording (nothing is captured until Start) and cancel.
+                    open_selector(&h, true);
+                    ms(1200);
+                    let _ = ov.eval(&mev("mousedown", 200.0, 150.0));
+                    for i in 1..=6 { let _ = ov.eval(&mev("mousemove", 200.0 + 60.0 * i as f64, 150.0 + 40.0 * i as f64)); ms(40); }
+                    let _ = ov.eval(&mev("mouseup", 560.0, 390.0));
+                    ms(400);
+                    match commit(&h, &st, false) {
+                        Ok(_) => {
+                            ms(2000);
+                            if let Some(w) = h.get_webview_window(recording::HUD) {
+                                let _ = w.eval(watch_csp);
+                                probe(&w, "recorder_info", "settings_save");
+                                ms(800);
+                                let _ = w.eval("window.__TAURI_INTERNALS__.invoke('recorder_cancel')");
+                            } else { println!("[sec] no recorder bar"); }
+                        }
+                        Err(e) => println!("[sec] video commit FAILED {e:?}"),
+                    }
+                    ms(2500);
                     h.exit(0);
                 });
             }

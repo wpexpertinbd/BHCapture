@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../events";
 
 type Phase = "ready" | "recording" | "paused" | "finishing";
 type Info = {

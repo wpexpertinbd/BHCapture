@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../events";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type Info = { file: string; saved_to: string | null; note: string | null };
@@ -98,7 +98,7 @@ export function VideoWindow() {
     return () => window.removeEventListener("keydown", onKey);
   }, [asking, save]);
 
-  useEffect(() => { void getCurrentWindow().setTitle(info?.saved_to ? `BHCapture — ${info.saved_to.split("/").pop()}` : "BHCapture — Recording"); }, [info]);
+  useEffect(() => { void getCurrentWindow().setTitle(info?.saved_to ? `BHCapture — ${info.saved_to.split(/[\\/]/).pop()}` : "BHCapture — Recording"); }, [info]);
 
   if (error) return <div className="video"><div className="vd-error">{error}</div></div>;
   if (!info) return <div className="video" />;

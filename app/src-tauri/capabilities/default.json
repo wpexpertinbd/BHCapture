@@ -1,11 +1,9 @@
 {
   "identifier": "default",
-  "description": "Overlay windows need the event bus and the selector commands. Without this file the webview silently cannot call listen or invoke -- nothing errors, it just never happens.",
+  "description": "Every window needs the event bus (listen) and read-only window info. Without this file the webview silently cannot call listen or invoke -- nothing errors, it just never happens. App commands are gated per window in main.rs (command_allowed).",
   "windows": ["*"],
   "permissions": [
-    "core:default",
     "core:event:default",
-    "core:window:default",
-    "core:webview:default"
+    "core:window:default"
   ]
 }

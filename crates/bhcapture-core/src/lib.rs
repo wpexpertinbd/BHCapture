@@ -13,6 +13,7 @@ pub mod image;
 pub mod level;
 pub mod mp4_writer;
 pub mod naming;
+pub mod private_file;
 pub mod record;
 pub mod resample;
 pub mod settings;

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../events";
 import { Loupe, LoupeData } from "./Loupe";
 
 /** What this overlay needs to turn local mouse coordinates into global desktop ones. */

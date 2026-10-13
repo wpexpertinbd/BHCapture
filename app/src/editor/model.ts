@@ -111,7 +111,9 @@ export function render(ctx: CanvasRenderingContext2D, base: CanvasImageSource, W
   for (const s of shapes.filter((s) => s.kind === "pixelate")) {
     const b = box(s);
     if (b.w < 1 || b.h < 1) continue;
-    const block = Math.max(6 * k, Math.min(b.w, b.h) / 12);
+    // Coarse on purpose: small blocks over text can be partly reversed (depixelation tools match
+    // the block averages against a known font). 12 points minimum, or a sixth of the box.
+    const block = Math.max(12 * k, Math.min(b.w, b.h) / 6);
     const tw = Math.max(1, Math.round(b.w / block)), th = Math.max(1, Math.round(b.h / block));
     const small = new OffscreenCanvas(tw, th);
     const sc = small.getContext("2d")!;

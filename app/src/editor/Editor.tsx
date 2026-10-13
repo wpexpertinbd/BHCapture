@@ -1,7 +1,7 @@
 import { isLineKind, squared } from "./model";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../events";
 import { COLORS, WIDTHS, Shape, Tool, box, hitTest, moved, render } from "./model";
 
 type Format = "jpeg" | "png" | "webp" | "tiff" | "bmp" | "gif";

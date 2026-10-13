@@ -447,20 +447,31 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
 }
 
 /// Call `f(x, y, right_button)` for every mouse-down anywhere (global logical points).
+///
+/// Returns only once the hook thread has its message queue and has published its id (or failed), so
+/// an `unwatch_clicks` straight after can always reach it -- otherwise the thread could store its id
+/// after the stop, keep the system-wide hook installed, and be orphaned (audit 2026-10-13).
 pub fn watch_clicks(f: impl Fn(f64, f64, bool) + Send + Sync + 'static) {
     unwatch_clicks();
     *CLICK_WATCHER.lock().unwrap() = Some(Box::new(f));
-    std::thread::spawn(|| unsafe {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_NOREMOVE};
+        // Create this thread's message queue first, so a WM_QUIT posted the moment the id is
+        // published cannot be lost.
+        let mut msg = MSG::default();
+        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
         let module = GetModuleHandleW(None).ok();
         let hook = match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module.map(|m| m.into()), 0) {
             Ok(h) => h,
-            Err(e) => { eprintln!("[rec] click highlight unavailable: {e}"); return; }
+            Err(e) => { eprintln!("[rec] click highlight unavailable: {e}"); let _ = ready_tx.send(()); return; }
         };
         HOOK_THREAD.store(GetCurrentThreadId(), Ordering::SeqCst);
-        let mut msg = MSG::default();
+        let _ = ready_tx.send(());
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
         let _ = UnhookWindowsHookEx(hook);
     });
+    let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(2));
 }
 
 /// Stop reporting clicks.

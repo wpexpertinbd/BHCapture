@@ -371,7 +371,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
     };
     let dir = recordings_dir();
     let stem = pattern.render(local_stamp(), &Fields { width: px.0, height: px.1, ..Default::default() });
-    let file = unique_path(&dir, &stem, "mp4", &|p| p.exists());
+    let file = unique_path(&dir, &stem, "mp4", &|p| bhcapture_core::private_file::occupied(p));
 
     // Click highlight: the overlay that already outlines the region draws the rings, and it is let
     // INTO the picture (the rest of the app stays out).
@@ -406,6 +406,8 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
     if include_window.is_some() {
         let (a, label) = (app.clone(), overlay.clone());
         let _ = app.run_on_main_thread(move || {
+            // A stop that landed before this ran has already queued end_take: do not arm after it.
+            if !SESSION.lock().unwrap().as_ref().map_or(false, |s| matches!(s.phase, Phase::Recording | Phase::Paused)) { return; }
             platform::watch_clicks(move |x, y, right| {
                 // Not while paused: a ring appearing in nothing would only confuse the video.
                 if SESSION.lock().unwrap().as_ref().map_or(false, |s| s.phase == Phase::Recording) {
@@ -747,10 +749,10 @@ pub(crate) async fn video_save(app: tauri::AppHandle, window: tauri::WebviewWind
         }
     } else {
         let _ = std::fs::create_dir_all(&out_dir);
-        unique_path(&out_dir, &stem, "mp4", &|p| p.exists())
+        unique_path(&out_dir, &stem, "mp4", &|p| bhcapture_core::private_file::occupied(p))
     };
-    if dest == src { return Err(CommitError::Failed("Choose a folder other than BHCapture's working folder.".into())); }
-    copy_private(&src, &dest).map_err(|e| CommitError::Failed(format!("Could not save the recording: {e}")))?;
+    if same_file(&dest, &src) { return Err(CommitError::Failed("Choose a folder other than BHCapture's working folder.".into())); }
+    bhcapture_core::private_file::copy_private(&src, &dest).map_err(|e| CommitError::Failed(format!("Could not save the recording: {e}")))?;
     videos(|v| if let Some(d) = v.get_mut(&id) { d.saved_to = Some(dest.clone()); });
     println!("[record] {} saved to {}", window.label(), dest.display());
     Ok(dest.display().to_string())
@@ -792,10 +794,12 @@ pub(crate) async fn video_export(app: tauri::AppHandle, window: tauri::WebviewWi
         let name = dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         dest.set_file_name(format!("{name}.{ext}"));
     }
-    if dest == src { return Err(CommitError::Failed("Choose a folder other than BHCapture's working folder.".into())); }
-    let tmp = dest.with_file_name(format!(".{}.bhc-partial.{ext}",
-        dest.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()));
-
+    if same_file(&dest, &src) { return Err(CommitError::Failed("Choose a folder other than BHCapture's working folder.".into())); }
+    // Built in our own private working folder (0700) and moved into place only when complete: a
+    // failed export never leaves a half file under the real name, and the encoders (which create
+    // their output themselves, under the umask) never write into a folder others may read.
+    let tmp = recordings_dir().join(format!("{id}-{}.exporting.{ext}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
     let (win, k) = (window.clone(), kind.clone());
     let report = move |p: f64| { let _ = win.emit_to(win.label(), "video-export-progress",
         ExportProgress { percent: (p.clamp(0.0, 1.0) * 100.0) as u32, kind: k.clone() }); true };
@@ -814,9 +818,7 @@ pub(crate) async fn video_export(app: tauri::AppHandle, window: tauri::WebviewWi
         let _ = std::fs::remove_file(&tmp);
         return Err(CommitError::Failed(format!("Export failed: {e}")));
     }
-    #[cfg(unix)]
-    { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)); }
-    std::fs::rename(&tmp, &dest).map_err(|e| { let _ = std::fs::remove_file(&tmp);
+    bhcapture_core::private_file::move_private(&tmp, &dest).map_err(|e| { let _ = std::fs::remove_file(&tmp);
         CommitError::Failed(format!("Could not save the export: {e}")) })?;
     // The user has their copy, in the format they chose: closing no longer needs to ask.
     videos(|v| if let Some(d) = v.get_mut(&id) { d.saved_to = Some(dest.clone()); });
@@ -848,12 +850,11 @@ fn export_gif(src: &Path, dst: &Path, report: &mut dyn FnMut(f64) -> bool) -> Re
     Ok(())
 }
 
-/// Copy readable only by this user (0600), like every capture (see `write_private`).
-fn copy_private(src: &Path, dest: &Path) -> std::io::Result<()> {
-    std::fs::copy(src, dest)?;
-    #[cfg(unix)]
-    { use std::os::unix::fs::PermissionsExt; std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o600))?; }
-    Ok(())
+/// Whether two paths name the same file, however they are spelled (`..`, symlinked folders, case on
+/// a case-insensitive volume is left to the OS: the parent is canonicalised, the name compared).
+fn same_file(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| p.parent().and_then(|d| std::fs::canonicalize(d).ok()).map(|d| d.join(p.file_name().unwrap_or_default()));
+    a == b || matches!((canon(a), canon(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Close for good (the page has already asked about an unsaved recording). Deletes the working copy:
@@ -873,8 +874,11 @@ pub(crate) fn video_close(window: tauri::WebviewWindow) -> Result<(), String> {
 pub(crate) fn reopen_leftovers(app: &tauri::AppHandle) {
     let dir = recordings_dir();
     let Ok(rd) = std::fs::read_dir(&dir) else { return };
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd.flatten()
-        .map(|e| e.path())
+    let entries: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    // An export cut off by a quit is only a by-product: the recording it came from is still here.
+    for p in entries.iter().filter(|p| p.to_string_lossy().contains(".exporting.")) { let _ = std::fs::remove_file(p); }
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries.into_iter()
+        .filter(|p| !p.to_string_lossy().contains(".exporting."))
         .filter(|p| p.extension().map_or(false, |e| e == "mp4"))
         // A half-made mix is a by-product; the recording itself is the file next to it.
         .filter(|p| !p.to_string_lossy().ends_with(".mixing.mp4"))

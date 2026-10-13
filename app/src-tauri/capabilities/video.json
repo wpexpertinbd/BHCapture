@@ -1,0 +1,8 @@
+{
+  "identifier": "video",
+  "description": "Playback windows name themselves after the saved file.",
+  "windows": ["video-*"],
+  "permissions": [
+    "core:window:allow-set-title"
+  ]
+}

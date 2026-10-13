@@ -145,7 +145,9 @@ static float rec_peak(CMSampleBufferRef sb) {
     if (CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(sb, NULL, abl, need, NULL, NULL,
             kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment, &src) != noErr) { free(abl); return NULL; }
     size_t total = (size_t)frames * ch * sizeof(float);
-    float *data = malloc(total);
+    /* calloc: a buffer shorter than `frames`, or fewer buffers than channels, must leave silence,
+       not whatever was in the heap. */
+    float *data = calloc(1, total);
     BOOL ok = data != NULL;
     if (ok && planar) {
         for (UInt32 c = 0; c < ch && c < abl->mNumberBuffers; c++) {
