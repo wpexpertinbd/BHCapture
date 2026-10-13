@@ -9,13 +9,15 @@
 
 use std::sync::{Arc, Mutex};
 
+mod recording;
+
 use bhcapture_capture::{macos::MacCapturer, CaptureError, Capturer, Snapshot};
 use bhcapture_core::geom::{DisplayId, DisplayLayout, LogPoint, LogRect};
 use bhcapture_core::image::Frame;
 use bhcapture_core::naming::{Fields, Pattern, Stamp, unique_path};
 use bhcapture_core::settings::{LoadOutcome, Settings, SettingsStore};
 use bhcapture_core::snap::{snap_window, Candidate};
-use bhcapture_core::hotkey::{Chord, Key, DEFAULT_REGION_HOTKEY};
+use bhcapture_core::hotkey::{Chord, Key, DEFAULT_RECORD_HOTKEY, DEFAULT_REGION_HOTKEY};
 use bhcapture_core::export::{self, ImageFormat, ALL_FORMATS};
 use base64::Engine;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -199,11 +201,27 @@ fn settings_save(state: tauri::State<Arc<AppState>>, next: Settings) -> Result<S
         }
     }
 
+    let wanted = state.settings.lock().unwrap().get().record_hotkey.clone();
+    let mut record_changed = false;
+    if wanted != previous.record_hotkey {
+        match set_record_hotkey(&wanted) {
+            Ok(_) => record_changed = true,
+            Err(e) => {
+                notes.push(format!("{e}. Kept {}.", previous.record_hotkey));
+                let mut st = state.settings.lock().unwrap();
+                let mut s = st.get().clone();
+                s.record_hotkey = previous.record_hotkey.clone();
+                st.set(s);
+            }
+        }
+    }
+
     // Report a refused save honestly, and roll back everything applied above, so what is running
     // always matches what is on disk.
     if let Err(e) = state.settings.lock().unwrap().save() {
         state.settings.lock().unwrap().set(previous.clone());
         if hotkey_changed { let _ = set_region_hotkey(&previous.region_hotkey); }
+        if record_changed { let _ = set_record_hotkey(&previous.record_hotkey); }
         return Err(e.to_string());
     }
     apply_settings(&state);
@@ -238,6 +256,7 @@ fn sync_dock(app: &tauri::AppHandle, closing: Option<&str>) {
     {
         let any_window = app.webview_windows().iter().any(|(label, w)| {
             !label.starts_with(OVERLAY_PREFIX)
+                && label != recording::HUD   // the recording bar is a tool surface, like the overlays
                 && Some(label.as_str()) != closing
                 && w.is_visible().unwrap_or(false)
         });
@@ -284,7 +303,10 @@ fn release_frozen(state: &AppState) {
 }
 
 /// The one way the selector opens, so the hotkey, the tray and the tests behave identically.
-fn open_selector(app: &tauri::AppHandle) {
+/// `video` picks what Enter does: open the capture in the editor, or set up a recording.
+fn open_selector(app: &tauri::AppHandle, video: bool) {
+    recording::VIDEO_MODE.store(video, Ordering::SeqCst);
+    let _ = app.emit("selector-mode", if video { "video" } else { "image" });
     let state = app.state::<Arc<AppState>>().inner().clone();
     *state.drag.lock().unwrap() = None;
     release_frozen(&state);
@@ -503,6 +525,9 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, _save_as: bool) -> Resu
     };
     if rect.is_empty() {
         return Err(CommitError::Empty(NOTHING_SELECTED.into()));
+    }
+    if recording::VIDEO_MODE.load(Ordering::SeqCst) {
+        return recording::prepare(app, state, rect);
     }
 
     // Test hook so the permission UI can be exercised without revoking a real grant.
@@ -899,11 +924,18 @@ fn handle_selector_key(app: &tauri::AppHandle, key: SelectorKey) {
 // The capture shortcut, from settings.
 // ---------------------------------------------------------------------------------------------
 
-/// Id of the currently registered capture shortcut, so the event loop knows which press is which.
-static REGION_HOTKEY_ID: AtomicU32 = AtomicU32::new(0);
-static REGION_HOTKEY: Mutex<Option<HotKey>> = Mutex::new(None);
+/// One user-set global shortcut: its registered id (so the event loop knows which press is which),
+/// the chord, and the tray item whose label shows it.
+struct HotkeySlot {
+    id: AtomicU32,
+    key: Mutex<Option<HotKey>>,
+    tray: &'static Mutex<Option<MainThreadOnly<MenuItem<tauri::Wry>>>>,
+    what: &'static str,
+}
 /// The tray's "Capture Region" item, so its shortcut label follows the setting.
 static TRAY_CAPTURE_ITEM: Mutex<Option<MainThreadOnly<MenuItem<tauri::Wry>>>> = Mutex::new(None);
+static REGION_SLOT: HotkeySlot = HotkeySlot { id: AtomicU32::new(0), key: Mutex::new(None), tray: &TRAY_CAPTURE_ITEM, what: "capture" };
+static RECORD_SLOT: HotkeySlot = HotkeySlot { id: AtomicU32::new(0), key: Mutex::new(None), tray: &recording::TRAY_RECORD_ITEM, what: "record" };
 
 fn to_platform_hotkey(c: &Chord) -> HotKey {
     let mut m = Modifiers::empty();
@@ -929,22 +961,25 @@ fn to_platform_hotkey(c: &Chord) -> HotKey {
 ///
 /// Registers the new chord before releasing the old one, so a chord another app already holds
 /// leaves the user with their previous, working shortcut rather than with none.
-fn set_region_hotkey(spec: &str) -> Result<String, String> {
+fn set_region_hotkey(spec: &str) -> Result<String, String> { set_slot_hotkey(&REGION_SLOT, spec) }
+fn set_record_hotkey(spec: &str) -> Result<String, String> { set_slot_hotkey(&RECORD_SLOT, spec) }
+
+fn set_slot_hotkey(slot: &HotkeySlot, spec: &str) -> Result<String, String> {
     let chord = Chord::parse(spec).map_err(|e| e.to_string())?;
     let hk = to_platform_hotkey(&chord);
     let guard = HOTKEY_MANAGER.lock().unwrap();
     let m = guard.as_ref().ok_or("hotkey manager not ready")?;
-    let mut current = REGION_HOTKEY.lock().unwrap();
+    let mut current = slot.key.lock().unwrap();
     if current.map(|c| c.id()) == Some(hk.id()) { return Ok(chord.display()); }
     m.0.register(hk).map_err(|e| format!(
         "{} could not be registered (another app may already use it): {e}", chord.display()))?;
     if let Some(old) = current.take() { let _ = m.0.unregister(old); }
     *current = Some(hk);
-    REGION_HOTKEY_ID.store(hk.id(), Ordering::SeqCst);
-    if let Some(item) = TRAY_CAPTURE_ITEM.lock().unwrap().as_ref() {
+    slot.id.store(hk.id(), Ordering::SeqCst);
+    if let Some(item) = slot.tray.lock().unwrap().as_ref() {
         let _ = item.0.set_accelerator(Some(chord.display().as_str()));
     }
-    println!("[hotkey] capture shortcut is {}", chord.display());
+    println!("[hotkey] {} shortcut is {}", slot.what, chord.display());
     Ok(chord.display())
 }
 
@@ -1011,7 +1046,8 @@ fn route_menu_event(app: &tauri::AppHandle, id: &str) {
     if id == "app:settings" { let _ = open_settings(app.clone()); return; }
     let Some(action) = id.strip_prefix("ed:") else { return };
     let focused = app.webview_windows().into_iter()
-        .find(|(l, w)| l.starts_with(EDITOR_PREFIX) && w.is_focused().unwrap_or(false));
+        .find(|(l, w)| (l.starts_with(EDITOR_PREFIX) || l.starts_with(recording::VIDEO_PREFIX))
+                     && w.is_focused().unwrap_or(false));
     if let Some((label, _)) = focused {
         let _ = app.emit_to(label.as_str(), "editor-menu", action.to_string());
     }
@@ -1195,12 +1231,14 @@ fn main() {
                 // An editor holds a capture that may not be saved anywhere yet. Closing it with the
                 // red button must ASK, which the page does (its own dialog: window.confirm is a no-op
                 // that returns true in a Tauri webview). The page then calls editor_close.
-                tauri::WindowEvent::CloseRequested { api, .. } if window.label().starts_with(EDITOR_PREFIX) => {
+                tauri::WindowEvent::CloseRequested { api, .. }
+                    if window.label().starts_with(EDITOR_PREFIX) || window.label().starts_with(recording::VIDEO_PREFIX) => {
                     api.prevent_close();
                     let _ = window.emit_to(window.label(), "editor-close-requested", ());
                 }
                 tauri::WindowEvent::Destroyed => {
                     // Free the pixels the moment their window is gone.
+                    if let Ok(id) = recording::video_id_of(window.label()) { recording::forget_video(id); }
                     if let Ok(id) = editor_id_of(window.label()) {
                         if let Some(st) = window.app_handle().try_state::<Arc<AppState>>() {
                             st.editors.lock().unwrap().remove(&id);
@@ -1216,7 +1254,10 @@ fn main() {
             selection_nudge, selection_cancel, selection_commit,
             snap_at, loupe, selection_set_rect, open_privacy_settings, relaunch_app, report_overlay_focus,
             settings_get, settings_save, settings_pick_dir, open_settings,
-            editor_info, editor_pixels, editor_save, editor_copy, editor_close, editor_format_changed
+            editor_info, editor_pixels, editor_save, editor_copy, editor_close, editor_format_changed,
+            recording::recorder_info, recording::recorder_option, recording::recorder_start,
+            recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel,
+            recording::video_info, recording::video_save, recording::video_close
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -1239,10 +1280,12 @@ fn main() {
             // Tray: without it there is no way to reach settings, since every window is an
             // overlay that hides itself.
             let cap_i = MenuItem::with_id(app, "capture", "Capture Region", true, None::<&str>)?;
+            let rec_i = MenuItem::with_id(app, "record", "Record Video", true, None::<&str>)?;
             let set_i = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit BHCapture", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&cap_i, &set_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&cap_i, &rec_i, &PredefinedMenuItem::separator(app)?, &set_i, &quit_i])?;
             *TRAY_CAPTURE_ITEM.lock().unwrap() = Some(MainThreadOnly(cap_i.clone()));
+            *recording::TRAY_RECORD_ITEM.lock().unwrap() = Some(MainThreadOnly(rec_i.clone()));
             let tray_img = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
             let tray = TrayIconBuilder::new()
                 .icon(tray_img)
@@ -1252,7 +1295,8 @@ fn main() {
                 .menu(&menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(move |app, ev| match ev.id().as_ref() {
-                    "capture" => open_selector(app),
+                    "capture" => open_selector(app, false),
+                    "record" => recording::record_shortcut(app),
                     "settings" => { let _ = open_settings(app.clone()); }
                     "quit" => app.exit(0),
                     _ => {}
@@ -1271,6 +1315,21 @@ fn main() {
                     eprintln!("[hotkey] the default could not be registered either: {e2}");
                 }
             }
+            let wanted = state.settings.lock().unwrap().get().record_hotkey.clone();
+            if let Err(e) = set_record_hotkey(&wanted) {
+                eprintln!("[hotkey] {e}; falling back to {DEFAULT_RECORD_HOTKEY}");
+                if let Err(e2) = set_record_hotkey(DEFAULT_RECORD_HOTKEY) {
+                    eprintln!("[hotkey] the default record shortcut could not be registered either: {e2}");
+                }
+            }
+            // Recordings play from the private working folder, and ONLY that folder is exposed to
+            // the web views' asset protocol (not $HOME, not the save folder).
+            if let Err(e) = app.asset_protocol_scope().allow_directory(recording::recordings_dir(), false) {
+                eprintln!("[record] could not allow playback from the recordings folder: {e}");
+            }
+            // A recording left over from a crash or a quit is reopened rather than silently lost.
+            let h_left = handle.clone();
+            std::thread::spawn(move || recording::reopen_leftovers(&h_left));
             println!("BHCapture ready.");
 
             let h = handle.clone();
@@ -1278,9 +1337,14 @@ fn main() {
                 let rx = GlobalHotKeyEvent::receiver();
                 while let Ok(ev) = rx.recv() {
                     if ev.state != global_hotkey::HotKeyState::Pressed { continue; }
-                    if ev.id == REGION_HOTKEY_ID.load(Ordering::SeqCst) {
+                    if ev.id == REGION_SLOT.id.load(Ordering::SeqCst) {
                         println!("[hotkey] pressed");
-                        open_selector(&h);
+                        // While a recording is set up or running, the capture shortcut must not open
+                        // a second selector over it.
+                        if !recording::busy() { open_selector(&h, false); }
+                    } else if ev.id == RECORD_SLOT.id.load(Ordering::SeqCst) {
+                        println!("[hotkey] record pressed");
+                        recording::record_shortcut(&h);
                     } else if let Some((_, key)) = selector_keys().iter().find(|(k, _)| k.id() == ev.id) {
                         handle_selector_key(&h, *key);
                     }
@@ -1300,7 +1364,7 @@ fn main() {
                         let r = d.rect(); (r.min_x(), r.min_y(), r.size.w, r.size.h) });
                     ms(5000); // the harness puts another app in front meanwhile
                     // Open the way a hotkey does, so the keys are armed exactly as in real use.
-                    open_selector(&h);
+                    open_selector(&h, false);
                     ms(1000);
                     let w = h.get_webview_window("overlay-1").expect("overlay-1");
                     let _ = w.eval(&js("mousedown", 300.0, 300.0));
@@ -1320,7 +1384,7 @@ fn main() {
                         st.drag.lock().unwrap().is_none(), w.is_visible().unwrap_or(true),
                         SELECTOR_KEYS_ARMED.load(Ordering::SeqCst));
                     // A second session, dismissed with Esc, to prove the keys are released again.
-                    open_selector(&h);
+                    open_selector(&h, false);
                     ms(800);
                     println!("[keys] reopened; armed = {}", SELECTOR_KEYS_ARMED.load(Ordering::SeqCst));
                     println!("[keys] HOLD-4");          // harness sends: Esc
@@ -1341,7 +1405,7 @@ fn main() {
                          el.dispatchEvent(new MouseEvent('{t}',{{bubbles:true,cancelable:true,\
                          clientX:{x},clientY:{y},button:0}}));}})()");
                     ms(2500);
-                    open_selector(&h);
+                    open_selector(&h, false);
                     ms(1000);
                     let ov = h.get_webview_window("overlay-1").expect("overlay-1");
                     let _ = ov.eval(&js("mousedown", 200.0, 150.0));
@@ -1408,7 +1472,7 @@ fn main() {
                     // Wait: the harness brings ANOTHER app to the front, which is exactly the state a
                     // hotkey press starts from.
                     ms(5000);
-                    open_selector(&h);
+                    open_selector(&h, false);
                     ms(900);
                     let w = h.get_webview_window("overlay-1").expect("overlay-1");
                     println!("[focus] selector opened; asking the page itself whether it has focus");
@@ -1430,7 +1494,7 @@ fn main() {
                          clientX:{x},clientY:{y},button:0}}));}})()");
                     let enter = "window.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true}))";
                     ms(1500);
-                    open_selector(&h);
+                    open_selector(&h, false);
                     ms(1200);
                     let w = h.get_webview_window("overlay-1").expect("overlay-1");
                     println!("[notice] visible 1.2s after open_selector = {:?}", w.is_visible());
@@ -1499,7 +1563,7 @@ fn main() {
                         let r = d.rect(); (r.min_x(), r.min_y(), r.size.w, r.size.h) });
 
                     std::thread::sleep(std::time::Duration::from_millis(1500));
-                    open_selector(&h);
+                    open_selector(&h, false);
                     wait_ready(&st);
                     let w = h.get_webview_window("overlay-1").expect("overlay-1");
 
@@ -1528,7 +1592,7 @@ fn main() {
 
                     // --- a drag must stay freeform ---
                     std::thread::sleep(std::time::Duration::from_millis(600));
-                    open_selector(&h);
+                    open_selector(&h, false);
                     wait_ready(&st);
                     let _ = w.eval(&js("mousedown", 200.0, 200.0));
                     for i in 1..=8 {
@@ -1635,6 +1699,10 @@ fn main() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running BHCapture");
+        .build(tauri::generate_context!())
+        .expect("error while building BHCapture")
+        .run(|_app, event| {
+            // Quitting mid-recording finishes the file, so it is playable and offered next launch.
+            if let tauri::RunEvent::Exit = event { recording::finish_on_exit(); }
+        });
 }

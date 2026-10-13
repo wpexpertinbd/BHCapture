@@ -41,6 +41,10 @@ export function Overlay() {
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  // What Enter starts: an image for the editor, or a recording.
+  const [mode, setMode] = useState<"image" | "video">("image");
+  // While recording, this overlay only outlines the region (the mouse passes through it).
+  const [frame, setFrame] = useState<Rect | null>(null);
 
   const dragRef = useRef(false);
   const downAt = useRef<{ x: number; y: number } | null>(null);
@@ -71,6 +75,12 @@ export function Overlay() {
       if ((e.payload as { rect: Rect | null }).rect === null && !dragRef.current) setSnap(null);
     });
     return () => { un.then((f) => f()); };
+  }, []);
+
+  useEffect(() => {
+    const a = listen<"image" | "video">("selector-mode", (e) => { setMode(e.payload); setFrame(null); });
+    const b = listen<Rect | null>("record-frame", (e) => setFrame(e.payload));
+    return () => { a.then((f) => f()); b.then((f) => f()); };
   }, []);
 
   // A capture started by a global key (Enter pressed while another app is in front) has no promise
@@ -194,7 +204,12 @@ export function Overlay() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  if (!info) return <div className="scrim-idle" />;
+  if (!info) return frame ? <div /> : <div className="scrim-idle" />;
+
+  if (frame) {
+    const f = { x: frame[0] - info.origin_x, y: frame[1] - info.origin_y, w: frame[2], h: frame[3] };
+    return <div className="rec-frame" style={{ left: f.x - 3, top: f.y - 3, width: f.w + 6, height: f.h + 6 }} />;
+  }
 
   // Global -> this overlay's local coordinates.
   const toLocal = (r: Rect) => ({ x: r[0] - info.origin_x, y: r[1] - info.origin_y, w: r[2], h: r[3] });
@@ -270,8 +285,8 @@ export function Overlay() {
 
       <div className="hint" style={{ bottom: 28 }}>
         {local
-          ? <><kbd>Enter</kbd> save <kbd>&#8679;Enter</kbd> save as&hellip; <kbd>&larr;&uarr;&rarr;&darr;</kbd> nudge <kbd>Esc</kbd> cancel</>
-          : <>Click a window or drag any size &nbsp;<kbd>Esc</kbd> cancel</>}
+          ? <><kbd>Enter</kbd> {mode === "video" ? "record this area" : "edit"} <kbd>&larr;&uarr;&rarr;&darr;</kbd> nudge <kbd>Esc</kbd> cancel</>
+          : <>{mode === "video" ? "Record: click a window or drag any size" : "Click a window or drag any size"} &nbsp;<kbd>Esc</kbd> cancel</>}
       </div>
     </div>
   );

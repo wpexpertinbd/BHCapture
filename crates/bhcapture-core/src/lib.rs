@@ -9,5 +9,6 @@ pub mod geom;
 pub mod hotkey;
 pub mod image;
 pub mod naming;
+pub mod record;
 pub mod settings;
 pub mod snap;

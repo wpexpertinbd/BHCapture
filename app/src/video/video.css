@@ -1,0 +1,28 @@
+/* Playback window. Shares the editor's tokens; every class is prefixed `vd-`. The modal reuses
+   the editor's `ed-modal*` classes, which need the editor's colour tokens defined here too. */
+.video {
+  --ed-bg: #ececef; --ed-chrome: #f7f7f9; --ed-fg: #1c1c1e; --ed-muted: #6e6e76;
+  --ed-line: #d6d6dc; --ed-btn: #ffffff; --ed-accent: #0a84ff;
+  color-scheme: light;
+  position: fixed; inset: 0; display: flex; flex-direction: column;
+  background: var(--ed-bg); color: var(--ed-fg);
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  user-select: none; -webkit-user-select: none; cursor: default;
+}
+@media (prefers-color-scheme: dark) {
+  .video {
+    --ed-bg: #1e1e21; --ed-chrome: #2a2a2e; --ed-fg: #ececf1; --ed-muted: #9a9aa4;
+    --ed-line: #3a3a3f; --ed-btn: #36363b; --ed-accent: #3b8bff;
+    color-scheme: dark;
+  }
+}
+.vd-stage { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; background: #000; }
+.vd-player { max-width: 100%; max-height: 100%; outline: none; }
+.vd-status {
+  display: flex; align-items: center; gap: 14px; padding: 6px 12px;
+  background: var(--ed-chrome); border-top: 1px solid var(--ed-line); color: var(--ed-muted); font-size: 12px;
+}
+.vd-msg { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vd-note { padding: 8px 12px; background: #fff4d6; color: #5a4300; border-bottom: 1px solid #e8d49a; }
+@media (prefers-color-scheme: dark) { .vd-note { background: #3a3218; color: #f3dc9a; border-color: #5a4c22; } }
+.vd-error { padding: 40px; }

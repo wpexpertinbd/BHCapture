@@ -6,6 +6,9 @@ use std::sync::{Arc, Mutex};
 use bhcapture_core::geom::{Display, DisplayId, DisplayLayout, LogRect, PhysSize, Scale};
 use bhcapture_core::image::Frame;
 
+mod rec;
+pub use rec::{microphone_supported, mix_audio_tracks, MacRecorder};
+
 use crate::{CaptureError, Capturer, Targets, WindowId, WindowInfo};
 
 const ERRCAP: i32 = 512;

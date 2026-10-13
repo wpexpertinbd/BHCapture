@@ -10,6 +10,7 @@ use bhcapture_core::image::{Frame, FrameError};
 
 pub mod error;
 pub mod snapshot;
+pub mod record;
 pub use error::CaptureError;
 pub use snapshot::Snapshot;
 

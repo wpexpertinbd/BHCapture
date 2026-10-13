@@ -26,6 +26,9 @@ pub struct Chord {
 }
 
 pub const DEFAULT_REGION_HOTKEY: &str = "Ctrl+Cmd+4";
+/// Start a screen recording. The same family as the capture shortcut, one key over, and likewise
+/// not one macOS owns (⇧⌘5 is the system's; ⌃⌘5 is not).
+pub const DEFAULT_RECORD_HOTKEY: &str = "Ctrl+Cmd+5";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HotkeyError {

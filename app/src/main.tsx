@@ -4,6 +4,8 @@ import { App } from "./App";
 import "./overlay/overlay.css";
 import "./settings/settings.css";
 import "./editor/editor.css";
+import "./recorder/recorder.css";
+import "./video/video.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::export::{ImageFormat, DEFAULT_JPEG_QUALITY};
-use crate::hotkey::{Chord, DEFAULT_REGION_HOTKEY};
+use crate::hotkey::{Chord, DEFAULT_RECORD_HOTKEY, DEFAULT_REGION_HOTKEY};
 use crate::naming::{Pattern, DEFAULT_PATTERN};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -48,6 +48,16 @@ pub struct Settings {
     pub image_format: ImageFormat,
     /// 1-100; only JPEG uses it.
     pub jpeg_quality: u8,
+    /// Shortcut that starts a screen recording (selector first, then the control bar).
+    pub record_hotkey: String,
+    /// Recording options, remembered from the control bar's toggles.
+    pub record_cursor: bool,
+    pub record_system_audio: bool,
+    /// Off by default: turning it on raises macOS's Microphone permission prompt.
+    pub record_microphone: bool,
+    pub record_countdown: bool,
+    /// 1-60.
+    pub record_fps: u32,
 }
 
 impl Default for Settings {
@@ -63,6 +73,12 @@ impl Default for Settings {
             // JPEG by default: much smaller files for screenshots (Benjamin, 2026-10-13).
             image_format: ImageFormat::Jpeg,
             jpeg_quality: DEFAULT_JPEG_QUALITY,
+            record_hotkey: DEFAULT_RECORD_HOTKEY.to_string(),
+            record_cursor: true,
+            record_system_audio: true,
+            record_microphone: false,
+            record_countdown: true,
+            record_fps: 30,
         }
     }
 }
@@ -101,6 +117,25 @@ impl Settings {
                     self.region_hotkey, DEFAULT_REGION_HOTKEY));
                 self.region_hotkey = DEFAULT_REGION_HOTKEY.to_string();
             }
+        }
+        match Chord::parse(&self.record_hotkey) {
+            Ok(c) => self.record_hotkey = c.display(),
+            Err(e) => {
+                fixed.push(format!("record shortcut {:?} was not used: {e}. Reset to {}",
+                    self.record_hotkey, DEFAULT_RECORD_HOTKEY));
+                self.record_hotkey = DEFAULT_RECORD_HOTKEY.to_string();
+            }
+        }
+        // One chord cannot start two things. The capture shortcut is the older one, so it keeps it.
+        if self.record_hotkey == self.region_hotkey {
+            let fallback = if self.region_hotkey == DEFAULT_RECORD_HOTKEY { DEFAULT_REGION_HOTKEY } else { DEFAULT_RECORD_HOTKEY };
+            fixed.push(format!("record shortcut {} is already the capture shortcut; reset to {fallback}", self.record_hotkey));
+            self.record_hotkey = fallback.to_string();
+            if self.record_hotkey == self.region_hotkey { self.record_hotkey = DEFAULT_RECORD_HOTKEY.to_string(); }
+        }
+        if !(1..=60).contains(&self.record_fps) {
+            fixed.push(format!("recording frame rate {} is outside 1-60; reset to 30", self.record_fps));
+            self.record_fps = 30;
         }
         fixed
     }

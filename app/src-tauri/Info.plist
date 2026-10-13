@@ -6,6 +6,10 @@
        overlay that hides itself or the settings window, reached from the tray. -->
   <key>LSUIElement</key>
   <true/>
+  <!-- Shown by macOS the first time a recording includes the microphone. Without it, macOS
+       terminates the app the moment it touches the microphone. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>BHCapture records your microphone into screen recordings when you turn Microphone on.</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
 </dict>

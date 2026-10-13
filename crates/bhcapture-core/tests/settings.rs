@@ -197,3 +197,33 @@ fn jpeg_is_the_default_format() {
     assert_eq!(Settings::default().image_format, bhcapture_core::export::ImageFormat::Jpeg);
     assert_eq!(Settings::default().jpeg_quality, bhcapture_core::export::DEFAULT_JPEG_QUALITY);
 }
+
+#[test]
+fn record_defaults_and_repairs() {
+    let s = Settings::default();
+    // The default must itself pass the shortcut rules (no Option, not a macOS-owned chord).
+    let chord = bhcapture_core::hotkey::Chord::parse(bhcapture_core::hotkey::DEFAULT_RECORD_HOTKEY).expect("valid default");
+    let mut n = Settings::default();
+    assert!(n.normalise().is_empty(), "defaults must need no repair");
+    assert_eq!(n.record_hotkey, chord.display());
+    assert!(s.record_system_audio && !s.record_microphone && s.record_cursor && s.record_countdown);
+    assert_eq!(s.record_fps, 30);
+
+    // The record shortcut may not be the capture shortcut.
+    let mut t = Settings::default();
+    t.record_hotkey = t.region_hotkey.clone();
+    let fixed = t.normalise();
+    assert!(fixed.iter().any(|f| f.contains("already the capture shortcut")), "{fixed:?}");
+    assert_ne!(t.record_hotkey, t.region_hotkey);
+
+    // Frame rate out of range is repaired, not kept.
+    let mut u = Settings::default();
+    u.record_fps = 0;
+    u.normalise();
+    assert_eq!(u.record_fps, 30);
+
+    // An older settings file without the recording fields still loads, with defaults.
+    let old: Settings = serde_json::from_str(r#"{"pattern":"BHCapture {date} at {time}"}"#).unwrap();
+    assert_eq!(old.record_fps, 30);
+    assert!(old.record_system_audio);
+}

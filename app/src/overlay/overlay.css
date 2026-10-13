@@ -110,3 +110,11 @@ html, body, #root {
 }
 .notice button:hover { background: rgba(255, 255, 255, 0.18); }
 .notice button.primary { background: #3b82f6; border-color: #3b82f6; }
+
+/* While recording: a dashed outline just OUTSIDE the recorded area (so it is not in the picture even
+   if exclusion ever failed), and nothing else -- the overlay passes the mouse through. */
+.rec-frame {
+  position: fixed; box-sizing: border-box; pointer-events: none;
+  border: 2px dashed #e5484d; border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+}

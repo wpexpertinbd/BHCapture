@@ -1,0 +1,49 @@
+/* Recording control bar. Always dark, like a HUD: it floats over whatever is being recorded, so it
+   must read on any background. Every class is prefixed `rc-`. */
+.recorder {
+  position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+  font: 12.5px/1.2 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  color: #f2f2f5; cursor: default; color-scheme: dark;
+}
+.rc-bar {
+  display: flex; align-items: center; gap: 6px;
+  height: 46px; padding: 0 8px; margin-top: 4px; box-sizing: border-box;
+  border-radius: 12px; background: rgba(28, 28, 31, 0.94);
+  border: 1px solid rgba(255, 255, 255, 0.12); box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  white-space: nowrap;
+}
+.recorder button {
+  font: inherit; color: inherit; cursor: pointer; border: 0; border-radius: 8px;
+  height: 32px; padding: 0 10px; background: rgba(255, 255, 255, 0.08);
+}
+.recorder button:hover:not(:disabled) { background: rgba(255, 255, 255, 0.16); }
+.recorder button:disabled { opacity: 0.45; cursor: default; }
+.recorder .rc-rec, .recorder .rc-stop {
+  background: #e5484d; color: #fff; font-weight: 600; display: flex; align-items: center; gap: 7px;
+}
+.recorder .rc-rec:hover:not(:disabled), .recorder .rc-stop:hover:not(:disabled) { background: #f05c61; }
+.rc-dot { width: 11px; height: 11px; border-radius: 50%; background: #fff; }
+.rc-square { width: 10px; height: 10px; border-radius: 2px; background: #fff; }
+.rc-count { min-width: 128px; text-align: center; font-weight: 600; color: #ffb4b6; }
+.rc-toggle { display: flex; align-items: center; gap: 6px; }
+.rc-led { width: 7px; height: 7px; border-radius: 50%; background: rgba(255, 255, 255, 0.25); }
+.rc-toggle.on .rc-led { background: #3fd07a; box-shadow: 0 0 5px #3fd07a; }
+.rc-size { color: rgba(255, 255, 255, 0.55); font-variant-numeric: tabular-nums; padding: 0 4px; }
+.recorder .rc-x { width: 32px; padding: 0; }
+.rc-time {
+  min-width: 64px; display: flex; align-items: center; gap: 6px; justify-content: center;
+  font: 600 14px ui-monospace, SFMono-Regular, Menlo, monospace; font-variant-numeric: tabular-nums;
+}
+.rc-time.paused { color: #ffcc66; }
+.rc-live { width: 8px; height: 8px; border-radius: 50%; background: #e5484d; animation: rc-blink 1s infinite; }
+@keyframes rc-blink { 50% { opacity: 0.25; } }
+.rc-chan { display: flex; align-items: center; gap: 4px; font-size: 12px; }
+.rc-meter { display: inline-flex; gap: 2px; align-items: flex-end; height: 14px; }
+.rc-meter i { width: 3px; height: 100%; border-radius: 1px; background: rgba(255, 255, 255, 0.15); }
+.rc-meter i.on { background: #3fd07a; }
+.rc-meter i.hot { background: #ffb020; }
+.rc-meter.off { opacity: 0.35; }
+.rc-error {
+  margin-top: 4px; max-width: 620px; padding: 5px 10px; border-radius: 8px;
+  background: rgba(120, 20, 24, 0.95); color: #fff; font-size: 12px; white-space: normal;
+}

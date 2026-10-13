@@ -1,0 +1,54 @@
+/* BHCapture macOS screen recorder.
+ *
+ * ScreenCaptureKit delivers frames and audio; AVAssetWriter encodes them with the system's own
+ * H.264 (VideoToolbox, hardware) and AAC encoders and writes the MP4 AS IT GOES -- a recording is
+ * never held in memory. No ffmpeg, nothing bundled: decision 3, "native encoders, small bundle".
+ *
+ * Threading: every sample (video, system audio, microphone) arrives on ONE serial queue, so the
+ * writer is only ever touched from one place. The control calls below may come from any thread.
+ */
+#ifndef BHC_REC_H
+#define BHC_REC_H
+
+#include <stdint.h>
+
+typedef struct BhcRecorder BhcRecorder;
+
+typedef struct {
+    uint32_t    display_id;
+    /* Region in DISPLAY-LOCAL logical points (origin = the display's top-left). */
+    double      x, y, w, h;
+    int32_t     fps;            /* 1..60 */
+    int32_t     show_cursor;    /* 0/1 */
+    int32_t     system_audio;   /* 0/1 */
+    int32_t     microphone;     /* 0/1; needs macOS 15 -- refused below that rather than faked */
+    const char *path;           /* UTF-8; the .mp4 to create. Must not exist. */
+} BhcRecordOptions;
+
+typedef struct {
+    int32_t state;              /* BHC_REC_* */
+    double  seconds;            /* recorded time, pauses excluded */
+    int64_t frames;             /* video frames written */
+    int32_t width, height;      /* encoded size in pixels */
+    float   level_system;       /* 0..1 peak since the last status call */
+    float   level_mic;
+} BhcRecordStatus;
+
+#define BHC_REC_RECORDING 1
+#define BHC_REC_PAUSED    2
+#define BHC_REC_FAILED    3     /* stopped by an error (disk full, display gone...); call stop */
+
+/* Start recording. Returns NULL and fills `err` on failure. Blocks until capture has started. */
+BhcRecorder *bhc_rec_start(const BhcRecordOptions *opt, int32_t *code, char *err, int32_t errcap);
+void         bhc_rec_set_paused(BhcRecorder *r, int32_t paused);
+void         bhc_rec_status(BhcRecorder *r, BhcRecordStatus *out, char *err, int32_t errcap);
+/* Stop and finish the file. Returns BHC_OK when a playable file was written. Always frees `r`. */
+int32_t      bhc_rec_stop(BhcRecorder *r, char *err, int32_t errcap);
+
+/* Mix all audio tracks of src into one stereo track in dst (video copied as is). */
+int32_t      bhc_rec_mix_audio(const char *src_path, const char *dst_path, char *err, int32_t errcap);
+
+/* 1 when ScreenCaptureKit can record the microphone (macOS 15+). */
+int32_t      bhc_rec_mic_supported(void);
+
+#endif /* BHC_REC_H */

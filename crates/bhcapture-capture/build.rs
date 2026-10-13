@@ -9,15 +9,18 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/macos/sck.m");
     println!("cargo:rerun-if-changed=src/macos/sck.h");
+    println!("cargo:rerun-if-changed=src/macos/rec.m");
+    println!("cargo:rerun-if-changed=src/macos/rec.h");
 
     cc::Build::new()
         .file("src/macos/sck.m")
+        .file("src/macos/rec.m")
         .flag("-fobjc-arc")
         .flag("-mmacosx-version-min=14.0")
         .flag("-Wall")
         .compile("bhc_sck");
 
-    for fw in ["ScreenCaptureKit", "CoreGraphics", "CoreFoundation", "Foundation", "CoreMedia", "CoreVideo", "AppKit"] {
+    for fw in ["ScreenCaptureKit", "CoreGraphics", "CoreFoundation", "Foundation", "CoreMedia", "CoreVideo", "AppKit", "AVFoundation"] {
         println!("cargo:rustc-link-lib=framework={fw}");
     }
 }

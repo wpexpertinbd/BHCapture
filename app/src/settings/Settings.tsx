@@ -10,6 +10,12 @@ type SettingsData = {
   copy_to_clipboard: boolean;
   include_cursor: boolean;
   region_hotkey: string;
+  record_hotkey: string;
+  record_cursor: boolean;
+  record_system_audio: boolean;
+  record_microphone: boolean;
+  record_countdown: boolean;
+  record_fps: number;
   theme: Theme;
   image_format: "jpeg" | "png" | "webp" | "tiff" | "bmp" | "gif";
   jpeg_quality: number;
@@ -166,6 +172,16 @@ export function Settings() {
           Takes effect as soon as you save. Shortcuts macOS already uses (like <code>⇧⌘4</code>
           or <code>⌃⇧⌘4</code>) are refused because both would fire, and so is anything with
           Option, which macOS silently blocks. Type it as <code>Ctrl+Cmd+4</code> or <code>⌃⌘4</code>.
+        </div>
+      </div>
+
+      <div className="row">
+        <label className="title" htmlFor="rhk">Record video shortcut</label>
+        <input id="rhk" type="text" value={draft.record_hotkey}
+               onChange={(e) => set("record_hotkey", e.target.value)} />
+        <div className="help">
+          Opens the selector for a recording. Pressed again it starts the recording, and once more it
+          stops it. Same rules as above; it must differ from the capture shortcut.
         </div>
       </div>
 
