@@ -26,6 +26,7 @@ type SettingsData = {
   record_click_highlight: boolean;
   record_countdown: boolean;
   record_fps: number;
+  launch_at_login: boolean;
   camera_enabled: boolean; camera_device: string; camera_shape: string; camera_size: number;
   camera_corner: string; camera_mirror: boolean; camera_enhance: boolean; camera_background: string;
   camera_bg_color: string; camera_bg_image: string | null;
@@ -41,6 +42,8 @@ type SettingsView = {
   /** False when the on-disk file could not be read; saving is refused. */
   writable: boolean;
   notice: string | null;
+  /** Open at login is on but the OS is holding it back: where to allow it (macOS Login Items, Windows Startup apps). */
+  login_blocked: string | null;
 };
 
 const TOKENS = ["year", "month", "day", "hour", "minute", "second", "app", "title", "width", "height"];
@@ -195,6 +198,21 @@ export function Settings() {
           <option value="light">Light</option>
           <option value="dark">Dark</option>
         </select>
+      </div>
+
+      <div className="row">
+        <label className="check">
+          <input type="checkbox" checked={draft.launch_at_login} onChange={(e) => set("launch_at_login", e.target.checked)} />
+          <span><span className="t">Open BHCapture at login</span>
+            <span className="d">Starts quietly in the menu bar, so your shortcuts work straight away. Takes effect when you save.</span></span>
+        </label>
+        {view.login_blocked && (
+          <div className="banner">
+            <b>Switched off in your system settings</b>
+            BHCapture will not open at login until you allow it in {view.login_blocked}.{" "}
+            <button type="button" onClick={() => invoke("login_open_settings")}>Open it</button>
+          </div>
+        )}
       </div>
 
       <Updates />

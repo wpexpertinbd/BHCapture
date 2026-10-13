@@ -101,6 +101,13 @@ pub struct Settings {
     pub camera_bg_color: String,
     /// The user's own background picture, for "image".
     pub camera_bg_image: Option<PathBuf>,
+    /// Start BHCapture (in the menu bar, no window) when the user logs in. On by default
+    /// (decision 38); the OS's own login entry is made to match this at every launch.
+    pub launch_at_login: bool,
+    /// The shell's own bookkeeping: true once BHCapture has created the login entry. An entry that
+    /// is then MISSING was removed by the user through the OS, which turns the setting off rather
+    /// than being quietly re-created at the next launch.
+    pub login_registered: bool,
     /// Look for a newer release at launch and every few hours (BHServe's model). On by default.
     pub auto_update_check: bool,
     /// Unix seconds of the last AUTOMATIC check, so restarts do not each ask GitHub.
@@ -148,6 +155,8 @@ impl Default for Settings {
             camera_background: "none".into(),
             camera_bg_color: "#1f6feb".into(),
             camera_bg_image: None,
+            launch_at_login: true,
+            login_registered: false,
             auto_update_check: true,
             last_update_check: 0,
             notified_update: String::new(),

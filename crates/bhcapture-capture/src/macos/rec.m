@@ -3,6 +3,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreMedia/CoreMedia.h>
+#import <ServiceManagement/ServiceManagement.h>
 #import <string.h>
 #import "sck.h"
 #import "rec.h"
@@ -868,3 +869,18 @@ uint32_t bhc_awake_hold(const char *reason) {
     return ok == kIOReturnSuccess ? (uint32_t)id : 0;
 }
 void bhc_awake_release(uint32_t id) { if (id) IOPMAssertionRelease((IOPMAssertionID)id); }
+
+/* Open at login (decision 38): macOS can leave our LaunchAgent "enabled, disallowed" -- after an OS
+ * upgrade, or when the user switched it off in Login Items. The plist is still there but nothing
+ * launches. 1 = needs the user's approval, 0 = fine or unknown. */
+int32_t bhc_login_needs_approval(const char *plist_path) {
+    @autoreleasepool {
+        if (!plist_path) return 0;
+        NSURL *u = [NSURL fileURLWithPath:[NSString stringWithUTF8String:plist_path]];
+        return [SMAppService statusForLegacyURL:u] == SMAppServiceStatusRequiresApproval ? 1 : 0;
+    }
+}
+
+void bhc_login_open_settings(void) {
+    [SMAppService openSystemSettingsLoginItems];
+}

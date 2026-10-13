@@ -156,6 +156,8 @@ struct SettingsView {
     /// save succeeded.
     writable: bool,
     notice: Option<String>,
+    /// Open at login is on, but macOS will not run it until the user allows it in Login Items.
+    login_blocked: Option<String>,
 }
 
 fn settings_view(state: &AppState, notice: Option<String>) -> SettingsView {
@@ -166,6 +168,7 @@ fn settings_view(state: &AppState, notice: Option<String>) -> SettingsView {
         path: st.path().display().to_string(),
         writable: st.is_writable(),
         notice,
+        login_blocked: login_blocked(st.get().launch_at_login),
     }
 }
 
@@ -186,7 +189,8 @@ fn settings_save(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, next
     // The updater owns these (its own switch and bookkeeping); a Settings page holding an older copy
     // must not write them back.
     let next = Settings { auto_update_check: previous.auto_update_check, last_update_check: previous.last_update_check,
-                          notified_update: previous.notified_update.clone(), ..next };
+                          notified_update: previous.notified_update.clone(),
+                          login_registered: previous.login_registered, ..next };
     let mut notes = { state.settings.lock().unwrap().set(next) };
 
     // The shortcut takes effect NOW (sync commands run on the main thread, where the hotkey API
@@ -215,6 +219,8 @@ fn settings_save(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>, next
     }
     apply_settings(&state);
     // A camera bubble on screen follows the new shape, size and background at once.
+    let next_login = state.settings.lock().unwrap().get().launch_at_login;
+    sync_launch_at_login(&state, previous.launch_at_login != next_login);
     let now = state.settings.lock().unwrap().get().clone();
     camera_bubble::apply_settings(&app, &now);
     let notice = if notes.is_empty() { None } else { Some(notes.join("; ")) };
@@ -238,6 +244,63 @@ async fn settings_pick_image(app: tauri::AppHandle) -> Option<String> {
         .blocking_pick_file()
         .and_then(|p| p.into_path().ok())
         .map(|p| p.display().to_string())
+}
+
+/// Settings › General: "Open Login Items" when macOS is holding the login entry back.
+#[tauri::command]
+fn login_open_settings() { bhcapture_capture::login::open_settings(); }
+
+/// Open at login is on, but macOS will not run the entry until the user allows it.
+fn login_blocked(want: bool) -> Option<String> {
+    if want { bhcapture_capture::login::blocked_where().map(str::to_string) } else { None }
+}
+
+/// Make the OS's login entry match the setting (decision 38). `explicit` = the user has just changed
+/// the setting in Settings, which is the only time a removed entry is re-created.
+///
+/// Never in debug, test or demo builds, and only from an installed copy: those must never register
+/// (or take over) a login entry pointing at a development binary on the user's machine.
+fn sync_launch_at_login(state: &AppState, explicit: bool) {
+    if cfg!(debug_assertions) || cfg!(feature = "demo") || std::env::var_os("BHC_TEST_OUT").is_some() { return; }
+    // Unreadable settings = running on defaults: never act on them (they would say "on").
+    if !state.settings.lock().unwrap().is_writable() { return; }
+    use bhcapture_capture::login::{self, Entry};
+    let s = state.settings.lock().unwrap().get().clone();
+    let mut next = s.clone();
+    if !s.launch_at_login {
+        match login::unregister() {
+            Ok(()) => next.login_registered = false,
+            Err(e) => eprintln!("[login] could not remove the login entry: {e}"),
+        }
+    } else {
+        let Some(target) = login::current_target().filter(|t| login::is_installed_location(t)) else { return };
+        if explicit { login::user_enabled(); }
+        let write = |next: &mut Settings| match login::register(&target) {
+            Ok(()) => { next.login_registered = true; println!("[login] open at login on ({})", target.display()); }
+            Err(e) => eprintln!("[login] could not turn open-at-login on: {e}"),
+        };
+        match login::state(&target) {
+            Entry::Current => next.login_registered = true,
+            // The app was moved (or updated to another path): point the entry at this copy.
+            Entry::Stale => write(&mut next),
+            // Removed through the OS after we made it: that is the user saying "off".
+            Entry::Missing if s.login_registered && !explicit => {
+                next.launch_at_login = false;
+                next.login_registered = false;
+                println!("[login] the login entry was removed outside BHCapture; open at login is now off");
+            }
+            Entry::Missing => write(&mut next),
+        }
+    }
+    if next != s {
+        let mut st = state.settings.lock().unwrap();
+        // Only the two login fields: anything else may have changed meanwhile.
+        let mut cur = st.get().clone();
+        cur.launch_at_login = next.launch_at_login;
+        cur.login_registered = next.login_registered;
+        st.set(cur);
+        if let Err(e) = st.save() { eprintln!("[login] could not save: {e}"); }
+    }
 }
 
 /// Show the Dock icon only while a real window (settings, and later the editor) is open.
@@ -837,7 +900,7 @@ fn command_allowed(label: &str, cmd: &str) -> bool {
             | "selection_cancel" | "selection_commit" | "snap_at" | "loupe" | "selection_set_rect"
             | "selection_fullscreen" | "selector_set_mode" | "open_privacy_settings" | "relaunch_app"
             | "report_overlay_focus"),
-        "settings" => matches!(cmd, "settings_get" | "settings_save" | "settings_pick_dir" | "settings_pick_image" | "hotkey_check" | "hotkeys_suspend" | "camera_devices")
+        "settings" => matches!(cmd, "settings_get" | "settings_save" | "settings_pick_dir" | "settings_pick_image" | "login_open_settings" | "hotkey_check" | "hotkeys_suspend" | "camera_devices")
             || cmd.starts_with("update_"),
         "editor" => cmd.starts_with("editor_"),
         "video" => cmd.starts_with("video_"),
@@ -1520,7 +1583,7 @@ fn main() {
             recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel, recording::recorder_hide, recording::recorder_restart,
             recording::video_info, recording::video_save, recording::video_close, recording::video_export,
             camera_bubble::camera_attach, camera_bubble::camera_devices,
-            updater::update_info, updater::update_check, updater::update_set_auto, updater::update_install, updater::update_open_page
+            updater::update_info, updater::update_check, updater::update_set_auto, updater::update_install, updater::update_open_page, login_open_settings
             ]);
             move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
                 let (label, cmd) = (invoke.message.webview_ref().label().to_string(), invoke.message.command().to_string());
@@ -1538,6 +1601,7 @@ fn main() {
                 std::process::exit(0);
             }
             let handle = app.handle().clone();
+            sync_launch_at_login(&state, false);
             // Menu-bar only until a window is opened. Info.plist's LSUIElement does this for the
             // bundled app; stating it here makes an unbundled dev run behave the same.
             sync_dock(&handle, None);
