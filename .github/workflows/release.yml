@@ -13,8 +13,22 @@ permissions:
   contents: write
 
 jobs:
+  draft:
+    name: Draft release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the draft once, before the parallel builds (each would otherwise race to make its own)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+              --title "BHCapture for macOS, Windows & Linux $TAG" --notes "Release notes are added before publishing."
+
   build:
     name: ${{ matrix.name }}
+    needs: draft
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -60,7 +74,7 @@ jobs:
         working-directory: app
       - name: Build
         working-directory: app
-        run: npm run tauri build -- ${{ matrix.args }}
+        run: npx tauri build ${{ matrix.args }}
       - name: Attach installers to the draft release
         shell: bash
         env:
@@ -74,8 +88,4 @@ jobs:
             -not -path './app/node_modules/*' | sort)
           if [ ${#files[@]} -eq 0 ]; then echo "::error::no installers were produced"; exit 1; fi
           printf 'found:\n'; printf '  %s\n' "${files[@]}"
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            gh release create "$TAG" --draft --title "BHCapture for macOS, Windows & Linux $TAG" \
-              --notes "Release notes are added before publishing." || true
-          fi
           gh release upload "$TAG" "${files[@]}" --clobber
