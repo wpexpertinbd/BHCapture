@@ -15,6 +15,7 @@ type SettingsData = {
   record_system_audio: boolean;
   record_microphone: boolean;
   record_noise_filter: boolean;
+  record_auto_level: boolean;
   record_countdown: boolean;
   record_fps: number;
   theme: Theme;
@@ -137,6 +138,12 @@ export function Settings() {
                  onChange={(e) => set("copy_to_clipboard", e.target.checked)} />
           <span><span className="t">Also copy to the clipboard</span>
             <span className="d">The file is still written either way.</span></span>
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={draft.record_auto_level}
+                 onChange={(e) => set("record_auto_level", e.target.checked)} />
+          <span><span className="t">Automatic microphone level (recordings)</span>
+            <span className="d">Brings a quiet voice up to a normal loudness, so recordings play back at normal volume. The pauses between words are never boosted.</span></span>
         </label>
         <label className="check">
           <input type="checkbox" checked={draft.include_cursor}

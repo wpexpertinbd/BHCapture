@@ -58,6 +58,8 @@ pub struct Settings {
     pub record_microphone: bool,
     /// RNNoise on the microphone (fans, hum, hiss). On by default: it is why it was added.
     pub record_noise_filter: bool,
+    /// Bring a quiet microphone voice up to a standard level (see `bhcapture_core::level`).
+    pub record_auto_level: bool,
     pub record_countdown: bool,
     /// 1-60.
     pub record_fps: u32,
@@ -81,6 +83,7 @@ impl Default for Settings {
             record_system_audio: true,
             record_microphone: true,
             record_noise_filter: true,
+            record_auto_level: true,
             record_countdown: true,
             record_fps: 30,
         }

@@ -17,6 +17,7 @@ struct BhcRecordOptions {
     system_audio: i32,
     microphone: i32,
     noise_filter: i32,
+    auto_level: i32,
     path: *const c_char,
 }
 
@@ -82,6 +83,7 @@ impl MacRecorder {
             system_audio: opt.system_audio as i32,
             microphone: opt.microphone as i32,
             noise_filter: opt.noise_filter as i32,
+            auto_level: opt.auto_level as i32,
             path: path.as_ptr(),
         };
         let mut code = 0i32;
@@ -152,4 +154,26 @@ pub unsafe extern "C" fn bhc_denoise_process(d: *mut std::ffi::c_void, s: *mut f
 #[no_mangle]
 pub unsafe extern "C" fn bhc_denoise_free(d: *mut std::ffi::c_void) {
     if !d.is_null() { drop(Box::from_raw(d as *mut bhcapture_core::denoise::Denoiser)); }
+}
+
+// Automatic voice level, likewise in portable core.
+
+#[no_mangle]
+pub extern "C" fn bhc_level_new(sample_rate: u32) -> *mut std::ffi::c_void {
+    Box::into_raw(Box::new(bhcapture_core::level::AutoLevel::new(sample_rate))) as *mut std::ffi::c_void
+}
+
+/// # Safety
+/// `l` from `bhc_level_new`, not yet freed; `s` points to `n` writable floats.
+#[no_mangle]
+pub unsafe extern "C" fn bhc_level_process(l: *mut std::ffi::c_void, s: *mut f32, n: usize) {
+    if l.is_null() || s.is_null() || n == 0 { return; }
+    (*(l as *mut bhcapture_core::level::AutoLevel)).process(std::slice::from_raw_parts_mut(s, n));
+}
+
+/// # Safety
+/// `l` from `bhc_level_new`, freed at most once.
+#[no_mangle]
+pub unsafe extern "C" fn bhc_level_free(l: *mut std::ffi::c_void) {
+    if !l.is_null() { drop(Box::from_raw(l as *mut bhcapture_core::level::AutoLevel)); }
 }

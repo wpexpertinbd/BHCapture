@@ -17,6 +17,8 @@ pub struct RecordOptions {
     pub microphone: bool,
     /// Run the microphone through the RNNoise filter (see `bhcapture_core::denoise`).
     pub noise_filter: bool,
+    /// Automatic voice level on the microphone (see `bhcapture_core::level`).
+    pub auto_level: bool,
     /// The `.mp4` to create. Must not already exist.
     pub path: PathBuf,
 }

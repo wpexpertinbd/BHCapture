@@ -358,7 +358,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
         let s = st.get();
         (Pattern::parse(&s.pattern).unwrap_or_default(),
          (s.record_cursor, s.record_system_audio, s.record_microphone && microphone_supported(), s.record_fps,
-          s.record_noise_filter))
+          s.record_noise_filter, s.record_auto_level))
     };
     let dir = recordings_dir();
     let stem = pattern.render(local_stamp(), &Fields { width: px.0, height: px.1, ..Default::default() });
@@ -366,7 +366,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
 
     let rec = MacRecorder::start(&RecordOptions {
         display, region: local, fps: opts.3, show_cursor: opts.0,
-        system_audio: opts.1, microphone: opts.2, noise_filter: opts.4, path: file.clone(),
+        system_audio: opts.1, microphone: opts.2, noise_filter: opts.4, auto_level: opts.5, path: file.clone(),
     }).map_err(|e| match e {
         bhcapture_capture::CaptureError::PermissionDenied => PERMISSION_MESSAGE.to_string(),
         other => format!("Could not start recording: {other}"),
@@ -460,6 +460,15 @@ pub(crate) fn demo_record(app: &tauri::AppHandle, state: &Arc<AppState>, secs: u
         s.record_noise_filter = v == "1";
         s.record_microphone = true;
         st.set(s);
+    }
+    // BHC_LEVEL=0/1 and BHC_SYS=0/1: likewise, in memory only.
+    for (var, field) in [("BHC_LEVEL", 0), ("BHC_SYS", 1)] {
+        if let Ok(v) = std::env::var(var) {
+            let mut st = state.settings.lock().unwrap();
+            let mut s = st.get().clone();
+            if field == 0 { s.record_auto_level = v == "1"; } else { s.record_system_audio = v == "1"; }
+            st.set(s);
+        }
     }
     let r = prepare(app, state, LogRect::new(200.0, 150.0, 600.0, 400.0));
     println!("[rectest] prepare: {:?}", r.as_ref().map(|_| ()).map_err(|e| e.to_string()));
