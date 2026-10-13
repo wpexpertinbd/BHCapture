@@ -261,6 +261,10 @@ pub(crate) fn recorder_option(state: tauri::State<Arc<AppState>>, name: String, 
 /// shows the timer once frames are flowing.
 #[tauri::command]
 pub(crate) async fn recorder_start(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    start(&app, &state)
+}
+
+pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(), String> {
     let (display, local, px) = {
         let g = SESSION.lock().unwrap();
         let s = g.as_ref().ok_or("Nothing to record. Select an area first.")?;
@@ -297,9 +301,9 @@ pub(crate) async fn recorder_start(app: tauri::AppHandle, state: tauri::State<'_
             _ => { drop(rec); let _ = std::fs::remove_file(&file); return Err("Recording was cancelled.".into()); }
         }
     }
-    println!("[record] started -> {}", file.display());
-    set_tray_label(&app, true);
-    emit_state(&app);
+    println!("[record] started -> {} (system audio {}, microphone {})", file.display(), opts.1, opts.2);
+    set_tray_label(app, true);
+    emit_state(app);
     spawn_status(app.clone());
     Ok(())
 }
@@ -348,6 +352,25 @@ pub(crate) fn recorder_pause(app: tauri::AppHandle, paused: bool) -> Result<(), 
 #[tauri::command]
 pub(crate) async fn recorder_stop(app: tauri::AppHandle) -> Result<(), String> { stop(&app) }
 
+/// Test harness: record a region for `secs` while the harness plays sound, then stop.
+#[cfg(feature = "demo")]
+pub(crate) fn demo_record(app: &tauri::AppHandle, state: &Arc<AppState>, secs: u64) {
+    let r = prepare(app, state, LogRect::new(200.0, 150.0, 600.0, 400.0));
+    println!("[rectest] prepare: {:?}", r.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+    std::thread::sleep(std::time::Duration::from_millis(800));
+    println!("[rectest] start: {:?}", start(app, state));
+    println!("[rectest] RECORDING");
+    let mut peak_sys = 0f32;
+    for _ in 0..(secs * 5) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        if let Some(st) = SESSION.lock().unwrap().as_ref().and_then(|s| s.recorder.as_ref().map(|r| r.status())) {
+            peak_sys = peak_sys.max(st.level_system);
+        }
+    }
+    println!("[rectest] peak system level seen by the meter: {peak_sys:.3}");
+    println!("[rectest] stop: {:?}", stop(app));
+}
+
 /// Finish the file and open it for playback. Safe to call twice; the second does nothing.
 fn stop(app: &tauri::AppHandle) -> Result<(), String> {
     let (rec, file, two_tracks) = {
@@ -388,6 +411,7 @@ fn mix_into_one_track(file: &Path) {
     match bhcapture_capture::macos::mix_audio_tracks(file, &tmp).and_then(|()| std::fs::rename(&tmp, file)
             .map_err(|e| bhcapture_capture::CaptureError::Backend(e.to_string()))) {
         Ok(()) => println!("[record] mixed system audio and microphone into one track"),
+        Err(e) if e.to_string().contains("nothing to mix") => { let _ = std::fs::remove_file(&tmp); }
         Err(e) => { let _ = std::fs::remove_file(&tmp); eprintln!("[record] could not mix the audio tracks ({e}); kept both"); }
     }
 }
@@ -561,6 +585,10 @@ pub(crate) fn reopen_leftovers(app: &tauri::AppHandle) {
         .collect();
     files.sort_by(|a, b| b.0.cmp(&a.0));
     for (_, f) in files.into_iter().take(5) {
+        // A recording cut off by a quit or crash never reached the mixing step, so it can still
+        // hold system audio and the microphone as two tracks, and players use only the first.
+        // Mixing a one-track file just fails harmlessly ("nothing to mix") and leaves it alone.
+        mix_into_one_track(&f);
         let _ = open_video(app, f, Some("Recovered: this recording was not saved before BHCapture last quit.".into()));
     }
 }

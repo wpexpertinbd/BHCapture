@@ -28,8 +28,11 @@ function useDecay(target: number) {
 
 function Meter({ level, off }: { level: number; off?: boolean }) {
   const v = useDecay(off ? 0 : level);
-  // Perceptual-ish: sqrt lifts quiet speech off the floor.
-  const bars = 10, lit = Math.round(Math.sqrt(v) * bars);
+  // Decibels, -54 dB .. 0 dB across the bars, like any recording meter. A linear scale left normal
+  // speech (about -30 dB, i.e. 0.03) at zero bars, which read as "no sound".
+  const bars = 10;
+  const db = v > 0 ? 20 * Math.log10(v) : -120;
+  const lit = Math.max(0, Math.min(bars, Math.ceil(((db + 54) / 54) * bars)));
   return (
     <span className={`rc-meter${off ? " off" : ""}`} aria-hidden>
       {Array.from({ length: bars }, (_, i) => <i key={i} className={i < lit ? (i >= 8 ? "hot" : "on") : ""} />)}

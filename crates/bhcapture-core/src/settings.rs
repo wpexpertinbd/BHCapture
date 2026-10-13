@@ -53,7 +53,8 @@ pub struct Settings {
     /// Recording options, remembered from the control bar's toggles.
     pub record_cursor: bool,
     pub record_system_audio: bool,
-    /// Off by default: turning it on raises macOS's Microphone permission prompt.
+    /// On by default (Benjamin, 2026-10-13). The first recording raises macOS's Microphone
+    /// permission prompt; on macOS 14 the shell ignores it (needs 15).
     pub record_microphone: bool,
     pub record_countdown: bool,
     /// 1-60.
@@ -76,7 +77,7 @@ impl Default for Settings {
             record_hotkey: DEFAULT_RECORD_HOTKEY.to_string(),
             record_cursor: true,
             record_system_audio: true,
-            record_microphone: false,
+            record_microphone: true,
             record_countdown: true,
             record_fps: 30,
         }

@@ -89,6 +89,7 @@ static float rec_peak(CMSampleBufferRef sb) {
     CMTime _lastV, _lastSys, _lastMic;   /* last ADJUSTED pts appended per track */
     CMSampleBufferRef _lastFrame;        /* retained; re-stamped at stop so the video lasts to the end */
     int64_t _frames;
+    int64_t _sysBufs, _micBufs;   /* audio buffers RECEIVED, for diagnosing "no sound" */
     float _lvlSys, _lvlMic;
     NSString *_failure;
     int32_t _w, _h, _fps;
@@ -145,7 +146,7 @@ static float rec_peak(CMSampleBufferRef sb) {
     float pk = rec_peak(sb);
     BOOL isMic = NO;
     if (@available(macOS 15.0, *)) { isMic = (type == SCStreamOutputTypeMicrophone); }
-    if (isMic) { if (pk > _lvlMic) _lvlMic = pk; } else { if (pk > _lvlSys) _lvlSys = pk; }
+    if (isMic) { _micBufs++; if (pk > _lvlMic) _lvlMic = pk; } else { _sysBufs++; if (pk > _lvlSys) _lvlSys = pk; }
     if (!_started || _paused) return;
     /* Audio that predates the first video frame would extend the movie backwards. */
     if (CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(sb), _first) < 0) return;
@@ -303,7 +304,8 @@ BhcRecorder *bhc_rec_start(const BhcRecordOptions *opt, int32_t *code, char *err
         if (![r->_stream addStreamOutput:r type:SCStreamOutputTypeScreen sampleHandlerQueue:r->_q error:&e]) {
             [r->_writer cancelWriting]; rec_set_err(err, errcap, e.localizedDescription); return NULL;
         }
-        if (opt->system_audio) [r->_stream addStreamOutput:r type:SCStreamOutputTypeAudio sampleHandlerQueue:r->_q error:nil];
+        if (opt->system_audio && ![r->_stream addStreamOutput:r type:SCStreamOutputTypeAudio sampleHandlerQueue:r->_q error:&e])
+            fprintf(stderr, "[rec] could not add the system audio output: %s\n", e.localizedDescription.UTF8String);
         if (opt->microphone) {
             if (@available(macOS 15.0, *)) {
                 [r->_stream addStreamOutput:r type:SCStreamOutputTypeMicrophone sampleHandlerQueue:r->_q error:nil];
@@ -375,6 +377,8 @@ int32_t bhc_rec_stop(BhcRecorder *h, char *err, int32_t errcap) {
             BOOL wasPaused = r->_paused;
             CMTime endHost = wasPaused ? r->_pauseAt : rec_host_now();
             r->_stopped = YES;
+            fprintf(stderr, "[rec] audio buffers received: system %lld, microphone %lld (inputs: system %s, mic %s); video frames %lld\n",
+                    r->_sysBufs, r->_micBufs, r->_sysIn ? "yes" : "no", r->_micIn ? "yes" : "no", r->_frames);
             if (!r->_started) {
                 [r->_writer cancelWriting];
                 [NSFileManager.defaultManager removeItemAtURL:r->_writer.outputURL error:nil];

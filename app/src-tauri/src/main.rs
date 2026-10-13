@@ -1396,6 +1396,14 @@ fn main() {
                 });
             }
 
+            if std::env::args().any(|a| a == "--demo-record") {
+                let (h, st) = (handle.clone(), state.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(2500));
+                    recording::demo_record(&h, &st, 5);
+                });
+            }
+
             if std::env::args().any(|a| a == "--demo-editor") {
                 let (h, st) = (handle.clone(), state.clone());
                 std::thread::spawn(move || {

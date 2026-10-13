@@ -206,7 +206,7 @@ fn record_defaults_and_repairs() {
     let mut n = Settings::default();
     assert!(n.normalise().is_empty(), "defaults must need no repair");
     assert_eq!(n.record_hotkey, chord.display());
-    assert!(s.record_system_audio && !s.record_microphone && s.record_cursor && s.record_countdown);
+    assert!(s.record_system_audio && s.record_microphone && s.record_cursor && s.record_countdown);
     assert_eq!(s.record_fps, 30);
 
     // The record shortcut may not be the capture shortcut.
