@@ -18,6 +18,8 @@ pub use snapshot::Snapshot;
 pub mod macos;
 #[cfg(windows)]
 pub mod windows;
+#[cfg(target_os = "linux")]
+pub mod linux;
 
 /// The current OS's backend under ONE set of names, so the shell never names an OS. Every item
 /// here exists on every supported OS; what differs is only how it is done.
@@ -32,6 +34,18 @@ pub mod platform {
         export_video, microphone_supported, mix_audio_tracks, unwatch_clicks, video_frames, watch_clicks,
         watch_displays, VideoExport, WinCapturer as PlatformCapturer, WinRecorder as Recorder,
     };
+    #[cfg(target_os = "linux")]
+    pub use crate::linux::{
+        export_video, microphone_supported, mix_audio_tracks, unwatch_clicks, video_frames, watch_clicks,
+        watch_displays, LinuxCapturer as PlatformCapturer, LinuxRecorder as Recorder, VideoExport,
+    };
+
+    /// True where a capture cannot leave our own windows out (X11). The selector must then take its
+    /// frozen frame BEFORE showing the overlay, or every screenshot would contain the dimmed selector.
+    #[cfg(target_os = "linux")]
+    pub const CAPTURE_SEES_OWN_WINDOWS: bool = crate::linux::CAPTURE_SEES_OWN_WINDOWS;
+    #[cfg(not(target_os = "linux"))]
+    pub const CAPTURE_SEES_OWN_WINDOWS: bool = false;
 
     /// Prepare one of OUR tool windows (selector overlay, recording bar): on macOS a non-activating
     /// panel; on Windows, kept out of captures. Returns false if it could not be done.
@@ -43,6 +57,8 @@ pub mod platform {
         { unsafe { crate::macos::make_overlay_panel(handle) == 1 } }
         #[cfg(windows)]
         { unsafe { crate::windows::set_excluded_from_capture(handle, true) } }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        { let _ = handle; true }
     }
 
     /// Let a tool window be IN recordings (the click-highlight layer) or keep it out. Only Windows
@@ -53,7 +69,7 @@ pub mod platform {
     pub unsafe fn set_window_in_captures(handle: *mut std::ffi::c_void, included: bool) {
         #[cfg(windows)]
         { unsafe { crate::windows::set_excluded_from_capture(handle, !included); } }
-        #[cfg(target_os = "macos")]
+        #[cfg(not(windows))]
         { let _ = (handle, included); }
     }
 
@@ -66,6 +82,8 @@ pub mod platform {
         { unsafe { crate::macos::cgwindow_id(handle) } }
         #[cfg(windows)]
         { unsafe { crate::windows::window_id(handle) } }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        { let _ = handle; 0 }
     }
 
     /// macOS: make the menu bar respond after the app turns regular at run time. Elsewhere nothing.

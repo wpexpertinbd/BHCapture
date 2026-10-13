@@ -325,6 +325,16 @@ fn open_selector_as(app: &tauri::AppHandle, video: bool, switchable: bool) {
     release_frozen(&state);
     let epoch = state.epoch.load(Ordering::SeqCst);
     broadcast(app, None);
+    // Where a capture cannot leave our own windows out (X11), freeze the screen BEFORE the overlay
+    // appears -- afterwards it would photograph its own dim scrim. Costs the time of one capture.
+    let frozen_first = platform::CAPTURE_SEES_OWN_WINDOWS;
+    if frozen_first {
+        let layout = state.layout.lock().unwrap().clone();
+        match Snapshot::take(&state.capturer, &layout) {
+            Ok(snap) => *state.snapshot.lock().unwrap() = Some(Arc::new(snap)),
+            Err(e) => eprintln!("[warn] could not freeze the screen ({e})"),
+        }
+    }
     show_overlays(app); // appear first; also arms the selector keys, in the same main-thread step
     for (label, w) in app.webview_windows() {
         if label.starts_with(OVERLAY_PREFIX) {
@@ -337,7 +347,7 @@ fn open_selector_as(app: &tauri::AppHandle, video: bool, switchable: bool) {
     // Two independent jobs, each discarded if the selector has since closed or reopened.
     let st = state.clone();
     let app_for_freeze = app.clone();
-    std::thread::spawn(move || {
+    if !frozen_first { std::thread::spawn(move || {
         let layout = st.layout.lock().unwrap().clone();
         match Snapshot::take(&st.capturer, &layout) {
             Ok(snap) if st.epoch.load(Ordering::SeqCst) == epoch => {
@@ -349,7 +359,7 @@ fn open_selector_as(app: &tauri::AppHandle, video: bool, switchable: bool) {
             Ok(_) => {}
             Err(e) => eprintln!("[warn] could not freeze the screen ({e}); the magnifier is off and capture will be live"),
         }
-    });
+    }); }
     let st = state.clone();
     std::thread::spawn(move || {
         match st.capturer.list_targets() {

@@ -24,3 +24,7 @@ windows = { version = "0.62", features = [
   "Win32_Media_Audio", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia",
   "Win32_UI_Input_KeyboardAndMouse", "Win32_System_SystemInformation",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pure Rust X11 client (no libX11 needed); already in the tree through the clipboard/hotkey crates.
+x11rb = { version = "0.13", features = ["randr"] }
