@@ -442,3 +442,19 @@ int32_t bhc_make_overlay_panel(void *nswindow) {
     }
     return 1;
 }
+
+/* macOS bug: an app that switches from accessory to regular WHILE RUNNING gets a menu bar that
+ * draws but does not open -- clicks on File/Edit do nothing -- until the app is deactivated and
+ * activated again. Reproduced on macOS 27 (Benjamin: "none of the menu items doing anything").
+ * The standard remedy is to hand activation to the Dock and immediately take it back, which is
+ * the deactivate/activate cycle the menu bar needs. Main thread only. */
+void bhc_refresh_menu_bar(void) {
+    NSRunningApplication *dock =
+        [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.dock"].firstObject;
+    if (!dock) { [NSApp activateIgnoringOtherApps:YES]; return; }
+    [dock activateWithOptions:0];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        [NSApp activateIgnoringOtherApps:YES];
+        [[NSRunningApplication currentApplication] activateWithOptions:NSApplicationActivateAllWindows];
+    });
+}

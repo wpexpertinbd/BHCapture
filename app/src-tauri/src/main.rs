@@ -230,6 +230,9 @@ async fn settings_pick_dir(app: tauri::AppHandle) -> Option<String> {
 /// The decision is derived from the windows that actually exist rather than tracked in a flag, so
 /// it cannot drift out of step with reality. `closing` names a window that is mid-destroy and must
 /// not be counted.
+#[cfg(target_os = "macos")]
+static DOCK_REGULAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn sync_dock(app: &tauri::AppHandle, closing: Option<&str>) {
     #[cfg(target_os = "macos")]
     {
@@ -243,7 +246,12 @@ fn sync_dock(app: &tauri::AppHandle, closing: Option<&str>) {
         } else {
             tauri::ActivationPolicy::Accessory
         };
+        let was_regular = DOCK_REGULAR.swap(any_window, std::sync::atomic::Ordering::SeqCst);
         let _ = app.set_activation_policy(policy);
+        if any_window && !was_regular {
+            // Without this the File/Edit menus draw but do not open (macOS bug, see the shim).
+            let _ = app.run_on_main_thread(bhcapture_capture::macos::refresh_menu_bar);
+        }
     }
     #[cfg(not(target_os = "macos"))]
     { let _ = (app, closing); }

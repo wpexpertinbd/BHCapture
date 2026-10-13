@@ -69,6 +69,7 @@ extern "C" {
     fn bhc_image_free(img: *mut BhcImage);
     fn bhc_watch_displays(cb: extern "C" fn(*mut c_void), ctx: *mut c_void);
     fn bhc_make_overlay_panel(nswindow: *mut c_void) -> i32;
+    fn bhc_refresh_menu_bar();
 }
 
 static DISPLAY_WATCHER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
@@ -88,6 +89,10 @@ extern "C" fn display_trampoline(_ctx: *mut c_void) {
 /// # Safety
 /// `ptr` must be a live `NSWindow*`, and this must run on the main thread.
 pub unsafe fn make_overlay_panel(ptr: *mut c_void) -> i32 { bhc_make_overlay_panel(ptr) }
+
+/// After switching the app from accessory to regular at run time, the menu bar draws but does not
+/// open until the app is deactivated and reactivated; this performs that cycle. Main thread only.
+pub fn refresh_menu_bar() { unsafe { bhc_refresh_menu_bar() } }
 
 pub fn watch_displays(f: impl Fn() + Send + Sync + 'static) {
     if DISPLAY_WATCHER.set(Box::new(f)).is_ok() {
