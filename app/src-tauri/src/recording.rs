@@ -30,7 +30,7 @@ use crate::{broadcast, default_capture_dir, hide_overlays, local_stamp, release_
 pub(crate) const HUD: &str = "recorder";
 pub(crate) const VIDEO_PREFIX: &str = "video-";
 /// Wide enough for the options row; tall enough for an error line under the bar.
-const HUD_SIZE: LogSize = LogSize { w: 760.0, h: 96.0 };
+const HUD_SIZE: LogSize = LogSize { w: 880.0, h: 96.0 };
 
 /// The selector is shared by screenshots and recordings; this says which one Enter starts.
 pub(crate) static VIDEO_MODE: AtomicBool = AtomicBool::new(false);
@@ -291,6 +291,7 @@ pub(crate) struct HudInfo {
     cursor: bool,
     system_audio: bool,
     microphone: bool,
+    noise_filter: bool,
     countdown: bool,
     mic_supported: bool,
     shortcut: String,
@@ -305,7 +306,8 @@ pub(crate) fn recorder_info(state: tauri::State<Arc<AppState>>) -> HudInfo {
         phase: g.as_ref().map(|s| s.phase),
         width: g.as_ref().map_or(0, |s| s.px.0), height: g.as_ref().map_or(0, |s| s.px.1),
         cursor: s.record_cursor, system_audio: s.record_system_audio,
-        microphone: s.record_microphone && microphone_supported(), countdown: s.record_countdown,
+        microphone: s.record_microphone && microphone_supported(), noise_filter: s.record_noise_filter,
+        countdown: s.record_countdown,
         mic_supported: microphone_supported(), shortcut: s.record_hotkey,
         pause_shortcut: bhcapture_core::hotkey::Chord::parse(PAUSE_SHORTCUT).map(|c| c.display()).unwrap_or_default(),
     }
@@ -327,6 +329,7 @@ pub(crate) fn recorder_option(state: tauri::State<Arc<AppState>>, name: String, 
             s.record_microphone = value;
         }
         "countdown" => s.record_countdown = value,
+        "noise_filter" => s.record_noise_filter = value,
         _ => return Err(format!("unknown option {name}")),
     }
     st.set(s);
@@ -354,7 +357,8 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
         let st = state.settings.lock().unwrap();
         let s = st.get();
         (Pattern::parse(&s.pattern).unwrap_or_default(),
-         (s.record_cursor, s.record_system_audio, s.record_microphone && microphone_supported(), s.record_fps))
+         (s.record_cursor, s.record_system_audio, s.record_microphone && microphone_supported(), s.record_fps,
+          s.record_noise_filter))
     };
     let dir = recordings_dir();
     let stem = pattern.render(local_stamp(), &Fields { width: px.0, height: px.1, ..Default::default() });
@@ -362,7 +366,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
 
     let rec = MacRecorder::start(&RecordOptions {
         display, region: local, fps: opts.3, show_cursor: opts.0,
-        system_audio: opts.1, microphone: opts.2, path: file.clone(),
+        system_audio: opts.1, microphone: opts.2, noise_filter: opts.4, path: file.clone(),
     }).map_err(|e| match e {
         bhcapture_capture::CaptureError::PermissionDenied => PERMISSION_MESSAGE.to_string(),
         other => format!("Could not start recording: {other}"),
@@ -380,7 +384,7 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
             _ => { drop(rec); let _ = std::fs::remove_file(&file); return Err("Recording was cancelled.".into()); }
         }
     }
-    println!("[record] started -> {} (system audio {}, microphone {})", file.display(), opts.1, opts.2);
+    println!("[record] started -> {} (system audio {}, microphone {}, noise filter {})", file.display(), opts.1, opts.2, opts.2 && opts.4);
     set_tray_label(app, true);
     let _ = app.run_on_main_thread(|| arm_pause_hotkey(true));
     emit_state(app);
@@ -449,6 +453,14 @@ pub(crate) async fn recorder_stop(app: tauri::AppHandle) -> Result<(), String> {
 /// Test harness: record a region for `secs` while the harness plays sound, then stop.
 #[cfg(feature = "demo")]
 pub(crate) fn demo_record(app: &tauri::AppHandle, state: &Arc<AppState>, secs: u64) {
+    // BHC_NOISE=0/1 sets the filter for this run IN MEMORY only (never saved over the user's settings).
+    if let Ok(v) = std::env::var("BHC_NOISE") {
+        let mut st = state.settings.lock().unwrap();
+        let mut s = st.get().clone();
+        s.record_noise_filter = v == "1";
+        s.record_microphone = true;
+        st.set(s);
+    }
     let r = prepare(app, state, LogRect::new(200.0, 150.0, 600.0, 400.0));
     println!("[rectest] prepare: {:?}", r.as_ref().map(|_| ()).map_err(|e| e.to_string()));
     std::thread::sleep(std::time::Duration::from_millis(800));

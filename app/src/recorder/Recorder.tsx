@@ -6,7 +6,7 @@ type Phase = "ready" | "recording" | "paused" | "finishing";
 type Info = {
   phase: Phase | null;
   width: number; height: number;
-  cursor: boolean; system_audio: boolean; microphone: boolean; countdown: boolean;
+  cursor: boolean; system_audio: boolean; microphone: boolean; noise_filter: boolean; countdown: boolean;
   mic_supported: boolean;
   shortcut: string;
   pause_shortcut: string;
@@ -113,6 +113,9 @@ export function Recorder() {
           <Toggle on={info.microphone} label="Microphone" onChange={(v) => toggle("microphone", v)}
                   disabled={count !== null || !info.mic_supported}
                   title={info.mic_supported ? undefined : "Needs macOS 15 or later"} />
+          <Toggle on={info.noise_filter && info.microphone} label="Noise filter" onChange={(v) => toggle("noise_filter", v)}
+                  disabled={count !== null || !info.microphone}
+                  title="Removes steady background noise from the microphone: fans, AC, hum, hiss" />
           <Toggle on={info.countdown} label="Countdown" onChange={(v) => toggle("countdown", v)} disabled={count !== null} />
           <span className="rc-size">{info.width} × {info.height}</span>
           <button className="rc-x" title="Cancel" onClick={() => void invoke("recorder_cancel")}>✕</button>

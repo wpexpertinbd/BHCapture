@@ -11,6 +11,7 @@
 #define BHC_REC_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 typedef struct BhcRecorder BhcRecorder;
 
@@ -22,6 +23,7 @@ typedef struct {
     int32_t     show_cursor;    /* 0/1 */
     int32_t     system_audio;   /* 0/1 */
     int32_t     microphone;     /* 0/1; needs macOS 15 -- refused below that rather than faked */
+    int32_t     noise_filter;   /* 0/1; RNNoise on the microphone (48 kHz float only) */
     const char *path;           /* UTF-8; the .mp4 to create. Must not exist. */
 } BhcRecordOptions;
 
@@ -50,5 +52,10 @@ int32_t      bhc_rec_mix_audio(const char *src_path, const char *dst_path, char 
 
 /* 1 when ScreenCaptureKit can record the microphone (macOS 15+). */
 int32_t      bhc_rec_mic_supported(void);
+
+/* The noise filter, implemented in Rust (bhcapture_core::denoise). */
+void  *bhc_denoise_new(void);
+void   bhc_denoise_process(void *d, float *samples, size_t n);
+void   bhc_denoise_free(void *d);
 
 #endif /* BHC_REC_H */

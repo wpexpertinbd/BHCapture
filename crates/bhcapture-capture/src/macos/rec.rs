@@ -16,6 +16,7 @@ struct BhcRecordOptions {
     show_cursor: i32,
     system_audio: i32,
     microphone: i32,
+    noise_filter: i32,
     path: *const c_char,
 }
 
@@ -80,6 +81,7 @@ impl MacRecorder {
             show_cursor: opt.show_cursor as i32,
             system_audio: opt.system_audio as i32,
             microphone: opt.microphone as i32,
+            noise_filter: opt.noise_filter as i32,
             path: path.as_ptr(),
         };
         let mut code = 0i32;
@@ -126,4 +128,28 @@ impl MacRecorder {
 
 impl Drop for MacRecorder {
     fn drop(&mut self) { let _ = self.finish(); }
+}
+
+// The microphone noise filter lives in portable core; `rec.m` calls it through these, one filter
+// per channel, from its single sample queue.
+
+#[no_mangle]
+pub extern "C" fn bhc_denoise_new() -> *mut std::ffi::c_void {
+    Box::into_raw(Box::new(bhcapture_core::denoise::Denoiser::new())) as *mut std::ffi::c_void
+}
+
+/// # Safety
+/// `d` from `bhc_denoise_new`, not yet freed; `s` points to `n` writable floats.
+#[no_mangle]
+pub unsafe extern "C" fn bhc_denoise_process(d: *mut std::ffi::c_void, s: *mut f32, n: usize) {
+    if d.is_null() || s.is_null() || n == 0 { return; }
+    let d = &mut *(d as *mut bhcapture_core::denoise::Denoiser);
+    d.process(std::slice::from_raw_parts_mut(s, n));
+}
+
+/// # Safety
+/// `d` from `bhc_denoise_new`, freed at most once.
+#[no_mangle]
+pub unsafe extern "C" fn bhc_denoise_free(d: *mut std::ffi::c_void) {
+    if !d.is_null() { drop(Box::from_raw(d as *mut bhcapture_core::denoise::Denoiser)); }
 }

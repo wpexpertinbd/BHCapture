@@ -14,6 +14,7 @@ type SettingsData = {
   record_cursor: boolean;
   record_system_audio: boolean;
   record_microphone: boolean;
+  record_noise_filter: boolean;
   record_countdown: boolean;
   record_fps: number;
   theme: Theme;

@@ -208,6 +208,7 @@ fn record_defaults_and_repairs() {
     assert_eq!(n.record_hotkey, chord.display());
     assert!(s.record_system_audio && s.record_microphone && s.record_cursor && s.record_countdown);
     assert_eq!(s.record_fps, 30);
+    assert!(s.record_noise_filter, "noise filter on by default");
 
     // The record shortcut may not be the capture shortcut.
     let mut t = Settings::default();

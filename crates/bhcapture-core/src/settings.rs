@@ -56,6 +56,8 @@ pub struct Settings {
     /// On by default (Benjamin, 2026-10-13). The first recording raises macOS's Microphone
     /// permission prompt; on macOS 14 the shell ignores it (needs 15).
     pub record_microphone: bool,
+    /// RNNoise on the microphone (fans, hum, hiss). On by default: it is why it was added.
+    pub record_noise_filter: bool,
     pub record_countdown: bool,
     /// 1-60.
     pub record_fps: u32,
@@ -78,6 +80,7 @@ impl Default for Settings {
             record_cursor: true,
             record_system_audio: true,
             record_microphone: true,
+            record_noise_filter: true,
             record_countdown: true,
             record_fps: 30,
         }
