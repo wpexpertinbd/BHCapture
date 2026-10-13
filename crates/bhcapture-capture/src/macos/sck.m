@@ -154,15 +154,29 @@ static int32_t bhc_shoot(SCContentFilter *filter, size_t px_w, size_t px_h, doub
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     __block CGImageRef img = NULL;
     __block NSError *shotErr = nil;
+    /* If we give up waiting, a completion that arrives LATER must release what it would have
+     * retained -- otherwise each slow capture leaks a whole-screen image (Codex review). The lock
+     * makes "abandon" and "store the image" mutually exclusive. */
+    __block BOOL abandoned = NO;
+    NSObject *lock = [NSObject new];
 
     [SCScreenshotManager captureImageWithFilter:filter configuration:cfg
                               completionHandler:^(CGImageRef sampled, NSError *e) {
-        if (sampled) img = CGImageRetain(sampled);   /* must outlive the block */
-        shotErr = e;
+        @synchronized (lock) {
+            if (!abandoned) {
+                if (sampled) img = CGImageRetain(sampled);   /* must outlive the block */
+                shotErr = e;
+            }
+        }
         dispatch_semaphore_signal(sem);
     }];
 
     if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, kBhcTimeoutNs)) != 0) {
+        @synchronized (lock) {
+            abandoned = YES;
+            /* The completion may have stored an image between the timeout and this lock. */
+            if (img) { CGImageRelease(img); img = NULL; }
+        }
         bhc_set_err(err, errcap, @"timed out waiting for SCScreenshotManager (5s)");
         return BHC_ERR_GENERIC;
     }
@@ -390,6 +404,10 @@ void bhc_watch_displays(void (*cb)(void *), void *ctx) {
 - (BOOL)canBecomeMainWindow { return NO; }
 @end
 
+/* ⚠️ CONTRACT: the swap REPLACES Tao's own `TaoWindow` subclass (and its `focusable` ivar and
+ * overrides) with this sibling NSPanel subclass. Everything BHCapture does with an overlay is fine
+ * with that, but NEVER call Tauri's `set_focusable` (or anything else that reaches Tao's window
+ * ivars) on an overlay window: Tao would touch an ivar the object no longer has. (Codex review.) */
 int32_t bhc_make_overlay_panel(void *nswindow) {
     if (!nswindow) return 0;
     NSWindow *w = (__bridge NSWindow *)nswindow;

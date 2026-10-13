@@ -190,3 +190,10 @@ fn a_valid_shortcut_is_stored_in_canonical_form() {
     assert!(r.is_empty(), "{r:?}");
     assert_eq!(store.get().region_hotkey, "Shift+Cmd+S");
 }
+
+#[test]
+fn jpeg_is_the_default_format() {
+    // Benjamin's call: screenshots default to JPEG because the files are far smaller.
+    assert_eq!(Settings::default().image_format, bhcapture_core::export::ImageFormat::Jpeg);
+    assert_eq!(Settings::default().jpeg_quality, bhcapture_core::export::DEFAULT_JPEG_QUALITY);
+}

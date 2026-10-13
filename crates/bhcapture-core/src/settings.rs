@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
+use crate::export::{ImageFormat, DEFAULT_JPEG_QUALITY};
 use crate::hotkey::{Chord, DEFAULT_REGION_HOTKEY};
 use crate::naming::{Pattern, DEFAULT_PATTERN};
 
@@ -42,6 +43,11 @@ pub struct Settings {
     pub include_cursor: bool,
     pub region_hotkey: String,
     pub theme: Theme,
+    /// Format a capture is saved in unless the user picks another in the editor or types an
+    /// extension in Save As.
+    pub image_format: ImageFormat,
+    /// 1-100; only JPEG uses it.
+    pub jpeg_quality: u8,
 }
 
 impl Default for Settings {
@@ -54,6 +60,9 @@ impl Default for Settings {
             include_cursor: false,
             region_hotkey: DEFAULT_REGION_HOTKEY.to_string(),
             theme: Theme::System,
+            // JPEG by default: much smaller files for screenshots (Benjamin, 2026-10-13).
+            image_format: ImageFormat::Jpeg,
+            jpeg_quality: DEFAULT_JPEG_QUALITY,
         }
     }
 }
@@ -78,6 +87,10 @@ impl Settings {
                 fixed.push(format!("output folder {} was not an absolute path; reset to the default", dir.display()));
                 self.output_dir = None;
             }
+        }
+        if !(1..=100).contains(&self.jpeg_quality) {
+            fixed.push(format!("JPEG quality {} is outside 1-100; reset to {DEFAULT_JPEG_QUALITY}", self.jpeg_quality));
+            self.jpeg_quality = DEFAULT_JPEG_QUALITY;
         }
         // Parse, and store the CANONICAL spelling, so "cmd+shift+s" and "⇧⌘S" are the same setting.
         // A chord macOS already owns is rejected: both would fire (see bhcapture_core::hotkey).

@@ -4,6 +4,7 @@
 //! The shell injects every path and every display it finds; this crate only does arithmetic,
 //! which is what makes the hard parts testable without a screen attached.
 
+pub mod export;
 pub mod geom;
 pub mod hotkey;
 pub mod image;

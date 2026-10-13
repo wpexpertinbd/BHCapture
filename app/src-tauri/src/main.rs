@@ -16,6 +16,7 @@ use bhcapture_core::naming::{Fields, Pattern, Stamp, unique_path};
 use bhcapture_core::settings::{LoadOutcome, Settings, SettingsStore};
 use bhcapture_core::snap::{snap_window, Candidate};
 use bhcapture_core::hotkey::{Chord, Key, DEFAULT_REGION_HOTKEY};
+use bhcapture_core::export::{self, ImageFormat, ALL_FORMATS};
 use base64::Engine;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tauri_plugin_dialog::DialogExt;
@@ -30,6 +31,7 @@ use tauri::tray::TrayIconBuilder;
 const OVERLAY_PREFIX: &str = "overlay-";
 
 const SETTINGS_WINDOW: &str = "settings";
+const EDITOR_PREFIX: &str = "editor-";
 
 struct AppState {
     capturer: MacCapturer,
@@ -48,6 +50,16 @@ struct AppState {
     /// Bumped each time the selector opens or closes, so a slow snapshot thread from a selector
     /// the user already dismissed cannot land its result on the next one.
     epoch: AtomicU64,
+    /// Captures open in editor windows, by editor id. Nothing is on disk until the user saves.
+    editors: Mutex<std::collections::HashMap<u64, EditorDoc>>,
+    next_editor: AtomicU64,
+}
+
+/// One capture being edited. The pixels stay in memory until the window closes; a save writes the
+/// EDITED image, which the editor renders and sends back.
+struct EditorDoc {
+    frame: Frame,
+    saved_to: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -160,25 +172,40 @@ fn settings_get(state: tauri::State<Arc<AppState>>) -> SettingsView {
 
 #[tauri::command]
 fn settings_save(state: tauri::State<Arc<AppState>>, next: Settings) -> Result<SettingsView, String> {
-    let previous_hotkey = state.settings.lock().unwrap().get().region_hotkey.clone();
+    // Refuse BEFORE applying anything: an unreadable settings file means saving is refused, and the
+    // running app must not quietly adopt values that were never saved (found by the Codex review).
+    if !state.settings.lock().unwrap().is_writable() {
+        return Err(state.settings.lock().unwrap().save().err().map(|e| e.to_string())
+            .unwrap_or_else(|| "settings cannot be saved".into()));
+    }
+    let previous = state.settings.lock().unwrap().get().clone();
     let mut notes = { state.settings.lock().unwrap().set(next) };
 
     // The shortcut takes effect NOW (sync commands run on the main thread, where the hotkey API
     // lives). If the OS will not give us the new chord, keep the old one and say so, rather than
     // saving a setting that does nothing.
     let wanted = state.settings.lock().unwrap().get().region_hotkey.clone();
-    if wanted != previous_hotkey {
-        if let Err(e) = set_region_hotkey(&wanted) {
-            notes.push(format!("{e}. Kept {previous_hotkey}."));
-            let mut st = state.settings.lock().unwrap();
-            let mut s = st.get().clone();
-            s.region_hotkey = previous_hotkey;
-            st.set(s);
+    let mut hotkey_changed = false;
+    if wanted != previous.region_hotkey {
+        match set_region_hotkey(&wanted) {
+            Ok(_) => hotkey_changed = true,
+            Err(e) => {
+                notes.push(format!("{e}. Kept {}.", previous.region_hotkey));
+                let mut st = state.settings.lock().unwrap();
+                let mut s = st.get().clone();
+                s.region_hotkey = previous.region_hotkey.clone();
+                st.set(s);
+            }
         }
     }
 
-    // Report a refused save honestly rather than letting the UI claim it worked.
-    state.settings.lock().unwrap().save().map_err(|e| e.to_string())?;
+    // Report a refused save honestly, and roll back everything applied above, so what is running
+    // always matches what is on disk.
+    if let Err(e) = state.settings.lock().unwrap().save() {
+        state.settings.lock().unwrap().set(previous.clone());
+        if hotkey_changed { let _ = set_region_hotkey(&previous.region_hotkey); }
+        return Err(e.to_string());
+    }
     apply_settings(&state);
     let notice = if notes.is_empty() { None } else { Some(notes.join("; ")) };
     Ok(settings_view(&state, notice))
@@ -255,8 +282,7 @@ fn open_selector(app: &tauri::AppHandle) {
     release_frozen(&state);
     let epoch = state.epoch.load(Ordering::SeqCst);
     broadcast(app, None);
-    show_overlays(app); // appear first: the freeze happens behind an already-visible overlay
-    set_selector_keys(app, true, false);
+    show_overlays(app); // appear first; also arms the selector keys, in the same main-thread step
     for (label, w) in app.webview_windows() {
         if label.starts_with(OVERLAY_PREFIX) {
             println!("[selector] {label} shown: visible={:?} at {:?} size {:?}",
@@ -340,11 +366,15 @@ fn selection_set_rect(app: tauri::AppHandle, state: tauri::State<Arc<AppState>>,
 }
 
 fn hide_overlays(app: &tauri::AppHandle) {
-    // Whenever the selector goes away its keys go with it, so Esc/Enter work normally again.
-    set_selector_keys(app, false, false);
-    for (label, w) in app.webview_windows() {
-        if label.starts_with(OVERLAY_PREFIX) { let _ = w.hide(); }
-    }
+    // Hide and disarm in ONE main-thread step (see `apply_selector_keys`): whenever the selector
+    // goes away its keys go with it, so Esc/Enter/arrows work normally again everywhere.
+    let a = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        for (label, w) in a.webview_windows() {
+            if label.starts_with(OVERLAY_PREFIX) { let _ = w.hide(); }
+        }
+        apply_selector_keys(false);
+    });
 }
 
 #[tauri::command]
@@ -394,6 +424,9 @@ fn default_capture_dir() -> std::path::PathBuf {
         .map(|h| h.join("Pictures").join("BHCapture"))
         .unwrap_or_else(std::env::temp_dir);
     if std::fs::create_dir_all(&dir).is_ok() {
+        // Our own default folder is private. A folder the user picks keeps whatever mode they gave it.
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)); }
         return dir;
     }
     home.unwrap_or_else(std::env::temp_dir)
@@ -415,31 +448,6 @@ fn local_stamp() -> Stamp {
         minute: tm.tm_min as u32,
         second: tm.tm_sec as u32,
     }
-}
-
-fn write_png(frame: &Frame, path: &std::path::Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), frame.width(), frame.height());
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.write_header().map_err(|e| e.to_string())?
-        .write_image_data(&frame.to_rgba8()).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Best-effort clipboard copy. A clipboard failure must never lose a capture that is already on
-/// disk, so this reports rather than propagates.
-fn copy_to_clipboard(frame: &Frame) -> Result<(), String> {
-    let img = arboard::ImageData {
-        width: frame.width() as usize,
-        height: frame.height() as usize,
-        bytes: std::borrow::Cow::Owned(frame.to_rgba8()),
-    };
-    arboard::Clipboard::new().map_err(|e| e.to_string())?
-        .set_image(img).map_err(|e| e.to_string())
 }
 
 /// Why a capture did not happen. Serialised to the overlay as `{kind, message}`, so the UI can pick
@@ -467,8 +475,8 @@ impl std::fmt::Display for CommitError {
 
 const NOTHING_SELECTED: &str = "Drag to select an area, or click a window, then press Enter.";
 
-/// `save_as` opens a native dialog so this one capture can go anywhere; otherwise it lands in the
-/// default folder. The default is a default, not a cage.
+/// Enter (or ⇧Enter) in the selector: open the capture in the EDITOR. Nothing is written to disk
+/// here (decision 11): the user saves, saves as, or copies from the editor.
 #[tauri::command]
 async fn selection_commit(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>, save_as: bool)
     -> Result<String, CommitError>
@@ -476,10 +484,11 @@ async fn selection_commit(app: tauri::AppHandle, state: tauri::State<'_, Arc<App
     commit(&app, &state, save_as)
 }
 
-/// Nothing destructive happens until the file is safely written. A failure at ANY earlier step
-/// leaves the overlay, the selection and the frozen frame intact, so the user sees the problem
-/// where they are and can retry or adjust, instead of losing a selection they spent time framing.
-fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Result<String, CommitError> {
+/// Crop the selection and open it in a new editor window. Returns the editor's window label.
+///
+/// Nothing destructive happens before the crop succeeds: a failure leaves the overlay, the
+/// selection and the frozen frame intact, so the user sees the problem where they are.
+fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, _save_as: bool) -> Result<String, CommitError> {
     let rect = match *state.drag.lock().unwrap() {
         Some(d) => d.rect(),
         None => return Err(CommitError::Empty(NOTHING_SELECTED.into())),
@@ -494,7 +503,7 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Resul
         return Err(CommitError::Permission(PERMISSION_MESSAGE.into()));
     }
 
-    // Prefer the frozen frames: the file then holds exactly what the user saw while selecting.
+    // Prefer the frozen frames: the capture then holds exactly what the user saw while selecting.
     // Falls back to a live capture if the freeze had not finished or failed.
     let frozen = state.snapshot.lock().unwrap().clone();
     let cropped = match &frozen {
@@ -511,66 +520,250 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, save_as: bool) -> Resul
         other => CommitError::Failed(other.to_string()),
     })?;
 
-    // The name is built from the pattern; `{title}`/`{app}` are untrusted window metadata, so
-    // core sanitises them to a single path component (see bhcapture_core::naming).
-    let (pattern, out_dir, ask, clip) = {
-        let st = state.settings.lock().unwrap();
-        let s = st.get();
-        (Pattern::parse(&s.pattern).unwrap_or_default(),
-         s.output_dir.clone().unwrap_or_else(default_capture_dir),
-         s.always_ask_where_to_save,
-         s.copy_to_clipboard)
-    };
-    let stem = pattern.render(local_stamp(), &Fields {
-        width: frame.width(), height: frame.height(), ..Default::default()
-    });
-
-    let asking = save_as || ask;
-    let path = if asking {
-        // The selector deliberately STAYS UP behind the Save dialog. Hiding it first was the plan,
-        // but the overlay came back within ~250 ms of the dialog opening regardless of what was
-        // tried (with and without the panel conversion), so rather than fight AppKit the design
-        // uses it: the user keeps seeing exactly what they are saving, a cancelled dialog needs no
-        // restore step, and the dialog (a modal panel) sits above the overlay.
-        // The selector's global Enter/Esc must NOT be live while the dialog is up, or the dialog could
-        // never receive its own. Waited for: a merely queued disarm would race the dialog opening.
-        set_selector_keys(app, false, true);
-        let picked = app.dialog().file()
-            .set_title("Save capture")
-            .set_directory(&out_dir)
-            .set_file_name(format!("{stem}.png"))
-            .add_filter("PNG image", &["png"])
-            .blocking_save_file();
-        set_selector_keys(app, true, false); // the selector is still up behind it
-        match picked.map(|p| p.into_path()) {
-            Some(Ok(p)) => p,
-            Some(Err(e)) => return Err(CommitError::Failed(e.to_string())),
-            None => return Err(CommitError::Cancelled("Save cancelled. Your selection is still here.".into())),
-        }
-    } else {
-        let _ = std::fs::create_dir_all(&out_dir);
-        unique_path(&out_dir, &stem, "png", &|p| p.exists())
-    };
-
-    if let Err(e) = write_png(&frame, &path) {
-        return Err(CommitError::Failed(format!("Could not save the file: {e}")));
-    }
-
-    // Written. Only now is it safe to tear the selector down.
+    // Cropped. The selector's job is done.
     *state.drag.lock().unwrap() = None;
     release_frozen(state);
     broadcast(app, None);
     hide_overlays(app);
 
-    // Clipboard is a convenience on top of a file that already exists -- never fail the capture
-    // for it, just say so.
-    if clip {
-        if let Err(e) = copy_to_clipboard(&frame) {
-            eprintln!("[warn] capture saved but clipboard copy failed: {e}");
+    open_editor(app, state, frame).map_err(CommitError::Failed)
+}
+
+/// Where a save goes, and in which format: the default folder with a generated, collision-free name,
+/// or a native Save dialog. The webview never supplies a path -- it only says "save" or "save as".
+///
+/// In Save As the extension the user types wins (`shot.jpg` is a JPEG even if PNG was selected), and a
+/// name with no extension we write gets the selected format's.
+fn choose_save_path(app: &tauri::AppHandle, state: &AppState, width: u32, height: u32, save_as: bool,
+                    format: ImageFormat, parent: Option<&tauri::WebviewWindow>)
+                    -> Result<(std::path::PathBuf, ImageFormat), CommitError> {
+    // The name is built from the pattern; `{title}`/`{app}` are untrusted window metadata, so
+    // core sanitises them to a single path component (see bhcapture_core::naming).
+    let (pattern, out_dir, ask) = {
+        let st = state.settings.lock().unwrap();
+        let s = st.get();
+        (Pattern::parse(&s.pattern).unwrap_or_default(),
+         s.output_dir.clone().unwrap_or_else(default_capture_dir),
+         s.always_ask_where_to_save)
+    };
+    let stem = pattern.render(local_stamp(), &Fields { width, height, ..Default::default() });
+
+    if save_as || ask {
+        let mut d = app.dialog().file()
+            .set_title("Save capture")
+            .set_directory(&out_dir)
+            .set_file_name(format!("{stem}.{}", format.extension()));
+        // The selected format first, so it is the dialog's default; every other format after it.
+        d = d.add_filter(format.label(), format.extensions());
+        for f in ALL_FORMATS.iter().filter(|f| **f != format) {
+            d = d.add_filter(f.label(), f.extensions());
         }
+        if let Some(w) = parent { d = d.set_parent(w); }
+        match d.blocking_save_file().map(|p| p.into_path()) {
+            Some(Ok(mut p)) => {
+                let chosen = match ImageFormat::from_path(&p) {
+                    Some(f) => f,
+                    None => {
+                        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        p.set_file_name(format!("{name}.{}", format.extension()));
+                        format
+                    }
+                };
+                Ok((p, chosen))
+            }
+            Some(Err(e)) => Err(CommitError::Failed(e.to_string())),
+            None => Err(CommitError::Cancelled("Save cancelled.".into())),
+        }
+    } else {
+        let _ = std::fs::create_dir_all(&out_dir);
+        Ok((unique_path(&out_dir, &stem, format.extension(), &|p| p.exists()), format))
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The editor
+// ---------------------------------------------------------------------------------------------
+
+/// Open `frame` in a new editor window. Windows are created on the main thread; this waits for it.
+/// Must not be called ON the main thread (every caller is a command or worker thread).
+fn open_editor(app: &tauri::AppHandle, state: &Arc<AppState>, frame: Frame) -> Result<String, String> {
+    let id = state.next_editor.fetch_add(1, Ordering::SeqCst) + 1;
+    let (w, h, scale) = (frame.width(), frame.height(), frame.scale().get());
+    state.editors.lock().unwrap().insert(id, EditorDoc { frame, saved_to: None });
+
+    // Show the capture at 1:1 (in points) when it fits, otherwise fit 85% of the main display.
+    let (dw, dh) = state.layout.lock().unwrap().displays().first()
+        .map(|d| (d.bounds.size.w, d.bounds.size.h)).unwrap_or((1440.0, 900.0));
+    let (iw, ih) = (w as f64 / scale, h as f64 / scale);
+    let ww = (iw + 48.0).clamp(820.0_f64.min(dw * 0.85), dw * 0.85);
+    let wh = (ih + 128.0).clamp(520.0_f64.min(dh * 0.85), dh * 0.85);
+
+    let label = format!("{EDITOR_PREFIX}{id}");
+    let (a, l) = (app.clone(), label.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let queued = app.run_on_main_thread(move || {
+        let r = WebviewWindowBuilder::new(&a, &l, WebviewUrl::App("index.html".into()))
+            .title(format!("BHCapture — {w} × {h}"))
+            .inner_size(ww, wh)
+            .min_inner_size(640.0, 420.0)
+            .center()
+            .resizable(true)
+            .build();
+        let _ = tx.send(match r {
+            Ok(win) => {
+                // A real window: the Dock icon appears (decision 10), and regular mode lets it focus.
+                sync_dock(&a, None);
+                let _ = win.set_focus();
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        });
+    });
+    let built = if queued.is_ok() {
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_else(|_| Err("timed out opening the editor".into()))
+    } else {
+        Err("could not reach the main thread".into())
+    };
+    if let Err(e) = built {
+        state.editors.lock().unwrap().remove(&id); // do not keep pixels nobody can see
+        return Err(format!("Could not open the editor: {e}"));
+    }
+    println!("[editor] opened {label}: {w}x{h} px");
+    Ok(label)
+}
+
+fn editor_id_of(label: &str) -> Result<u64, String> {
+    label.strip_prefix(EDITOR_PREFIX).and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("{label} is not an editor window"))
+}
+
+#[derive(Serialize)]
+struct EditorInfo { id: u64, width: u32, height: u32, scale: f64, saved_to: Option<String>, format: ImageFormat }
+
+#[tauri::command]
+fn editor_info(window: tauri::Window, state: tauri::State<Arc<AppState>>) -> Result<EditorInfo, String> {
+    let id = editor_id_of(window.label())?;
+    let format = state.settings.lock().unwrap().get().image_format;
+    let docs = state.editors.lock().unwrap();
+    let d = docs.get(&id).ok_or("this capture is no longer open")?;
+    Ok(EditorInfo { id, width: d.frame.width(), height: d.frame.height(), scale: d.frame.scale().get(),
+                    saved_to: d.saved_to.as_ref().map(|p| p.display().to_string()), format })
+}
+
+/// The capture's pixels as raw RGBA8, sent as binary rather than a multi-megabyte JSON array.
+#[tauri::command]
+fn editor_pixels(window: tauri::Window, state: tauri::State<Arc<AppState>>) -> Result<tauri::ipc::Response, String> {
+    let id = editor_id_of(window.label())?;
+    let docs = state.editors.lock().unwrap();
+    let d = docs.get(&id).ok_or("this capture is no longer open")?;
+    Ok(tauri::ipc::Response::new(d.frame.to_rgba8()))
+}
+
+/// Largest image the editor may hand back. Far above any real screen (an 8K display at 2x is
+/// ~530 MP), it only stops a runaway allocation.
+const MAX_EDITOR_PNG: usize = 1 << 30;
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// The editor's rendered image, checked before anything is done with it.
+fn png_from_request(request: &tauri::ipc::Request<'_>) -> Result<(Vec<u8>, u32, u32), String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected the image as raw PNG bytes".into());
+    };
+    if bytes.len() > MAX_EDITOR_PNG { return Err("image is too large".into()); }
+    if !bytes.starts_with(PNG_SIGNATURE) { return Err("not a PNG image".into()); }
+    let info = png::Decoder::new(std::io::Cursor::new(bytes.as_slice())).read_info()
+        .map_err(|e| format!("not a valid PNG: {e}"))?;
+    let (w, h) = (info.info().width, info.info().height);
+    Ok((bytes.clone(), w, h))
+}
+
+/// Write a capture readable only by this user (0600). A screenshot can hold anything that was on
+/// screen; under a usual 022 umask `fs::write` would make it world-readable (0644) wherever it is
+/// saved, so a capture saved to a shared folder would be readable by other accounts (Codex review).
+/// The user can still share the file deliberately; it is just never exposed by default.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    { use std::os::unix::fs::OpenOptionsExt; o.mode(0o600); }
+    let mut f = o.open(path)?;
+    f.write_all(bytes)?;
+    // An existing file keeps its old mode on open(), so set it explicitly too.
+    #[cfg(unix)]
+    { use std::os::unix::fs::PermissionsExt; let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)); }
+    f.sync_all()
+}
+
+/// Decode the editor's PNG into straight RGBA8.
+fn decode_png_rgba(png: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    let mut dec = png::Decoder::new(std::io::Cursor::new(png));
+    dec.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
+    let mut reader = dec.read_info().map_err(|e| e.to_string())?;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return Err("unexpected PNG format".into());
+    }
+    buf.truncate(info.buffer_size());
+    Ok((buf, info.width, info.height))
+}
+
+fn rgba_to_clipboard(rgba: Vec<u8>, w: u32, h: u32) -> Result<(), String> {
+    arboard::Clipboard::new().map_err(|e| e.to_string())?
+        .set_image(arboard::ImageData { width: w as usize, height: h as usize, bytes: std::borrow::Cow::Owned(rgba) })
+        .map_err(|e| e.to_string())
+}
+
+/// Save the EDITED capture. The body is a lossless PNG the editor rendered; headers say
+/// `x-save-as: 1` for a dialog and `x-format: jpeg|png|webp|tiff|bmp|gif`. The path is always chosen
+/// here, never by the webview, and the file is re-encoded here in the format chosen.
+#[tauri::command]
+async fn editor_save(app: tauri::AppHandle, window: tauri::WebviewWindow, state: tauri::State<'_, Arc<AppState>>,
+                     request: tauri::ipc::Request<'_>) -> Result<String, CommitError> {
+    let id = editor_id_of(window.label()).map_err(CommitError::Failed)?;
+    let save_as = request.headers().get("x-save-as").map_or(false, |v| v.as_bytes() == b"1");
+    let (default_format, quality, clip) = {
+        let st = state.settings.lock().unwrap();
+        let s = st.get();
+        (s.image_format, s.jpeg_quality, s.copy_to_clipboard)
+    };
+    let wanted = request.headers().get("x-format").and_then(|v| v.to_str().ok())
+        .and_then(ImageFormat::parse).unwrap_or(default_format);
+    let (png, w, h) = png_from_request(&request).map_err(CommitError::Failed)?;
+    if !state.editors.lock().unwrap().contains_key(&id) {
+        return Err(CommitError::Failed("this capture is no longer open".into()));
+    }
+
+    let (path, format) = choose_save_path(&app, &state, w, h, save_as, wanted, Some(&window))?;
+    let (rgba, rw, rh) = decode_png_rgba(&png).map_err(CommitError::Failed)?;
+    let bytes = export::encode(&rgba, rw, rh, format, quality).map_err(|e| CommitError::Failed(e.to_string()))?;
+    write_private(&path, &bytes).map_err(|e| CommitError::Failed(format!("Could not save the file: {e}")))?;
+    if let Some(d) = state.editors.lock().unwrap().get_mut(&id) { d.saved_to = Some(path.clone()); }
+
+    // Clipboard is a convenience on top of a file that already exists -- never fail the save for it.
+    if clip {
+        if let Err(e) = rgba_to_clipboard(rgba, rw, rh) { eprintln!("[warn] saved but clipboard copy failed: {e}"); }
+    }
+    println!("[editor] {} saved {w}x{h} as {} ({} bytes) to {}", window.label(), format.label(), bytes.len(), path.display());
     Ok(path.display().to_string())
 }
+
+#[tauri::command]
+async fn editor_copy(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let (png, _, _) = png_from_request(&request)?;
+    let (rgba, w, h) = decode_png_rgba(&png)?;
+    rgba_to_clipboard(rgba, w, h)
+}
+
+/// Close an editor for good (the page has already asked about unsaved changes).
+#[tauri::command]
+fn editor_close(window: tauri::WebviewWindow, state: tauri::State<Arc<AppState>>) -> Result<(), String> {
+    let id = editor_id_of(window.label())?;
+    state.editors.lock().unwrap().remove(&id);
+    window.destroy().map_err(|e| e.to_string())
+}
+
 
 const PERMISSION_MESSAGE: &str = "BHCapture is not allowed to record the screen yet. \
     Allow it in System Settings, then relaunch BHCapture. A running app never sees a new grant.";
@@ -657,22 +850,19 @@ fn selector_keys() -> &'static [(HotKey, SelectorKey)] {
     })
 }
 
-/// Arm or disarm the selector's keys. Idempotent. With `wait`, returns only once it has happened
-/// (bounded), which the Save dialog needs: its own Enter/Esc must not be swallowed.
-fn set_selector_keys(app: &tauri::AppHandle, on: bool, wait: bool) {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let queued = app.run_on_main_thread(move || {
-        if SELECTOR_KEYS_ARMED.swap(on, Ordering::SeqCst) != on {
-            if let Some(m) = HOTKEY_MANAGER.lock().unwrap().as_ref() {
-                for (hk, _) in selector_keys() {
-                    let r = if on { m.0.register(*hk) } else { m.0.unregister(*hk) };
-                    if let Err(e) = r { eprintln!("[keys] {} {:?} failed: {e}", if on { "register" } else { "unregister" }, hk); }
-                }
+/// Arm or disarm on the CURRENT thread, which must be the main thread. Show/hide call this inside
+/// the same main-thread step as the window change, so the two can never be reordered: queuing
+/// "show" and "arm" separately let a cancel slip between them and leave Esc/Enter captured
+/// system-wide behind a hidden selector (found by the Codex review).
+fn apply_selector_keys(on: bool) {
+    if SELECTOR_KEYS_ARMED.swap(on, Ordering::SeqCst) != on {
+        if let Some(m) = HOTKEY_MANAGER.lock().unwrap().as_ref() {
+            for (hk, _) in selector_keys() {
+                let r = if on { m.0.register(*hk) } else { m.0.unregister(*hk) };
+                if let Err(e) = r { eprintln!("[keys] {} {:?} failed: {e}", if on { "register" } else { "unregister" }, hk); }
             }
         }
-        let _ = tx.send(());
-    });
-    if wait && queued.is_ok() { let _ = rx.recv_timeout(std::time::Duration::from_millis(1500)); }
+    }
 }
 
 /// Run a capture off the event thread (it crops, writes a file and may open a dialog) and report a
@@ -876,6 +1066,7 @@ fn show_overlays(app: &tauri::AppHandle) {
                 let _ = webview.set_focus();
             }
         }
+        apply_selector_keys(true);
     });
 }
 
@@ -903,6 +1094,8 @@ fn main() {
         cands: Mutex::new(Vec::new()),
         overlay_ids: Mutex::new(Vec::new()),
         epoch: AtomicU64::new(0),
+        editors: Mutex::new(std::collections::HashMap::new()),
+        next_editor: AtomicU64::new(0),
     });
     apply_settings(&state);
 
@@ -911,15 +1104,32 @@ fn main() {
         .manage(state.clone())
         // The moment the last real window goes, the Dock icon goes with it.
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::Destroyed = event {
-                sync_dock(window.app_handle(), Some(window.label()));
+            match event {
+                // An editor holds a capture that may not be saved anywhere yet. Closing it with the
+                // red button must ASK, which the page does (its own dialog: window.confirm is a no-op
+                // that returns true in a Tauri webview). The page then calls editor_close.
+                tauri::WindowEvent::CloseRequested { api, .. } if window.label().starts_with(EDITOR_PREFIX) => {
+                    api.prevent_close();
+                    let _ = window.emit_to(window.label(), "editor-close-requested", ());
+                }
+                tauri::WindowEvent::Destroyed => {
+                    // Free the pixels the moment their window is gone.
+                    if let Ok(id) = editor_id_of(window.label()) {
+                        if let Some(st) = window.app_handle().try_state::<Arc<AppState>>() {
+                            st.editors.lock().unwrap().remove(&id);
+                        }
+                    }
+                    sync_dock(window.app_handle(), Some(window.label()));
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
             overlay_info, selection_begin, selection_update,
             selection_nudge, selection_cancel, selection_commit,
             snap_at, loupe, selection_set_rect, open_privacy_settings, relaunch_app, report_overlay_focus,
-            settings_get, settings_save, settings_pick_dir, open_settings
+            settings_get, settings_save, settings_pick_dir, open_settings,
+            editor_info, editor_pixels, editor_save, editor_copy, editor_close
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -1025,36 +1235,6 @@ fn main() {
                     ms(2500);
                     println!("[keys] after ESC: overlay visible = {}, armed = {}",
                         w.is_visible().unwrap_or(true), SELECTOR_KEYS_ARMED.load(Ordering::SeqCst));
-                    ms(300);
-                    h.exit(0);
-                });
-            }
-
-            if std::env::args().any(|a| a == "--demo-saveas") {
-                let (h, st) = (handle.clone(), state.clone());
-                std::thread::spawn(move || {
-                    let ms = |n| std::thread::sleep(std::time::Duration::from_millis(n));
-                    let js = |t: &str, x: f64, y: f64| format!(
-                        "(()=>{{const el=document.elementFromPoint({x},{y})||document.body;\
-                         el.dispatchEvent(new MouseEvent('{t}',{{bubbles:true,cancelable:true,\
-                         clientX:{x},clientY:{y},button:0}}));}})()");
-                    ms(5000); // the harness puts another app in front meanwhile
-                    open_selector(&h);
-                    ms(900);
-                    let w = h.get_webview_window("overlay-1").expect("overlay-1");
-                    let _ = w.eval(&js("mousedown", 300.0, 300.0));
-                    for i in 1..=5 { let _ = w.eval(&js("mousemove", 300.0 + 40.0 * i as f64, 300.0 + 25.0 * i as f64)); ms(40); }
-                    let _ = w.eval(&js("mouseup", 500.0, 425.0));
-                    ms(400);
-                    println!("[saveas] selection made; opening the Save dialog (blocks until it is dismissed)");
-                    let r = commit(&h, &st, true);
-                    println!("[saveas] dialog dismissed -> {:?}", r.as_ref().map(|_| "saved").map_err(|e| e.message().to_string()));
-                    ms(600);
-                    println!("[saveas] after CANCEL: selection kept = {}, overlay still up = {}",
-                        st.drag.lock().unwrap().is_some(), w.is_visible().unwrap_or(false));
-                    println!("[saveas] HOLD-AFTER-CANCEL");
-                    ms(3500); // the harness sends a second Esc here: it must now reach the OVERLAY
-                    println!("[saveas] 3.5 s later: overlay visible = {}", w.is_visible().unwrap_or(false));
                     ms(300);
                     h.exit(0);
                 });
