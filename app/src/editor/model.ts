@@ -1,7 +1,17 @@
 // The editor's annotation model and renderer. Pure functions over a canvas, so the SAME code draws
 // the on-screen view and the exported file -- what you see is exactly what gets saved.
 
-export type Tool = "select" | "arrow" | "rect" | "text" | "highlight" | "pixelate" | "step";
+export type Tool = "select" | "arrow" | "darrow" | "line" | "ellipse" | "rect" | "text" | "highlight" | "pixelate" | "step";
+
+/** Drawn from a start point to an end point (hit and selected along the line, not as a box). */
+export const isLineKind = (k: Tool) => k === "arrow" || k === "darrow" || k === "line";
+
+/** A perfect square/circle from a drag: the shorter side follows the longer (Shift). */
+export function squared(s: Shape): Shape {
+  const dx = s.x2 - s.x1, dy = s.y2 - s.y1;
+  const d = Math.max(Math.abs(dx), Math.abs(dy));
+  return { ...s, x2: s.x1 + Math.sign(dx || 1) * d, y2: s.y1 + Math.sign(dy || 1) * d };
+}
 
 export type Shape = {
   id: number;
@@ -51,8 +61,18 @@ function distToSegment(px: number, py: number, s: Shape) {
 export function hitTest(shapes: Shape[], x: number, y: number, k: number, ctx?: CanvasRenderingContext2D): Shape | null {
   for (let i = shapes.length - 1; i >= 0; i--) {
     const s = shapes[i];
-    if (s.kind === "arrow") {
+    if (isLineKind(s.kind)) {
       if (distToSegment(x, y, s) <= (s.width * k) / 2 + 8 * k) return s;
+      continue;
+    }
+    if (s.kind === "ellipse") {
+      // Hit on the OUTLINE, like a box: inside it, the click goes to what is underneath.
+      const b = box(s);
+      const rx = b.w / 2 || 1, ry = b.h / 2 || 1;
+      const nx = (x - (b.x + rx)) / rx, ny = (y - (b.y + ry)) / ry;
+      const r = Math.hypot(nx, ny);
+      const tol = ((s.width * k) / 2 + 8 * k) / Math.min(rx, ry);
+      if (Math.abs(r - 1) <= tol) return s;
       continue;
     }
     const b = bounds(s, k, ctx);
@@ -120,16 +140,28 @@ export function render(ctx: CanvasRenderingContext2D, base: CanvasImageSource, W
       ctx.globalCompositeOperation = "multiply";
       ctx.fillRect(b.x, b.y, b.w, b.h);
       ctx.restore();
-    } else if (s.kind === "arrow") {
+    } else if (s.kind === "ellipse") {
+      const b = box(s);
+      ctx.beginPath();
+      ctx.ellipse(b.x + b.w / 2, b.y + b.h / 2, Math.max(b.w / 2, 0.5), Math.max(b.h / 2, 0.5), 0, 0, Math.PI * 2);
+      ctx.stroke();
+    } else if (isLineKind(s.kind)) {
       const ang = Math.atan2(s.y2 - s.y1, s.x2 - s.x1);
       const head = Math.max(14 * k, lw * 3.6);
-      const bx = s.x2 - Math.cos(ang) * head * 0.85, by = s.y2 - Math.sin(ang) * head * 0.85;
-      ctx.beginPath(); ctx.moveTo(s.x1, s.y1); ctx.lineTo(bx, by); ctx.stroke();
-      ctx.beginPath();
-      ctx.moveTo(s.x2, s.y2);
-      ctx.lineTo(s.x2 - head * Math.cos(ang - 0.45), s.y2 - head * Math.sin(ang - 0.45));
-      ctx.lineTo(s.x2 - head * Math.cos(ang + 0.45), s.y2 - head * Math.sin(ang + 0.45));
-      ctx.closePath(); ctx.fill();
+      const atEnd = s.kind !== "line", atStart = s.kind === "darrow";
+      // Stop the shaft short of each head, so a thick line does not poke through the point.
+      const ex = atEnd ? s.x2 - Math.cos(ang) * head * 0.85 : s.x2, ey = atEnd ? s.y2 - Math.sin(ang) * head * 0.85 : s.y2;
+      const sx = atStart ? s.x1 + Math.cos(ang) * head * 0.85 : s.x1, sy = atStart ? s.y1 + Math.sin(ang) * head * 0.85 : s.y1;
+      ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+      const tip = (x: number, y: number, a: number) => {
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(x - head * Math.cos(a - 0.45), y - head * Math.sin(a - 0.45));
+        ctx.lineTo(x - head * Math.cos(a + 0.45), y - head * Math.sin(a + 0.45));
+        ctx.closePath(); ctx.fill();
+      };
+      if (atEnd) tip(s.x2, s.y2, ang);
+      if (atStart) tip(s.x1, s.y1, ang + Math.PI);
     } else if (s.kind === "step") {
       const r = 15 * k;
       ctx.beginPath(); ctx.arc(s.x1, s.y1, r, 0, Math.PI * 2); ctx.fill();
@@ -152,7 +184,7 @@ export function render(ctx: CanvasRenderingContext2D, base: CanvasImageSource, W
   if (!forExport && selectedId !== null) {
     const s = shapes.find((x) => x.id === selectedId);
     if (s) {
-      const b = s.kind === "arrow" ? box(s) : bounds(s, k, ctx);
+      const b = isLineKind(s.kind) || s.kind === "ellipse" ? box(s) : bounds(s, k, ctx);
       const pad = 5 * k;
       ctx.setLineDash([6 * k, 4 * k]);
       ctx.lineWidth = 1.5 * k;

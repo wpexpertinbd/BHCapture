@@ -1,3 +1,4 @@
+import { isLineKind, squared } from "./model";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -12,9 +13,17 @@ const FORMATS: { value: Format; label: string }[] = [
   { value: "tiff", label: "TIFF" }, { value: "bmp", label: "BMP" }, { value: "gif", label: "GIF" },
 ];
 
+/** The shapes group: one toolbar button showing the current pick, with the rest behind its ▾.
+ *  Arrow first and the default -- the most used annotation. */
+const SHAPES: { tool: Tool; key: string; label: string; icon: string }[] = [
+  { tool: "arrow", key: "a", label: "Arrow", icon: "↗" },
+  { tool: "darrow", key: "d", label: "Double arrow", icon: "↔" },
+  { tool: "line", key: "l", label: "Line", icon: "╱" },
+  { tool: "ellipse", key: "o", label: "Circle", icon: "◯" },
+];
+
 const TOOLS: { tool: Tool; key: string; label: string; icon: string }[] = [
   { tool: "select", key: "v", label: "Select", icon: "➚" },
-  { tool: "arrow", key: "a", label: "Arrow", icon: "↗" },
   { tool: "rect", key: "r", label: "Box", icon: "▭" },
   { tool: "text", key: "t", label: "Text", icon: "T" },
   { tool: "highlight", key: "h", label: "Highlight", icon: "▬" },
@@ -68,6 +77,10 @@ export function Editor() {
   const [doc, dispatch] = useReducer(reduce, { shapes: [], undo: [], redo: [], dirty: true, nextId: 1 });
   const { shapes, dirty } = doc;
   const [tool, setTool] = useState<Tool>("arrow");
+  // The shape the group button currently stands for (Arrow until another is picked).
+  const [shape, setShape] = useState<Tool>("arrow");
+  const [shapeMenu, setShapeMenu] = useState(false);
+  const pickShape = (t: Tool) => { setShape(t); setTool(t); setShapeMenu(false); };
   const [color, setColor] = useState(COLORS[0]);
   const [width, setWidth] = useState(WIDTHS[1]);
   const [format, setFormat] = useState<Format>("jpeg");
@@ -235,7 +248,11 @@ export function Editor() {
     if (!d) return;
     const p = toImage(e);
     if (d.mode === "draw") {
-      if (draftRef.current) setDraftBoth({ ...draftRef.current, x2: p.x, y2: p.y });
+      if (draftRef.current) {
+        const next = { ...draftRef.current, x2: p.x, y2: p.y };
+        // Shift: a perfect circle / square.
+        setDraftBoth(e.shiftKey && (next.kind === "ellipse" || next.kind === "rect") ? squared(next) : next);
+      }
     } else if (d.orig) {
       d.moved = true;
       dispatch({ t: "moveLive", id: d.orig.id, to: moved(d.orig, p.x - d.x, p.y - d.y) });
@@ -249,9 +266,10 @@ export function Editor() {
     if (d.mode === "draw" && draftRef.current) {
       // Include the release point itself: a fast flick can end without a final move event.
       const p = toImage(e);
-      const fin = { ...draftRef.current, x2: p.x, y2: p.y };
+      const raw = { ...draftRef.current, x2: p.x, y2: p.y };
+      const fin = e.shiftKey && (raw.kind === "ellipse" || raw.kind === "rect") ? squared(raw) : raw;
       const b = box(fin);
-      const big = fin.kind === "arrow" ? Math.hypot(fin.x2 - fin.x1, fin.y2 - fin.y1) > 6 * k : b.w > 4 * k && b.h > 4 * k;
+      const big = isLineKind(fin.kind) ? Math.hypot(fin.x2 - fin.x1, fin.y2 - fin.y1) > 6 * k : b.w > 4 * k && b.h > 4 * k;
       if (big) {
         const { id: _drop, ...rest } = fin;
         dispatch({ t: "add", shape: rest });
@@ -289,6 +307,8 @@ export function Editor() {
         e.preventDefault(); dispatch({ t: "remove", id: selected }); setSelected(null); return;
       }
       if (e.key === "Escape") { setSelected(null); setDraftBoth(null); return; }
+      const sh = SHAPES.find((s) => s.key === key);
+      if (sh) { pickShape(sh.tool); return; }
       const t = TOOLS.find((t) => t.key === key);
       if (t) { setTool(t.tool); if (t.tool !== "select") setSelected(null); }
     };
@@ -311,11 +331,36 @@ export function Editor() {
     <div className="editor">
       <div className="ed-toolbar">
         <div className="ed-group">
-          {TOOLS.map((t) => (
-            <button key={t.tool} className={`ed-tool ${tool === t.tool ? "on" : ""}`}
-                    title={`${t.label} (${t.key.toUpperCase()})`} onClick={() => setTool(t.tool)}>
-              <span className="ed-icon">{t.icon}</span><span className="ed-label">{t.label}</span>
-            </button>
+          {TOOLS.map((t, i) => (
+            <span key={t.tool} style={{ display: "contents" }}>
+              <button className={`ed-tool ${tool === t.tool ? "on" : ""}`}
+                      title={`${t.label} (${t.key.toUpperCase()})`} onClick={() => setTool(t.tool)}>
+                <span className="ed-icon">{t.icon}</span><span className="ed-label">{t.label}</span>
+              </button>
+              {i === 0 && (() => {
+                const cur = SHAPES.find((s) => s.tool === shape) ?? SHAPES[0];
+                return (
+                  <span className="ed-shapes">
+                    <button className={`ed-tool ${tool === cur.tool ? "on" : ""}`}
+                            title={`${cur.label} (${cur.key.toUpperCase()})`} onClick={() => setTool(cur.tool)}>
+                      <span className="ed-icon">{cur.icon}</span><span className="ed-label">{cur.label}</span>
+                    </button>
+                    <button className={`ed-more ${shapeMenu ? "open" : ""}`} title="More shapes"
+                            onClick={() => setShapeMenu((v) => !v)}>▾</button>
+                    {shapeMenu && (
+                      <div className="ed-shape-menu" role="menu" onMouseLeave={() => setShapeMenu(false)}>
+                        {SHAPES.map((s) => (
+                          <button key={s.tool} role="menuitem" className={s.tool === shape ? "on" : ""}
+                                  onClick={() => pickShape(s.tool)}>
+                            <span className="ed-icon">{s.icon}</span>{s.label}<kbd>{s.key.toUpperCase()}</kbd>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </span>
+                );
+              })()}
+            </span>
           ))}
         </div>
         <div className="ed-group">

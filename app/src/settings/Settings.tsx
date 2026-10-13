@@ -57,6 +57,8 @@ function previewName(pattern: string): string {
 export function Settings() {
   const [view, setView] = useState<SettingsView | null>(null);
   const [draft, setDraft] = useState<SettingsData | null>(null);
+  // Tabs, so nothing important sits below the fold of a long page (the shortcuts used to).
+  const [tab, setTab] = useState<"general" | "shortcuts" | "recording">("general");
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -107,6 +109,15 @@ export function Settings() {
       {view.notice && <div className="banner"><b>Some values were adjusted</b>{view.notice}</div>}
       {error && <div className="banner"><b>Could not save</b>{error}</div>}
 
+      <div className="tabs" role="tablist">
+        {(["general", "shortcuts", "recording"] as const).map((t) => (
+          <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>
+            {({ general: "General", shortcuts: "Shortcuts", recording: "Recording" })[t]}
+          </button>
+        ))}
+      </div>
+
+      {tab === "general" && (<>
       <div className="row">
         <label className="title" htmlFor="dir">Save captures to</label>
         <div className="with-button">
@@ -146,18 +157,6 @@ export function Settings() {
             <span className="d">The file is still written either way.</span></span>
         </label>
         <label className="check">
-          <input type="checkbox" checked={draft.record_voice_clarity}
-                 onChange={(e) => set("record_voice_clarity", e.target.checked)} />
-          <span><span className="t">Voice clarity (recordings)</span>
-            <span className="d">Takes the boom out of a laptop microphone and brings out the consonants, so a voice sounds natural instead of deep and muffled.</span></span>
-        </label>
-        <label className="check">
-          <input type="checkbox" checked={draft.record_auto_level}
-                 onChange={(e) => set("record_auto_level", e.target.checked)} />
-          <span><span className="t">Automatic microphone level (recordings)</span>
-            <span className="d">Brings a quiet voice up to a normal loudness, so recordings play back at normal volume. The pauses between words are never boosted.</span></span>
-        </label>
-        <label className="check">
           <input type="checkbox" checked={draft.include_cursor}
                  onChange={(e) => set("include_cursor", e.target.checked)} />
           <span><span className="t">Include the mouse pointer</span>
@@ -177,13 +176,25 @@ export function Settings() {
             <option value="bmp">BMP</option>
             <option value="gif">GIF</option>
           </select>
-          <input type="text" inputMode="numeric" style={{ maxWidth: 70 }} value={String(draft.jpeg_quality)}
+          <input type="text" inputMode="numeric" className="quality" value={String(draft.jpeg_quality)}
                  title="JPEG quality, 1-100"
                  onChange={(e) => set("jpeg_quality", Number(e.target.value.replace(/[^0-9]/g, "")) || 0)} />
         </div>
         <div className="help">The editor starts on this format; you can pick another per capture. The number is JPEG quality (1-100, default 90). JPEG has no transparency, so transparent areas become white.</div>
       </div>
 
+      <div className="row">
+        <label className="title" htmlFor="th">Appearance</label>
+        <select id="th" value={draft.theme} onChange={(e) => set("theme", e.target.value as Theme)}>
+          <option value="system">Match system</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </div>
+
+      </>)}
+
+      {tab === "shortcuts" && (<>
       <div className="row">
         <div className="title">Shortcuts</div>
         <div className="help">Click a box and press the keys you want. Shortcuts the system already uses are refused, with the reason.</div>
@@ -212,14 +223,62 @@ export function Settings() {
         </select>
       </div>
 
+      </>)}
+
+      {tab === "recording" && (<>
       <div className="row">
-        <label className="title" htmlFor="th">Appearance</label>
-        <select id="th" value={draft.theme} onChange={(e) => set("theme", e.target.value as Theme)}>
-          <option value="system">Match system</option>
-          <option value="light">Light</option>
-          <option value="dark">Dark</option>
-        </select>
+        <div className="title">Recording</div>
+        <div className="help">The starting options for every recording. The recording bar can change them for one recording; they are remembered.</div>
+        <label className="check">
+          <input type="checkbox" checked={draft.record_system_audio}
+                 onChange={(e) => set("record_system_audio", e.target.checked)} />
+          <span><span className="t">System audio</span>
+            <span className="d">Sound playing on this computer goes into the recording.</span></span>
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={draft.record_microphone}
+                 onChange={(e) => set("record_microphone", e.target.checked)} />
+          <span><span className="t">Microphone</span>
+            <span className="d">Your voice goes into the recording. macOS asks for permission the first time.</span></span>
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={draft.record_noise_filter}
+                 onChange={(e) => set("record_noise_filter", e.target.checked)} />
+          <span><span className="t">Noise filter</span>
+            <span className="d">Removes steady background noise from the microphone: fans, AC, hum, hiss.</span></span>
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={draft.record_voice_clarity}
+                 onChange={(e) => set("record_voice_clarity", e.target.checked)} />
+          <span><span className="t">Voice clarity (recordings)</span>
+            <span className="d">Takes the boom out of a laptop microphone and brings out the consonants, so a voice sounds natural instead of deep and muffled.</span></span>
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={draft.record_auto_level}
+                 onChange={(e) => set("record_auto_level", e.target.checked)} />
+          <span><span className="t">Automatic microphone level (recordings)</span>
+            <span className="d">Brings a quiet voice up to a normal loudness, so recordings play back at normal volume. The pauses between words are never boosted.</span></span>
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={draft.record_cursor}
+                 onChange={(e) => set("record_cursor", e.target.checked)} />
+          <span><span className="t">Show the pointer</span>
+            <span className="d">The mouse pointer is visible in the video.</span></span>
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={draft.record_click_highlight}
+                 onChange={(e) => set("record_click_highlight", e.target.checked)} />
+          <span><span className="t">Click highlight</span>
+            <span className="d">A ring appears in the video wherever you click.</span></span>
+        </label>
+        <label className="check">
+          <input type="checkbox" checked={draft.record_countdown}
+                 onChange={(e) => set("record_countdown", e.target.checked)} />
+          <span><span className="t">Countdown</span>
+            <span className="d">3, 2, 1 before the recording starts.</span></span>
+        </label>
       </div>
+      </>)}
 
       <div className="footer">
         <span className="path">{view.path}</span>

@@ -92,3 +92,24 @@
 .ed-modal-text { color: var(--ed-muted); margin-bottom: 16px; }
 .ed-modal-actions { display: flex; gap: 8px; align-items: center; }
 .editor-loading, .editor-error { padding: 40px; font: 14px -apple-system, system-ui, sans-serif; }
+
+/* Shapes group: the current shape, with the others behind a small ▾. */
+.ed-shapes { position: relative; display: flex; align-items: stretch; }
+.ed-more {
+  width: 16px; margin-left: -4px; border: 0; border-radius: 6px; cursor: pointer;
+  background: transparent; color: var(--ed-muted); font-size: 11px;
+}
+.ed-more:hover, .ed-more.open { background: var(--ed-btn); color: var(--ed-fg); }
+.ed-shape-menu {
+  position: absolute; top: 100%; left: 0; z-index: 20; margin-top: 4px; min-width: 190px; padding: 5px;
+  border-radius: 10px; background: var(--ed-chrome); border: 1px solid var(--ed-line);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+}
+.ed-shape-menu button {
+  display: flex; align-items: center; gap: 10px; width: 100%; padding: 7px 9px; border: 0; border-radius: 7px;
+  background: transparent; color: var(--ed-fg); font: inherit; text-align: left; cursor: pointer;
+}
+.ed-shape-menu button:hover { background: var(--ed-btn); }
+.ed-shape-menu button.on { color: var(--ed-accent); font-weight: 600; }
+.ed-shape-menu .ed-icon { width: 20px; text-align: center; }
+.ed-shape-menu kbd { margin-left: auto; font: 11px ui-monospace, Menlo, monospace; opacity: 0.6; }

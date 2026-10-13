@@ -1901,8 +1901,14 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("error while building BHCapture")
-        .run(|_app, event| {
+        .run(|app, event| {
             // Quitting mid-recording finishes the file, so it is playable and offered next launch.
             if let tauri::RunEvent::Exit = event { recording::finish_on_exit(); }
+            // Opening BHCapture again while it runs (Launchpad, Finder, Spotlight) opens Settings --
+            // a menu-bar app otherwise gives no sign that anything happened.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event { let _ = open_settings(app.clone()); }
+            #[cfg(not(target_os = "macos"))]
+            let _ = app;
         });
 }
