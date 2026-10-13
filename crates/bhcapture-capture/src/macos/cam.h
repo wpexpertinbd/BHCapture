@@ -21,7 +21,7 @@ int32_t bhc_cam_list(char *out, int32_t cap);
 
 /* 0 = not asked yet, 1 = allowed, 2 = denied or restricted. */
 int32_t bhc_cam_permission(void);
-/* Ask (shows the system prompt the first time); blocks up to 60 s. Returns 1 when allowed. */
+/* Ask (shows the system prompt the first time); blocks until answered. Returns 1 when allowed. */
 int32_t bhc_cam_request_permission(void);
 
 /* Start a camera ("" = the default one). `max_height` picks the largest format up to it (e.g.

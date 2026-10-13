@@ -32,7 +32,12 @@ export function CameraBubble() {
       .catch((e) => setError(String(e)));
     const a = listen<Style>("camera-style", (e) => setStyle(e.payload));
     const b = listen<string>("camera-error", (e) => setError(e.payload));
-    return () => { void a.then((f) => f()); void b.then((f) => f()); };
+    // Reopened for a new take: show nothing until its first frame.
+    const c = listen("camera-reset", () => {
+      setLive(false); setError(null);
+      const cv = canvas.current; cv?.getContext("2d")?.clearRect(0, 0, cv.width, cv.height);
+    });
+    return () => { void a.then((f) => f()); void b.then((f) => f()); void c.then((f) => f()); };
   }, []);
 
   const shape = style?.shape ?? "circle";

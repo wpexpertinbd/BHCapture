@@ -37,7 +37,8 @@ pub fn camera_request_permission() -> bool { true }
 fn yuyv_to_bgra(src: &[u8], w: usize, h: usize, stride: usize, out: &mut [u8]) {
     let clamp = |v: i32| v.clamp(0, 255) as u8;
     for y in 0..h {
-        let row = &src[y * stride..];
+        let Some(row) = src.get(y * stride..) else { break };
+        if row.len() < w * 2 { break; }
         for x in (0..w).step_by(2) {
             let i = x * 2;
             if i + 3 >= row.len() { break; }
@@ -63,9 +64,11 @@ pub struct LinuxCamera {
 
 impl LinuxCamera {
     pub fn start(id: &str, max_height: u32, _fps: u32, mut sink: FrameSink) -> Result<Self, CaptureError> {
-        let path = if id.is_empty() {
-            camera_devices().into_iter().next().map(|d| d.id).ok_or_else(|| be("no camera found"))?
-        } else { id.to_string() };
+        // Only a camera the system lists: the setting is a free string, and opening an arbitrary
+        // path would hand it ioctls (audit 2026-10-13). An unknown id falls back to the first camera.
+        let devices = camera_devices();
+        let path = devices.iter().find(|d| !id.is_empty() && d.id == id).or_else(|| devices.first())
+            .map(|d| d.id.clone()).ok_or_else(|| be("no camera found"))?;
         let dev = Device::with_path(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::PermissionDenied { CaptureError::PermissionDenied }
             else { be(format!("the camera could not be opened: {e}")) }
@@ -86,14 +89,33 @@ impl LinuxCamera {
             return Err(be(format!("the camera offers neither MJPEG nor YUYV (it offers {fourcc})")));
         }
         let mut stream = MmapStream::with_buffers(&dev, Type::VideoCapture, 4).map_err(be)?;
+        // Without a timeout a stalled camera blocks next() -- and stopping -- forever.
+        stream.set_timeout(std::time::Duration::from_millis(500));
         let stop = Arc::new(AtomicBool::new(false));
         let s2 = stop.clone();
         let thread = std::thread::spawn(move || {
-            let _dev = dev;
             let mut out = vec![0u8; w * h * 4];
+            let mut failures = 0u32;
             while !s2.load(Ordering::SeqCst) {
-                let Ok((buf, meta)) = stream.next() else { break };
+                let (buf, meta) = match stream.next() {
+                    Ok(x) => { failures = 0; x }
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    // After a stall the buffer queue can be out of step (v4l re-queues a buffer that is
+                    // still queued): start a fresh stream, a few times, before giving up.
+                    Err(e) => {
+                        failures += 1;
+                        if failures > 3 { eprintln!("[camera] stopped: {e}"); break; }
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        match MmapStream::with_buffers(&dev, Type::VideoCapture, 4) {
+                            Ok(mut st) => { st.set_timeout(std::time::Duration::from_millis(500)); stream = st; }
+                            Err(_) => {}
+                        }
+                        continue;
+                    }
+                };
                 let data = &buf[..(meta.bytesused as usize).min(buf.len())];
+                // A short or error frame (bytesused 0) is skipped, never converted.
+                if fourcc == FourCC::new(b"YUYV") && data.len() < stride.max(w * 2) * h { continue; }
                 if fourcc == FourCC::new(b"MJPG") {
                     // image's JPEG decoder (zune-jpeg, already in the build for screenshots).
                     let Ok(img) = image::load_from_memory_with_format(data, image::ImageFormat::Jpeg) else { continue };
@@ -118,8 +140,15 @@ impl LinuxCamera {
 impl Drop for LinuxCamera {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // stream.next() returns within a frame; after the join no callback can run.
-        if let Some(t) = self.thread.take() { let _ = t.join(); }
+        // next() wakes within its 500 ms timeout; wait a little longer than that, then let a stuck
+        // thread finish on its own (it owns its sink, so nothing it touches is freed here).
+        if let Some(t) = self.thread.take() {
+            let t0 = std::time::Instant::now();
+            while !t.is_finished() && t0.elapsed() < std::time::Duration::from_millis(1500) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if t.is_finished() { let _ = t.join(); }
+        }
     }
 }
 
@@ -133,5 +162,12 @@ mod tests {
         super::yuyv_to_bgra(&src, 2, 1, 4, &mut out);
         assert_eq!(&out[0..3], &[0, 0, 0]);
         assert_eq!(&out[4..7], &[255, 255, 255]);
+    }
+
+    #[test]
+    fn a_short_frame_is_not_read_past() {
+        let mut out = [7u8; 16];
+        super::yuyv_to_bgra(&[16u8, 128], 2, 2, 4, &mut out); // far shorter than 2x2
+        super::yuyv_to_bgra(&[], 2, 2, 4, &mut out);
     }
 }

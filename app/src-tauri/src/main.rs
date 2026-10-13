@@ -1711,6 +1711,8 @@ fn main() {
                           try{{ await I.invoke({own:?}); out.own='ok'; }}catch(e){{ out.own='ERR '+e; }}
                           try{{ await I.invoke({foreign:?}, {{settings:{{}}}}); out.foreign='ALLOWED'; }}catch(e){{ out.foreign='refused: '+e; }}
                           const v=document.querySelector('video'); if(v) out.video={{ready:v.readyState, err:v.error&&v.error.code, src:v.currentSrc.slice(0,40)}};
+                          const bar=document.querySelector('.rc-bar'); if(bar) out.bar=[bar.scrollWidth, bar.clientWidth, window.innerWidth];
+                          const tab=[...document.querySelectorAll('.tabs button')].find(b=>b.textContent==='Camera'); if(tab){{ tab.click(); await new Promise(r=>setTimeout(r,300)); out.camtab=document.body.innerText.split('Camera').slice(1).join('Camera').slice(0,400); out.camtabOverflow=document.documentElement.scrollWidth>window.innerWidth; }}
                           await I.invoke('plugin:event|emit',{{event:'sec-probe',payload:out}});
                         }})()"#, label = w.label());
                         let _ = w.eval(&js);
@@ -1821,7 +1823,7 @@ fn main() {
                         let mut g = st.settings.lock().unwrap();
                         let s = g.get().clone();
                         let bg = std::env::var("BHC_CAM_BG").unwrap_or_else(|_| "blur".into());
-                        g.set(Settings { camera_enabled: true, camera_background: bg, camera_shape: "circle".into(),
+                        g.set(Settings { camera_enabled: true, camera_background: bg, camera_shape: std::env::var("BHC_CAM_SHAPE").unwrap_or_else(|_| "circle".into()),
                                          record_countdown: false, record_microphone: false, record_system_audio: false, ..s });
                     }
                     ms(2500);
@@ -1841,10 +1843,12 @@ fn main() {
                     let t0 = std::time::Instant::now();
                     while camera_bubble::FRAMES_SENT.load(Ordering::Relaxed) == 0 && t0.elapsed().as_secs() < 60 { ms(200); }
                     let a = camera_bubble::FRAMES_SENT.load(Ordering::Relaxed);
+                    let ai = camera_bubble::FRAMES_IN.load(Ordering::Relaxed);
                     println!("[camtest] first frame after {:.1}s", t0.elapsed().as_secs_f64());
                     ms(3000);
                     let b = camera_bubble::FRAMES_SENT.load(Ordering::Relaxed);
-                    println!("[camtest] bubble frame rate: {:.1} fps", (b - a) as f64 / 3.0);
+                    let bi = camera_bubble::FRAMES_IN.load(Ordering::Relaxed);
+                    println!("[camtest] bubble frame rate: {:.1} fps (camera delivered {:.1} fps)", (b - a) as f64 / 3.0, (bi - ai) as f64 / 3.0);
                     if let Some(w) = h.get_webview_window(camera_bubble::CAMERA_WINDOW) {
                         let _ = w.eval("(()=>{const c=document.querySelector('canvas');const d=c.getContext('2d').getImageData(0,0,c.width,c.height).data;let n=0,s=0;for(let i=0;i<d.length;i+=4){s+=d[i]+d[i+1]+d[i+2];n++;}window.__TAURI_INTERNALS__.invoke('plugin:event|emit',{event:'sec-probe',payload:{canvas:[c.width,c.height],mean:Math.round(s/n/3),shape:getComputedStyle(document.querySelector('.cam')).borderRadius,msg:document.body.innerText}})})()");
                     }
@@ -1871,7 +1875,18 @@ fn main() {
                     println!("[camtest] second take: bubble open = {}, frames in 4 s = {}", camera_bubble::is_open(&h), after - before);
                     let _ = tauri::async_runtime::block_on(recording::recorder_cancel(h.clone()));
                     ms(1000);
-                    println!("[camtest] after cancel: bubble open = {} (camera stopped = {})", camera_bubble::is_open(&h), camera_bubble::FRAMES_SENT.load(Ordering::Relaxed) == after || true);
+                    let c0 = camera_bubble::FRAMES_SENT.load(Ordering::Relaxed);
+                    ms(1500);
+                    println!("[camtest] after cancel: bubble open = {}, frames in 1.5 s = {} (expect 0: camera off)",
+                        camera_bubble::is_open(&h), camera_bubble::FRAMES_SENT.load(Ordering::Relaxed) - c0);
+                    // Hammer the Camera switch: on/off/on/off with no pause, ending OFF.
+                    let r = LogRect::new(150.0, 120.0, 600.0, 420.0);
+                    for i in 0..6 { camera_bubble::request(&h, i % 2 == 0, Some(r)); }
+                    ms(4000);
+                    let c1 = camera_bubble::FRAMES_SENT.load(Ordering::Relaxed);
+                    ms(1500);
+                    println!("[camtest] after rapid toggles ending off: bubble open = {}, frames in 1.5 s = {} (expect 0)",
+                        camera_bubble::is_open(&h), camera_bubble::FRAMES_SENT.load(Ordering::Relaxed) - c1);
                     ms(1500);
                     h.exit(0);
                 });

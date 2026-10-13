@@ -221,7 +221,7 @@ pub(crate) fn prepare(app: &tauri::AppHandle, state: &Arc<AppState>, rect: LogRe
     open_hud(app, at.x, at.y).map_err(CommitError::Failed)?;
     // The camera bubble, when it is on: shown now, so it can be placed before recording starts.
     if state.settings.lock().unwrap().get().camera_enabled {
-        if let Err(e) = crate::camera_bubble::open(app, target.global) { eprintln!("[camera] {e}"); }
+        crate::camera_bubble::request(app, true, Some(target.global));
     }
     println!("[record] ready: {}x{} pt at ({},{}) on display {} -> ~{}x{} px",
         target.global.size.w, target.global.size.h, target.global.min_x(), target.global.min_y(), target.display.0, px.0, px.1);
@@ -353,9 +353,8 @@ pub(crate) fn recorder_option(app: tauri::AppHandle, state: tauri::State<Arc<App
     st.set(s);
     if name == "camera" {
         let region = SESSION.lock().unwrap().as_ref().map(|s| s.global);
-        let a = app.clone();
-        // Off a sync command's main thread: opening the bubble waits on the main thread.
-        std::thread::spawn(move || if let Err(e) = crate::camera_bubble::set_enabled(&a, value, region) { eprintln!("[camera] {e}"); });
+        // In order, off this sync command's main thread (opening waits on the main thread).
+        crate::camera_bubble::request(&app, value, region);
     }
     // An unreadable settings file refuses saves (see SettingsStore); the option still applies to
     // this recording, it just is not remembered.
@@ -393,6 +392,13 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
     let overlay = format!("{OVERLAY_PREFIX}{}", display.0);
     let click_window = if opts.7 { overlay_window_id(app, &overlay) } else { None };
     // The camera bubble is let into the picture too (on Windows this also clears its exclusion).
+    // The bubble is opened by an ordered worker; give it a moment if Record came straight away.
+    if state.settings.lock().unwrap().get().camera_enabled {
+        let t0 = std::time::Instant::now();
+        while !crate::camera_bubble::is_open(app) && t0.elapsed() < std::time::Duration::from_secs(2) {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
     let camera_window = if crate::camera_bubble::is_open(app) { overlay_window_id(app, crate::camera_bubble::CAMERA_WINDOW) } else { None };
     let include_windows: Vec<u32> = click_window.into_iter().chain(camera_window).collect();
     let rec = Recorder::start(&RecordOptions {
@@ -661,7 +667,8 @@ fn end_session(app: &tauri::AppHandle) {
     BAR_HIDDEN.store(false, Ordering::SeqCst);
     end_take(app);
     hide_hud(app);
-    crate::camera_bubble::close(app);
+    // Through the same ordered queue as the bar's Camera switch, so a late "on" cannot reopen it.
+    crate::camera_bubble::request(app, false, None);
     if let Some(d) = display { show_frame(app, d, None); }
     set_tray_label(app, false);
 }

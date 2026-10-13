@@ -43,6 +43,9 @@ Everything is on the [**latest release**](https://github.com/wpexpertinbd/BHCapt
 - **Noise filter** (RNNoise), **voice clarity** and **automatic level** for the microphone — clear voice
   from a laptop mic, no fan hum, normal loudness.
 - **Click highlight**, countdown, pause/resume, restart, and a control bar you can hide.
+- **Camera bubble** — your camera in the video: circle, rounded, square or wide; any size, drag it
+  anywhere; mirror; auto light; **background removal** (blur, a colour, built-in backgrounds or your
+  own picture). Turn it on or off right on the recording bar.
 - Export as **MP4 (H.264)**, **MP4 (HEVC)** for smaller files, **MOV** (macOS), or **animated GIF**.
 - A recording interrupted by a crash or quit is kept and reopened at the next launch.
 
@@ -95,6 +98,13 @@ sees a new grant.
 ├── SECURITY.md
 └── DISCLAIMER.md              # not affiliated with Snagit / Camtasia
 ```
+
+## 🙏 Third-party
+
+- Camera background removal on Windows and Linux uses Google's **MediaPipe Selfie Segmenter**
+  (Apache-2.0), bundled unchanged — see `crates/bhcapture-core/assets/NOTICE.md`.
+- It runs on **tract** by Sonos (MIT/Apache-2.0); a lightly patched copy lives in
+  `third_party/tract-tflite` (what changed: `BHCAPTURE-PATCH.md`).
 
 ## 📄 License
 MIT — see [`LICENSE`](LICENSE). Not affiliated with, endorsed by, or derived from Snagit, Camtasia or

@@ -129,36 +129,61 @@ impl WinCamera {
                     out.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32).map_err(be)?;
                     reader.SetCurrentMediaType(stream, None, &out).map_err(|e| be(format!("the camera format is not supported: {e}")))?;
                 }
-                let cur = unsafe { reader.GetCurrentMediaType(stream) }.map_err(be)?;
-                let (w, h) = unpack(unsafe { cur.GetUINT64(&MF_MT_FRAME_SIZE) }.map_err(be)?);
-                if w == 0 || h == 0 { return Err(be("the camera reported no frame size")); }
+                // Size and row order of what the reader delivers; read again whenever it changes.
+                let current = |r: &IMFSourceReader| -> Result<(u32, u32, bool), CaptureError> {
+                    let cur = unsafe { r.GetCurrentMediaType(stream) }.map_err(be)?;
+                    let (w, h) = unpack(unsafe { cur.GetUINT64(&MF_MT_FRAME_SIZE) }.map_err(be)?);
+                    // RGB32 is bottom-up unless MF_MT_DEFAULT_STRIDE says otherwise.
+                    let stride = unsafe { cur.GetUINT32(&MF_MT_DEFAULT_STRIDE) }.map(|v| v as i32).unwrap_or(-((w * 4) as i32));
+                    if w == 0 || h == 0 { return Err(be("the camera reported no frame size")); }
+                    Ok((w, h, stride < 0))
+                };
+                let (mut w, mut h, mut bottom_up) = current(&reader)?;
                 let _ = tx.send(Ok(()));
                 let mut frame = vec![0u8; w as usize * h as usize * 4];
                 while !s2.load(Ordering::SeqCst) {
                     let (mut flags, mut sample) = (0u32, None::<IMFSample>);
                     let r = unsafe { reader.ReadSample(stream, 0, None, Some(&mut flags), None, Some(&mut sample)) };
                     if r.is_err() || flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 { break; }
+                    if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32 != 0 {
+                        let Ok(n) = current(&reader) else { break };
+                        (w, h, bottom_up) = n;
+                        frame = vec![0u8; w as usize * h as usize * 4];
+                    }
                     let Some(sample) = sample else { continue };
                     let Ok(buf) = (unsafe { sample.GetBufferByIndex(0) }) else { continue };
-                    // A 2D buffer knows its pitch (negative = bottom-up rows), copy top-down.
+                    let row_bytes = w as usize * 4;
+                    // A 2D buffer knows its pitch (negative = bottom-up rows): copy top-down, only
+                    // when the locked region really holds h rows of that pitch.
                     if let Ok(b2) = buf.cast::<IMF2DBuffer>() {
                         let (mut p, mut pitch) = (std::ptr::null_mut::<u8>(), 0i32);
-                        if unsafe { b2.Lock2D(&mut p, &mut pitch) }.is_ok() && !p.is_null() && pitch.unsigned_abs() >= w * 4 {
-                            for y in 0..h as isize {
-                                let row = unsafe { p.offset(y * pitch as isize) };
-                                let dst = &mut frame[y as usize * w as usize * 4..(y as usize + 1) * w as usize * 4];
-                                unsafe { std::ptr::copy_nonoverlapping(row, dst.as_mut_ptr(), dst.len()) };
+                        if unsafe { b2.Lock2D(&mut p, &mut pitch) }.is_ok() {
+                            let len = unsafe { b2.GetContiguousLength() }.unwrap_or(0) as usize;
+                            let ok = !p.is_null() && pitch.unsigned_abs() as usize >= row_bytes
+                                && pitch.unsigned_abs() as usize * (h as usize - 1) + row_bytes <= len;
+                            if ok {
+                                for y in 0..h as isize {
+                                    let row = unsafe { p.offset(y * pitch as isize) };
+                                    let dst = &mut frame[y as usize * row_bytes..(y as usize + 1) * row_bytes];
+                                    unsafe { std::ptr::copy_nonoverlapping(row, dst.as_mut_ptr(), row_bytes) };
+                                }
                             }
                             let _ = unsafe { b2.Unlock2D() };
-                            sink(&CameraFrame { bgra: &frame, width: w, height: h, stride: w as usize * 4, mask: None });
+                            if ok { sink(&CameraFrame { bgra: &frame, width: w, height: h, stride: row_bytes, mask: None }); }
                         }
                         continue;
                     }
                     let (mut p, mut len) = (std::ptr::null_mut::<u8>(), 0u32);
-                    if unsafe { buf.Lock(&mut p, None, Some(&mut len)) }.is_ok() && !p.is_null() && len as usize >= frame.len() {
-                        unsafe { std::ptr::copy_nonoverlapping(p, frame.as_mut_ptr(), frame.len()) };
+                    if unsafe { buf.Lock(&mut p, None, Some(&mut len)) }.is_ok() {
+                        let ok = !p.is_null() && len as usize >= frame.len();
+                        if ok {
+                            for y in 0..h as usize {
+                                let src_row = if bottom_up { h as usize - 1 - y } else { y };
+                                unsafe { std::ptr::copy_nonoverlapping(p.add(src_row * row_bytes), frame.as_mut_ptr().add(y * row_bytes), row_bytes) };
+                            }
+                        }
                         let _ = unsafe { buf.Unlock() };
-                        sink(&CameraFrame { bgra: &frame, width: w, height: h, stride: w as usize * 4, mask: None });
+                        if ok { sink(&CameraFrame { bgra: &frame, width: w, height: h, stride: row_bytes, mask: None }); }
                     }
                 }
                 unsafe { let _ = source.Shutdown(); }
@@ -180,8 +205,15 @@ impl WinCamera {
 impl Drop for WinCamera {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // ReadSample returns within a frame, so the thread ends promptly; after the join no frame
-        // callback can run.
-        if let Some(t) = self.thread.take() { let _ = t.join(); }
+        // ReadSample normally returns within a frame. A stalled camera must not hang stopping
+        // (and with it the app): wait a moment, then let the thread finish on its own -- it owns
+        // its sink, so nothing it touches is freed here (audit 2026-10-13).
+        if let Some(t) = self.thread.take() {
+            let t0 = std::time::Instant::now();
+            while !t.is_finished() && t0.elapsed() < std::time::Duration::from_millis(1500) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if t.is_finished() { let _ = t.join(); }
+        }
     }
 }

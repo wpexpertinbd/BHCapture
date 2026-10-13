@@ -100,9 +100,20 @@ pub fn preset_image(name: &str, w: u32, h: u32) -> Option<Vec<u8>> {
 /// The user's own background picture, decoded and scaled to cover the output. `None` when the file
 /// is missing, unreadable or not a supported picture (PNG, JPEG, WebP, BMP, TIFF, GIF).
 pub fn background_from_file(path: &std::path::Path, out_w: u32, out_h: u32) -> Option<Vec<u8>> {
-    // Refuse anything large before decoding: a 100 MB "picture" must not stall a recording.
-    if std::fs::metadata(path).ok()?.len() > 40 * 1024 * 1024 { return None; }
-    let img = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?.to_rgba8();
+    // A regular file only (not a FIFO or device, which could block or never end), not huge.
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > 40 * 1024 * 1024 { return None; }
+    let mut reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    // The file size does not bound the pixel count: cap the dimensions and the memory (a 40 MB
+    // picture can otherwise declare a 50+ megapixel image).
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(300 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader.decode().ok()?;
+    // Shrink first (the bubble is at most 1280x720), so the copies below stay small.
+    let img = img.thumbnail(out_w.saturating_mul(2).max(64), out_h.saturating_mul(2).max(64)).to_rgba8();
     cover(img.as_raw(), img.width(), img.height(), out_w, out_h)
 }
 
@@ -323,6 +334,17 @@ mod tests {
         assert_eq!(parse_hex_color("#zzzzzz"), None);
         let red: Vec<u8> = (0..16).flat_map(|_| [255, 0, 0, 255]).collect();
         assert_eq!(&cover(&red, 4, 4, 2, 2).unwrap()[0..4], &[255, 0, 0, 255], "colours survive (no R/B swap)");
+    }
+
+    #[test]
+    fn a_background_picture_must_be_a_real_picture_file() {
+        let dir = std::env::temp_dir();
+        assert!(background_from_file(&dir, 8, 8).is_none(), "a folder is refused");
+        assert!(background_from_file(&dir.join("bhc-no-such-file.png"), 8, 8).is_none());
+        let junk = dir.join(format!("bhc-junk-{}.png", std::process::id()));
+        std::fs::write(&junk, b"not a picture").unwrap();
+        assert!(background_from_file(&junk, 8, 8).is_none(), "garbage is refused, not guessed");
+        let _ = std::fs::remove_file(&junk);
     }
 
     #[test]

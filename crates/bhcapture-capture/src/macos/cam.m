@@ -50,7 +50,8 @@ int32_t bhc_cam_request_permission(void) {
     [AVCaptureDevice requestAccessForMediaType:AVMediaTypeVideo completionHandler:^(BOOL granted) {
         ok = granted; dispatch_semaphore_signal(done);
     }];
-    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC));
+    /* Until answered: timing out while the prompt is still up would report "denied" wrongly. */
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
     return ok ? 1 : 0;
 }
 
@@ -153,7 +154,11 @@ BhcCamera *bhc_cam_start(const char *unique_id, int32_t max_height, int32_t fps,
         AVCaptureDeviceFormat *f = best_format(dev, max_height > 0 ? max_height : 1080, fps > 0 ? fps : 30);
         if (f && [dev lockForConfiguration:&e]) {
             dev.activeFormat = f;
+            /* Both ends: without the max, the camera stretches its exposure in an ordinary room and
+             * drops to ~17 fps (measured). A steady rate matters more in a recording; the bubble's
+             * Enhance lifts the slightly darker picture. */
             dev.activeVideoMinFrameDuration = CMTimeMake(1, fps > 0 ? fps : 30);
+            dev.activeVideoMaxFrameDuration = CMTimeMake(1, fps > 0 ? fps : 30);
             [dev unlockForConfiguration];
         }
         [s startRunning];
