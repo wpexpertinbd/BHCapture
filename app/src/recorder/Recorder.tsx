@@ -6,7 +6,7 @@ type Phase = "ready" | "recording" | "paused" | "finishing";
 type Info = {
   phase: Phase | null;
   width: number; height: number;
-  cursor: boolean; system_audio: boolean; microphone: boolean; noise_filter: boolean; countdown: boolean;
+  cursor: boolean; system_audio: boolean; microphone: boolean; noise_filter: boolean; clicks: boolean; countdown: boolean;
   mic_supported: boolean;
   shortcut: string;
   pause_shortcut: string;
@@ -65,12 +65,18 @@ export function Recorder() {
     return () => { a.then((f) => f()); b.then((f) => f()); };
   }, [load]);
 
+  // Reads the state FRESH from Rust instead of trusting this render's copy: after Restart the
+  // "start" request arrives before the bar has re-rendered as ready, and a stale "recording" copy
+  // made it ignore the request (found by a real-click test).
   const start = useCallback(async () => {
-    if (counting.current || !info || info.phase !== "ready") return;
+    if (counting.current) return;
     counting.current = true;
     setError(null);
     try {
-      if (info.countdown) {
+      const fresh = await invoke<Info>("recorder_info");
+      setInfo(fresh);
+      if (fresh.phase !== "ready") return;
+      if (fresh.countdown) {
         for (const n of [3, 2, 1]) { setCount(n); await new Promise((r) => setTimeout(r, 1000)); }
       }
       setCount(null);
@@ -81,7 +87,7 @@ export function Recorder() {
     } finally {
       counting.current = false;
     }
-  }, [info]);
+  }, []);
 
   // The record shortcut pressed while the bar is waiting = press Record.
   useEffect(() => {
@@ -109,6 +115,8 @@ export function Recorder() {
             </button>
           )}
           <Toggle on={info.cursor} label="Cursor" onChange={(v) => toggle("cursor", v)} disabled={count !== null} />
+          <Toggle on={info.clicks} label="Clicks" onChange={(v) => toggle("clicks", v)} disabled={count !== null}
+                  title="Shows a ring in the video wherever you click" />
           <Toggle on={info.system_audio} label="System audio" onChange={(v) => toggle("system_audio", v)} disabled={count !== null} />
           <Toggle on={info.microphone} label="Microphone" onChange={(v) => toggle("microphone", v)}
                   disabled={count !== null || !info.mic_supported}
@@ -142,6 +150,10 @@ export function Recorder() {
         </span>
         <span className="rc-chan" title="System audio">🔊 <Meter level={status.level_system} off={!info.system_audio} /></span>
         <span className="rc-chan" title="Microphone">🎙 <Meter level={status.level_mic} off={!info.microphone} /></span>
+        <button className="rc-btn" onClick={() => void invoke("recorder_restart")} disabled={info.phase === "finishing"}
+                title="Throw this take away and record again from the countdown">
+          ↺ Restart
+        </button>
         <button className="rc-btn" onClick={() => void invoke("recorder_hide")} disabled={info.phase === "finishing"}
                 title={`Hide this bar. Stop with ${info.shortcut} or from the BHCapture menu-bar icon, which also brings the bar back.`}>
           Hide

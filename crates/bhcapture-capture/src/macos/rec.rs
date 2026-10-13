@@ -19,6 +19,7 @@ struct BhcRecordOptions {
     noise_filter: i32,
     auto_level: i32,
     voice_clarity: i32,
+    include_window: u32,
     path: *const c_char,
 }
 
@@ -43,6 +44,8 @@ extern "C" {
     fn bhc_rec_status(r: *mut BhcRecorder, out: *mut BhcRecordStatus, err: *mut c_char, errcap: i32);
     fn bhc_rec_stop(r: *mut BhcRecorder, err: *mut c_char, errcap: i32) -> i32;
     fn bhc_rec_mic_supported() -> i32;
+    fn bhc_watch_clicks(cb: extern "C" fn(f64, f64, i32, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void);
+    fn bhc_unwatch_clicks();
     fn bhc_rec_mix_audio(src: *const c_char, dst: *const c_char, err: *mut c_char, errcap: i32) -> i32;
 }
 
@@ -55,6 +58,26 @@ pub fn mix_audio_tracks(src: &std::path::Path, dst: &std::path::Path) -> Result<
     let mut err = [0 as c_char; ERRCAP];
     let rc = unsafe { bhc_rec_mix_audio(s.as_ptr(), d.as_ptr(), err.as_mut_ptr(), ERRCAP as i32) };
     if rc == 0 { Ok(()) } else { Err(CaptureError::Backend(cstr(&err))) }
+}
+
+type ClickFn = Box<dyn Fn(f64, f64, bool) + Send + Sync>;
+static CLICK_WATCHER: std::sync::Mutex<Option<ClickFn>> = std::sync::Mutex::new(None);
+
+extern "C" fn click_trampoline(x: f64, y: f64, right: i32, _ctx: *mut std::ffi::c_void) {
+    if let Some(f) = CLICK_WATCHER.lock().unwrap().as_ref() { f(x, y, right != 0); }
+}
+
+/// Call `f(x, y, right_button)` for every mouse-down anywhere (global top-left logical points).
+/// For the click highlight. MAIN THREAD ONLY. Replaces any previous watcher.
+pub fn watch_clicks(f: impl Fn(f64, f64, bool) + Send + Sync + 'static) {
+    *CLICK_WATCHER.lock().unwrap() = Some(Box::new(f));
+    unsafe { bhc_watch_clicks(click_trampoline, std::ptr::null_mut()) };
+}
+
+/// Stop reporting clicks. MAIN THREAD ONLY.
+pub fn unwatch_clicks() {
+    unsafe { bhc_unwatch_clicks() };
+    *CLICK_WATCHER.lock().unwrap() = None;
 }
 
 /// Whether the microphone can be recorded on this macOS (15 or later).
@@ -86,6 +109,7 @@ impl MacRecorder {
             noise_filter: opt.noise_filter as i32,
             auto_level: opt.auto_level as i32,
             voice_clarity: opt.voice_clarity as i32,
+            include_window: opt.include_window.unwrap_or(0),
             path: path.as_ptr(),
         };
         let mut code = 0i32;

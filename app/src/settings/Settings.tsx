@@ -17,6 +17,7 @@ type SettingsData = {
   record_noise_filter: boolean;
   record_auto_level: boolean;
   record_voice_clarity: boolean;
+  record_click_highlight: boolean;
   record_countdown: boolean;
   record_fps: number;
   theme: Theme;

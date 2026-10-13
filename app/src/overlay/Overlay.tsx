@@ -45,6 +45,9 @@ export function Overlay() {
   const [mode, setMode] = useState<"image" | "video">("image");
   // While recording, this overlay only outlines the region (the mouse passes through it).
   const [frame, setFrame] = useState<Rect | null>(null);
+  // Click rings while recording (global points), each removed when its animation ends.
+  const [rings, setRings] = useState<{ id: number; x: number; y: number; right: boolean }[]>([]);
+  const ringId = useRef(0);
 
   const dragRef = useRef(false);
   const downAt = useRef<{ x: number; y: number } | null>(null);
@@ -80,8 +83,14 @@ export function Overlay() {
 
   useEffect(() => {
     const a = listen<"image" | "video">("selector-mode", (e) => { setMode(e.payload); setFrame(null); });
-    const b = listen<Rect | null>("record-frame", (e) => setFrame(e.payload));
-    return () => { a.then((f) => f()); b.then((f) => f()); };
+    const b = listen<Rect | null>("record-frame", (e) => { setFrame(e.payload); setRings([]); });
+    const c = listen<[number, number, boolean]>("record-click", (e) => {
+      const [x, y, right] = e.payload;
+      const id = ++ringId.current;
+      setRings((r) => [...r.slice(-8), { id, x, y, right }]);
+      setTimeout(() => setRings((r) => r.filter((q) => q.id !== id)), 650);
+    });
+    return () => { a.then((f) => f()); b.then((f) => f()); c.then((f) => f()); };
   }, []);
 
   // A capture started by a global key (Enter pressed while another app is in front) has no promise
@@ -215,7 +224,15 @@ export function Overlay() {
 
   if (frame) {
     const f = { x: frame[0] - info.origin_x, y: frame[1] - info.origin_y, w: frame[2], h: frame[3] };
-    return <div className="rec-frame" style={{ left: f.x - 3, top: f.y - 3, width: f.w + 6, height: f.h + 6 }} />;
+    return (
+      <>
+        <div className="rec-frame" style={{ left: f.x - 3, top: f.y - 3, width: f.w + 6, height: f.h + 6 }} />
+        {rings.map((r) => (
+          <div key={r.id} className={`click-ring${r.right ? " right" : ""}`}
+               style={{ left: r.x - info.origin_x, top: r.y - info.origin_y }} />
+        ))}
+      </>
+    );
   }
 
   // Global -> this overlay's local coordinates.

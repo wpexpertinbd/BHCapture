@@ -30,7 +30,7 @@ use crate::{broadcast, default_capture_dir, hide_overlays, local_stamp, release_
 pub(crate) const HUD: &str = "recorder";
 pub(crate) const VIDEO_PREFIX: &str = "video-";
 /// Wide enough for the options row; tall enough for an error line under the bar.
-const HUD_SIZE: LogSize = LogSize { w: 880.0, h: 96.0 };
+const HUD_SIZE: LogSize = LogSize { w: 960.0, h: 96.0 };
 
 /// The selector is shared by screenshots and recordings; this says which one Enter starts.
 pub(crate) static VIDEO_MODE: AtomicBool = AtomicBool::new(false);
@@ -292,6 +292,7 @@ pub(crate) struct HudInfo {
     system_audio: bool,
     microphone: bool,
     noise_filter: bool,
+    clicks: bool,
     countdown: bool,
     mic_supported: bool,
     shortcut: String,
@@ -306,7 +307,7 @@ pub(crate) fn recorder_info(state: tauri::State<Arc<AppState>>) -> HudInfo {
         phase: g.as_ref().map(|s| s.phase),
         width: g.as_ref().map_or(0, |s| s.px.0), height: g.as_ref().map_or(0, |s| s.px.1),
         cursor: s.record_cursor, system_audio: s.record_system_audio,
-        microphone: s.record_microphone && microphone_supported(), noise_filter: s.record_noise_filter,
+        microphone: s.record_microphone && microphone_supported(), noise_filter: s.record_noise_filter, clicks: s.record_click_highlight,
         countdown: s.record_countdown,
         mic_supported: microphone_supported(), shortcut: s.record_hotkey,
         pause_shortcut: bhcapture_core::hotkey::Chord::parse(PAUSE_SHORTCUT).map(|c| c.display()).unwrap_or_default(),
@@ -330,6 +331,7 @@ pub(crate) fn recorder_option(state: tauri::State<Arc<AppState>>, name: String, 
         }
         "countdown" => s.record_countdown = value,
         "noise_filter" => s.record_noise_filter = value,
+        "clicks" => s.record_click_highlight = value,
         _ => return Err(format!("unknown option {name}")),
     }
     st.set(s);
@@ -358,15 +360,19 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
         let s = st.get();
         (Pattern::parse(&s.pattern).unwrap_or_default(),
          (s.record_cursor, s.record_system_audio, s.record_microphone && microphone_supported(), s.record_fps,
-          s.record_noise_filter, s.record_auto_level, s.record_voice_clarity))
+          s.record_noise_filter, s.record_auto_level, s.record_voice_clarity, s.record_click_highlight))
     };
     let dir = recordings_dir();
     let stem = pattern.render(local_stamp(), &Fields { width: px.0, height: px.1, ..Default::default() });
     let file = unique_path(&dir, &stem, "mp4", &|p| p.exists());
 
+    // Click highlight: the overlay that already outlines the region draws the rings, and it is let
+    // INTO the picture (the rest of the app stays out).
+    let overlay = format!("{OVERLAY_PREFIX}{}", display.0);
+    let include_window = if opts.7 { overlay_window_id(app, &overlay) } else { None };
     let rec = MacRecorder::start(&RecordOptions {
         display, region: local, fps: opts.3, show_cursor: opts.0,
-        system_audio: opts.1, microphone: opts.2, noise_filter: opts.4, auto_level: opts.5, voice_clarity: opts.6, path: file.clone(),
+        system_audio: opts.1, microphone: opts.2, noise_filter: opts.4, auto_level: opts.5, voice_clarity: opts.6, include_window, path: file.clone(),
     }).map_err(|e| match e {
         bhcapture_capture::CaptureError::PermissionDenied => PERMISSION_MESSAGE.to_string(),
         other => format!("Could not start recording: {other}"),
@@ -387,6 +393,17 @@ pub(crate) fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> Result<(),
     println!("[record] started -> {} (system audio {}, microphone {}, noise filter {})", file.display(), opts.1, opts.2, opts.2 && opts.4);
     set_tray_label(app, true);
     let _ = app.run_on_main_thread(|| arm_pause_hotkey(true));
+    if include_window.is_some() {
+        let (a, label) = (app.clone(), overlay.clone());
+        let _ = app.run_on_main_thread(move || {
+            bhcapture_capture::macos::watch_clicks(move |x, y, right| {
+                // Not while paused: a ring appearing in nothing would only confuse the video.
+                if SESSION.lock().unwrap().as_ref().map_or(false, |s| s.phase == Phase::Recording) {
+                    let _ = a.emit_to(label.as_str(), "record-click", (x, y, right));
+                }
+            });
+        });
+    }
     emit_state(app);
     spawn_status(app.clone());
     Ok(())
@@ -476,8 +493,15 @@ pub(crate) fn demo_record(app: &tauri::AppHandle, state: &Arc<AppState>, secs: u
     println!("[rectest] start: {:?}", start(app, state));
     println!("[rectest] RECORDING");
     let mut peak_sys = 0f32;
-    for _ in 0..(secs * 5) {
+    let overlay = SESSION.lock().unwrap().as_ref().map(|s| format!("{OVERLAY_PREFIX}{}", s.display.0));
+    for i in 0..(secs * 5) {
         std::thread::sleep(std::time::Duration::from_millis(200));
+        // BHC_CLICKS=1: a click every second at the region's centre (500,350), alternating buttons,
+        // through the same event the real mouse watcher sends.
+        if std::env::var("BHC_CLICKS").as_deref() == Ok("1") && i % 5 == 0 {
+            if let Some(l) = &overlay { let _ = app.emit_to(l.as_str(), "record-click", (500.0f64, 350.0f64, i % 10 == 5)); }
+            println!("[rectest] click at {:.1}s", i as f64 * 0.2);
+        }
         if let Some(st) = SESSION.lock().unwrap().as_ref().and_then(|s| s.recorder.as_ref().map(|r| r.status())) {
             peak_sys = peak_sys.max(st.level_system);
         }
@@ -531,6 +555,50 @@ fn mix_into_one_track(file: &Path) {
     }
 }
 
+/// What one take holds besides the file: the pause key and the click watcher. Released on stop,
+/// cancel and restart alike.
+fn end_take(app: &tauri::AppHandle) {
+    let _ = app.run_on_main_thread(|| {
+        if PAUSE_HOTKEY_ID.load(Ordering::SeqCst) != 0 { arm_pause_hotkey(false); }
+        bhcapture_capture::macos::unwatch_clicks();
+    });
+}
+
+/// The CGWindowID of one of our windows (main-thread lookup).
+fn overlay_window_id(app: &tauri::AppHandle, label: &str) -> Option<u32> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (a, l) = (app.clone(), label.to_string());
+    app.run_on_main_thread(move || {
+        let id = a.get_webview_window(&l).and_then(|w| w.ns_window().ok())
+            .map(|p| unsafe { bhcapture_capture::macos::cgwindow_id(p) }).filter(|&i| i != 0);
+        let _ = tx.send(id);
+    }).ok()?;
+    rx.recv_timeout(std::time::Duration::from_secs(2)).ok().flatten()
+}
+
+/// Restart: throw this take away and start a new one on the same region, with the countdown.
+#[tauri::command]
+pub(crate) async fn recorder_restart(app: tauri::AppHandle) -> Result<(), String> {
+    let (rec, file) = {
+        let mut g = SESSION.lock().unwrap();
+        let Some(s) = g.as_mut() else { return Ok(()) };
+        if !matches!(s.phase, Phase::Recording | Phase::Paused) { return Ok(()); }
+        s.phase = Phase::Finishing;
+        (s.recorder.take(), s.file.take())
+    };
+    emit_state(&app);
+    end_take(&app);
+    if let Some(r) = rec { let _ = r.stop(); }
+    if let Some(f) = file { let _ = std::fs::remove_file(f); }
+    if let Some(s) = SESSION.lock().unwrap().as_mut() { s.phase = Phase::Ready; s.two_tracks = false; }
+    set_tray_label(&app, false);
+    println!("[record] restarted: previous take discarded");
+    emit_state(&app);
+    // The bar runs the countdown and starts, exactly as if Record had been pressed.
+    let _ = app.emit_to(HUD, "recorder-start-requested", ());
+    Ok(())
+}
+
 /// Cancel: before recording, just close the bar; while recording, stop and throw the file away.
 #[tauri::command]
 pub(crate) async fn recorder_cancel(app: tauri::AppHandle) -> Result<(), String> {
@@ -551,7 +619,7 @@ pub(crate) async fn recorder_cancel(app: tauri::AppHandle) -> Result<(), String>
 fn end_session(app: &tauri::AppHandle) {
     let display = SESSION.lock().unwrap().take().map(|s| s.display);
     BAR_HIDDEN.store(false, Ordering::SeqCst);
-    if PAUSE_HOTKEY_ID.load(Ordering::SeqCst) != 0 { let _ = app.run_on_main_thread(|| arm_pause_hotkey(false)); }
+    end_take(app);
     hide_hud(app);
     if let Some(d) = display { show_frame(app, d, None); }
     set_tray_label(app, false);

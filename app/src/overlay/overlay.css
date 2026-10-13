@@ -132,3 +132,17 @@ html, body, #root {
 .fs-btn:hover { background: rgba(40, 150, 255, 1); }
 .fs-btn kbd { font: inherit; font-weight: 500; padding: 2px 6px; border-radius: 4px; background: rgba(255, 255, 255, 0.22); }
 .fs-icon { font-size: 15px; }
+
+/* Click highlight, drawn INTO the recording: a ring that grows and fades where the mouse clicked.
+   Yellow for a left click, blue for a right click. */
+.click-ring {
+  position: fixed; width: 44px; height: 44px; margin: -22px 0 0 -22px; pointer-events: none;
+  border-radius: 50%; border: 3px solid rgba(255, 196, 0, 0.95);
+  background: rgba(255, 210, 0, 0.28); box-sizing: border-box;
+  animation: click-ring 0.6s ease-out forwards;
+}
+.click-ring.right { border-color: rgba(10, 132, 255, 0.95); background: rgba(10, 132, 255, 0.25); }
+@keyframes click-ring {
+  0% { transform: scale(0.35); opacity: 1; }
+  100% { transform: scale(1.4); opacity: 0; }
+}

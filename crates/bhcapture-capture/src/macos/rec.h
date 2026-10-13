@@ -26,6 +26,7 @@ typedef struct {
     int32_t     noise_filter;   /* 0/1; RNNoise on the microphone (48 kHz float only) */
     int32_t     auto_level;     /* 0/1; automatic voice level on the microphone */
     int32_t     voice_clarity;  /* 0/1; voice EQ on the microphone */
+    uint32_t    include_window; /* CGWindowID of OUR window to keep in the picture (click rings); 0 = none */
     const char *path;           /* UTF-8; the .mp4 to create. Must not exist. */
 } BhcRecordOptions;
 
@@ -67,5 +68,11 @@ void   bhc_level_free(void *l);
 void  *bhc_eq_new(uint32_t sample_rate);
 void   bhc_eq_process(void *e, float *samples, size_t n);
 void   bhc_eq_free(void *e);
+
+/* Report every left/right mouse-down anywhere on screen as global TOP-LEFT logical points, for the
+ * click highlight. A global NSEvent monitor: needs no Accessibility permission for mouse events.
+ * Main thread only. One watcher at a time; watch again replaces it. */
+void bhc_watch_clicks(void (*cb)(double x, double y, int32_t right, void *ctx), void *ctx);
+void bhc_unwatch_clicks(void);
 
 #endif /* BHC_REC_H */

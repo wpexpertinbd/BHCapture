@@ -21,6 +21,8 @@ pub struct RecordOptions {
     pub auto_level: bool,
     /// Voice EQ on the microphone (see `bhcapture_core::voice_eq`).
     pub voice_clarity: bool,
+    /// An OS window id of ours to keep IN the picture (the click-highlight layer). `None` = all of ours stay out.
+    pub include_window: Option<u32>,
     /// The `.mp4` to create. Must not already exist.
     pub path: PathBuf,
 }

@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
 #import <CoreMedia/CoreMedia.h>
@@ -295,7 +296,14 @@ BhcRecorder *bhc_rec_start(const BhcRecordOptions *opt, int32_t *code, char *err
         NSMutableArray<SCRunningApplication *> *skip = [NSMutableArray array];
         for (SCRunningApplication *a in content.applications)
             if (me && [a.bundleIdentifier isEqualToString:me]) [skip addObject:a];
-        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:disp excludingApplications:skip exceptingWindows:@[]];
+        /* ...except the one window asked for: the overlay that draws click rings, which must be IN
+         * the video while the control bar stays out. */
+        NSMutableArray<SCWindow *> *keep = [NSMutableArray array];
+        if (opt->include_window) {
+            for (SCWindow *w in content.windows) if ((uint32_t)w.windowID == opt->include_window) { [keep addObject:w]; break; }
+            if (keep.count == 0) fprintf(stderr, "[rec] the click-highlight window %u is not on screen; clicks will not show\n", opt->include_window);
+        }
+        SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:disp excludingApplications:skip exceptingWindows:keep];
 
         /* Pixel size: the display's own scale, EVEN (H.264 4:2:0 needs it), long side at most 4096
          * (the H.264 hardware limit we can rely on). */
@@ -607,4 +615,26 @@ int32_t bhc_rec_mix_audio(const char *src_path, const char *dst_path, char *err,
         }
         return BHC_OK;
     }
+}
+
+static id gClickMonitor = nil;
+static void (*gClickCb)(double, double, int32_t, void *) = NULL;
+static void *gClickCtx = NULL;
+
+void bhc_watch_clicks(void (*cb)(double, double, int32_t, void *), void *ctx) {
+    bhc_unwatch_clicks();
+    gClickCb = cb; gClickCtx = ctx;
+    gClickMonitor = [NSEvent addGlobalMonitorForEventsMatchingMask:(NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown)
+                                                            handler:^(NSEvent *e) {
+        /* mouseLocation is bottom-left based on the PRIMARY screen; the rest of BHCapture uses
+         * top-left global points, whose origin is that same screen's top-left. */
+        NSPoint p = [NSEvent mouseLocation];
+        CGFloat h = NSScreen.screens.count ? NSScreen.screens[0].frame.size.height : 0;
+        if (gClickCb) gClickCb(p.x, h - p.y, e.type == NSEventTypeRightMouseDown ? 1 : 0, gClickCtx);
+    }];
+}
+
+void bhc_unwatch_clicks(void) {
+    if (gClickMonitor) { [NSEvent removeMonitor:gClickMonitor]; gClickMonitor = nil; }
+    gClickCb = NULL; gClickCtx = NULL;
 }

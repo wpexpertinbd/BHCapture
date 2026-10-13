@@ -1289,7 +1289,7 @@ fn main() {
             settings_get, settings_save, settings_pick_dir, open_settings,
             editor_info, editor_pixels, editor_save, editor_copy, editor_close, editor_format_changed,
             recording::recorder_info, recording::recorder_option, recording::recorder_start,
-            recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel, recording::recorder_hide,
+            recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel, recording::recorder_hide, recording::recorder_restart,
             recording::video_info, recording::video_save, recording::video_close
         ])
         .setup(move |app| {
