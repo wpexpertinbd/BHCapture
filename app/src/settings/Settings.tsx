@@ -141,7 +141,11 @@ export function Settings() {
         <label className="title" htmlFor="hk">Region capture shortcut</label>
         <input id="hk" type="text" value={draft.region_hotkey}
                onChange={(e) => set("region_hotkey", e.target.value)} />
-        <div className="help">Takes effect after a restart.</div>
+        <div className="help">
+          Takes effect as soon as you save. Shortcuts macOS already uses (like <code>⇧⌘4</code>
+          or <code>⌃⇧⌘4</code>) are refused, because both would fire. Type it as
+          <code>Ctrl+Option+Cmd+4</code> or with the symbols <code>⌃⌥⌘4</code>.
+        </div>
       </div>
 
       <div className="row">

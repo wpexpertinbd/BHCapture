@@ -168,3 +168,25 @@ fn set_reports_repairs_so_the_ui_can_say_so() {
     assert_eq!(repaired.len(), 1, "{repaired:?}");
     assert_eq!(store.get().pattern, DEFAULT_PATTERN);
 }
+
+#[test]
+fn a_saved_system_owned_shortcut_is_migrated_to_the_new_default() {
+    // Anyone who saved settings with the old default has ⌃⇧⌘4 on disk. Loading must repair it.
+    let dir = tmpdir("hotkey");
+    let p = dir.join("settings.json");
+    std::fs::write(&p, r#"{ "region_hotkey": "Cmd+Shift+Ctrl+4" }"#).unwrap();
+    let (store, outcome) = SettingsStore::load(&p);
+    let LoadOutcome::Loaded { repaired } = outcome else { panic!("{outcome:?}") };
+    assert_eq!(repaired.len(), 1, "{repaired:?}");
+    assert!(repaired[0].contains("macOS already uses"), "{repaired:?}");
+    assert_eq!(store.get().region_hotkey, bhcapture_core::hotkey::DEFAULT_REGION_HOTKEY);
+}
+
+#[test]
+fn a_valid_shortcut_is_stored_in_canonical_form() {
+    let dir = tmpdir("hotkey2");
+    let (mut store, _) = SettingsStore::load(dir.join("settings.json"));
+    let r = store.set(Settings { region_hotkey: "cmd + shift + s".into(), ..Default::default() });
+    assert!(r.is_empty(), "{r:?}");
+    assert_eq!(store.get().region_hotkey, "Shift+Cmd+S");
+}

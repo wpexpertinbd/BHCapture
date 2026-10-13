@@ -15,12 +15,13 @@ use bhcapture_core::image::Frame;
 use bhcapture_core::naming::{Fields, Pattern, Stamp, unique_path};
 use bhcapture_core::settings::{LoadOutcome, Settings, SettingsStore};
 use bhcapture_core::snap::{snap_window, Candidate};
+use bhcapture_core::hotkey::{Chord, Key, DEFAULT_REGION_HOTKEY};
 use base64::Engine;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tauri_plugin_dialog::DialogExt;
 use global_hotkey::{hotkey::{Code, HotKey, Modifiers}, GlobalHotKeyEvent, GlobalHotKeyManager};
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use serde::Serialize;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri::menu::{Menu, MenuItem};
@@ -159,11 +160,27 @@ fn settings_get(state: tauri::State<Arc<AppState>>) -> SettingsView {
 
 #[tauri::command]
 fn settings_save(state: tauri::State<Arc<AppState>>, next: Settings) -> Result<SettingsView, String> {
-    let repaired = { state.settings.lock().unwrap().set(next) };
+    let previous_hotkey = state.settings.lock().unwrap().get().region_hotkey.clone();
+    let mut notes = { state.settings.lock().unwrap().set(next) };
+
+    // The shortcut takes effect NOW (sync commands run on the main thread, where the hotkey API
+    // lives). If the OS will not give us the new chord, keep the old one and say so, rather than
+    // saving a setting that does nothing.
+    let wanted = state.settings.lock().unwrap().get().region_hotkey.clone();
+    if wanted != previous_hotkey {
+        if let Err(e) = set_region_hotkey(&wanted) {
+            notes.push(format!("{e}. Kept {previous_hotkey}."));
+            let mut st = state.settings.lock().unwrap();
+            let mut s = st.get().clone();
+            s.region_hotkey = previous_hotkey;
+            st.set(s);
+        }
+    }
+
     // Report a refused save honestly rather than letting the UI claim it worked.
     state.settings.lock().unwrap().save().map_err(|e| e.to_string())?;
     apply_settings(&state);
-    let notice = if repaired.is_empty() { None } else { Some(repaired.join("; ")) };
+    let notice = if notes.is_empty() { None } else { Some(notes.join("; ")) };
     Ok(settings_view(&state, notice))
 }
 
@@ -680,6 +697,59 @@ fn handle_selector_key(app: &tauri::AppHandle, key: SelectorKey) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The capture shortcut, from settings.
+// ---------------------------------------------------------------------------------------------
+
+/// Id of the currently registered capture shortcut, so the event loop knows which press is which.
+static REGION_HOTKEY_ID: AtomicU32 = AtomicU32::new(0);
+static REGION_HOTKEY: Mutex<Option<HotKey>> = Mutex::new(None);
+/// The tray's "Capture Region" item, so its shortcut label follows the setting.
+static TRAY_CAPTURE_ITEM: Mutex<Option<MainThreadOnly<MenuItem<tauri::Wry>>>> = Mutex::new(None);
+
+fn to_platform_hotkey(c: &Chord) -> HotKey {
+    let mut m = Modifiers::empty();
+    if c.cmd { m |= Modifiers::SUPER; }
+    if c.ctrl { m |= Modifiers::CONTROL; }
+    if c.alt { m |= Modifiers::ALT; }
+    if c.shift { m |= Modifiers::SHIFT; }
+    let code = match c.key {
+        Key::Digit(d) => [Code::Digit0, Code::Digit1, Code::Digit2, Code::Digit3, Code::Digit4,
+                          Code::Digit5, Code::Digit6, Code::Digit7, Code::Digit8, Code::Digit9][d as usize],
+        Key::F(n) => [Code::F1, Code::F2, Code::F3, Code::F4, Code::F5, Code::F6,
+                      Code::F7, Code::F8, Code::F9, Code::F10, Code::F11, Code::F12][(n - 1) as usize],
+        Key::Letter(ch) => [Code::KeyA, Code::KeyB, Code::KeyC, Code::KeyD, Code::KeyE, Code::KeyF,
+                            Code::KeyG, Code::KeyH, Code::KeyI, Code::KeyJ, Code::KeyK, Code::KeyL,
+                            Code::KeyM, Code::KeyN, Code::KeyO, Code::KeyP, Code::KeyQ, Code::KeyR,
+                            Code::KeyS, Code::KeyT, Code::KeyU, Code::KeyV, Code::KeyW, Code::KeyX,
+                            Code::KeyY, Code::KeyZ][(ch as u8 - b'A') as usize],
+    };
+    HotKey::new(if m.is_empty() { None } else { Some(m) }, code)
+}
+
+/// Swap the capture shortcut to `spec`. MAIN THREAD ONLY (setup and sync commands run there).
+///
+/// Registers the new chord before releasing the old one, so a chord another app already holds
+/// leaves the user with their previous, working shortcut rather than with none.
+fn set_region_hotkey(spec: &str) -> Result<String, String> {
+    let chord = Chord::parse(spec).map_err(|e| e.to_string())?;
+    let hk = to_platform_hotkey(&chord);
+    let guard = HOTKEY_MANAGER.lock().unwrap();
+    let m = guard.as_ref().ok_or("hotkey manager not ready")?;
+    let mut current = REGION_HOTKEY.lock().unwrap();
+    if current.map(|c| c.id()) == Some(hk.id()) { return Ok(chord.display()); }
+    m.0.register(hk).map_err(|e| format!(
+        "{} could not be registered (another app may already use it): {e}", chord.display()))?;
+    if let Some(old) = current.take() { let _ = m.0.unregister(old); }
+    *current = Some(hk);
+    REGION_HOTKEY_ID.store(hk.id(), Ordering::SeqCst);
+    if let Some(item) = TRAY_CAPTURE_ITEM.lock().unwrap().as_ref() {
+        let _ = item.0.set_accelerator(Some(chord.display().as_str()));
+    }
+    println!("[hotkey] capture shortcut is {}", chord.display());
+    Ok(chord.display())
+}
+
 fn overlay_label(id: DisplayId) -> String { format!("{OVERLAY_PREFIX}{}", id.0) }
 
 /// Make the overlay windows match the current display layout: create what is missing, move and
@@ -866,10 +936,11 @@ fn main() {
 
             // Tray: without it there is no way to reach settings, since every window is an
             // overlay that hides itself.
-            let cap_i = MenuItem::with_id(app, "capture", "Capture Region", true, Some("Cmd+Shift+Ctrl+4"))?;
+            let cap_i = MenuItem::with_id(app, "capture", "Capture Region", true, None::<&str>)?;
             let set_i = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit BHCapture", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&cap_i, &set_i, &quit_i])?;
+            *TRAY_CAPTURE_ITEM.lock().unwrap() = Some(MainThreadOnly(cap_i.clone()));
             let tray_img = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
             let tray = TrayIconBuilder::new()
                 .icon(tray_img)
@@ -888,22 +959,24 @@ fn main() {
             // Keep the TrayIcon alive: dropping it removes the icon from the menu bar.
             app.manage(tray);
 
-            let manager = GlobalHotKeyManager::new()?;
-            let hk = HotKey::new(
-                Some(Modifiers::SUPER | Modifiers::SHIFT | Modifiers::CONTROL), Code::Digit4);
-            manager.register(hk)?;
-            let region_id = hk.id();
-            // Kept (not leaked) so the selector's keys can be armed and disarmed later, always from
-            // the main thread; dropping it would unregister the capture shortcut.
-            *HOTKEY_MANAGER.lock().unwrap() = Some(MainThreadOnly(manager));
-            println!("BHCapture ready. Region capture: Cmd+Shift+Ctrl+4");
+            // Kept (not leaked) so shortcuts can be changed and the selector's keys armed later,
+            // always from the main thread; dropping it would unregister everything.
+            *HOTKEY_MANAGER.lock().unwrap() = Some(MainThreadOnly(GlobalHotKeyManager::new()?));
+            let wanted = state.settings.lock().unwrap().get().region_hotkey.clone();
+            if let Err(e) = set_region_hotkey(&wanted) {
+                eprintln!("[hotkey] {e}; falling back to {DEFAULT_REGION_HOTKEY}");
+                if let Err(e2) = set_region_hotkey(DEFAULT_REGION_HOTKEY) {
+                    eprintln!("[hotkey] the default could not be registered either: {e2}");
+                }
+            }
+            println!("BHCapture ready.");
 
             let h = handle.clone();
             std::thread::spawn(move || {
                 let rx = GlobalHotKeyEvent::receiver();
                 while let Ok(ev) = rx.recv() {
                     if ev.state != global_hotkey::HotKeyState::Pressed { continue; }
-                    if ev.id == region_id {
+                    if ev.id == REGION_HOTKEY_ID.load(Ordering::SeqCst) {
                         println!("[hotkey] pressed");
                         open_selector(&h);
                     } else if let Some((_, key)) = selector_keys().iter().find(|(k, _)| k.id() == ev.id) {

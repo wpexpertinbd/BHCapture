@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
+use crate::hotkey::{Chord, DEFAULT_REGION_HOTKEY};
 use crate::naming::{Pattern, DEFAULT_PATTERN};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -51,7 +52,7 @@ impl Default for Settings {
             always_ask_where_to_save: false,
             copy_to_clipboard: true,
             include_cursor: false,
-            region_hotkey: "Cmd+Shift+Ctrl+4".to_string(),
+            region_hotkey: DEFAULT_REGION_HOTKEY.to_string(),
             theme: Theme::System,
         }
     }
@@ -78,9 +79,15 @@ impl Settings {
                 self.output_dir = None;
             }
         }
-        if self.region_hotkey.trim().is_empty() {
-            fixed.push("region hotkey was empty; reset to the default".to_string());
-            self.region_hotkey = Settings::default().region_hotkey;
+        // Parse, and store the CANONICAL spelling, so "cmd+shift+s" and "⇧⌘S" are the same setting.
+        // A chord macOS already owns is rejected: both would fire (see bhcapture_core::hotkey).
+        match Chord::parse(&self.region_hotkey) {
+            Ok(c) => self.region_hotkey = c.display(),
+            Err(e) => {
+                fixed.push(format!("capture shortcut {:?} was not used: {e}. Reset to {}",
+                    self.region_hotkey, DEFAULT_REGION_HOTKEY));
+                self.region_hotkey = DEFAULT_REGION_HOTKEY.to_string();
+            }
         }
         fixed
     }
