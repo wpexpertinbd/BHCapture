@@ -25,7 +25,7 @@ pub struct Chord {
     pub key: Key,
 }
 
-pub const DEFAULT_REGION_HOTKEY: &str = "Ctrl+Option+Cmd+4";
+pub const DEFAULT_REGION_HOTKEY: &str = "Ctrl+Cmd+4";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum HotkeyError {
@@ -37,6 +37,10 @@ pub enum HotkeyError {
     NeedsModifier,
     /// Already used by the operating system; both would fire.
     TakenBySystem(&'static str),
+    /// Contains Option. Since macOS 15 the system silently blocks app shortcuts built on Option
+    /// (registration still reports success), so it would never fire. Seen on macOS 27: real
+    /// presses of Ctrl+Option+Cmd+4 never reached BHCapture while Ctrl+Shift+Cmd+4 did.
+    UsesOption,
 }
 
 impl std::fmt::Display for HotkeyError {
@@ -48,6 +52,7 @@ impl std::fmt::Display for HotkeyError {
             HotkeyError::TwoKeys => write!(f, "the shortcut names more than one key"),
             HotkeyError::NeedsModifier => write!(f, "a shortcut needs Cmd, Ctrl or Option, or it would steal ordinary typing"),
             HotkeyError::TakenBySystem(what) => write!(f, "macOS already uses this shortcut for {what}"),
+            HotkeyError::UsesOption => write!(f, "macOS blocks app shortcuts that use Option, so it would never fire"),
         }
     }
 }
@@ -79,10 +84,11 @@ impl Chord {
         }
         let key = key.ok_or(HotkeyError::NoKey)?;
         // Shift alone is not enough; function keys are a deliberate exception (F5 on its own is
-        // not ordinary typing).
+        // not ordinary typing). Option does not count: it is refused below.
         if !(cmd || ctrl || alt) && !matches!(key, Key::F(_)) {
             return Err(HotkeyError::NeedsModifier);
         }
+        if alt { return Err(HotkeyError::UsesOption); }
         let chord = Chord { cmd, ctrl, alt, shift, key };
         if let Some(what) = chord.macos_conflict() {
             return Err(HotkeyError::TakenBySystem(what));

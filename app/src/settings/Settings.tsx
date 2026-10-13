@@ -143,8 +143,8 @@ export function Settings() {
                onChange={(e) => set("region_hotkey", e.target.value)} />
         <div className="help">
           Takes effect as soon as you save. Shortcuts macOS already uses (like <code>⇧⌘4</code>
-          or <code>⌃⇧⌘4</code>) are refused, because both would fire. Type it as
-          <code>Ctrl+Option+Cmd+4</code> or with the symbols <code>⌃⌥⌘4</code>.
+          or <code>⌃⇧⌘4</code>) are refused because both would fire, and so is anything with
+          Option, which macOS silently blocks. Type it as <code>Ctrl+Cmd+4</code> or <code>⌃⌘4</code>.
         </div>
       </div>
 
