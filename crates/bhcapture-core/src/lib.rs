@@ -11,6 +11,7 @@ pub mod gif_export;
 pub mod hotkey;
 pub mod image;
 pub mod level;
+pub mod mp4_writer;
 pub mod naming;
 pub mod record;
 pub mod resample;

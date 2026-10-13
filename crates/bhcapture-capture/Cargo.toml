@@ -29,4 +29,11 @@ windows = { version = "0.62", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Pure Rust X11 client (no libX11 needed); already in the tree through the clipboard/hotkey crates.
-x11rb = { version = "0.13", features = ["randr"] }
+x11rb = { version = "0.13", features = ["randr", "xfixes"] }
+# Linux has no system video encoder that is always present: OpenH264 is compiled in (~1 MB).
+openh264 = "0.9.8"
+# Opus via the system libopus (installed on every desktop distro: PipeWire/PulseAudio depend on it).
+opus = "0.4"
+# PulseAudio API for system sound (monitor source) and the microphone; PipeWire serves it too.
+libpulse-binding = { version = "2.29", default-features = false }
+libpulse-simple-binding = { version = "2.29", default-features = false }
