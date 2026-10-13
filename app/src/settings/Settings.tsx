@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ShortcutField } from "./ShortcutField";
+import { Updates } from "./Updates";
 
 type Theme = "system" | "light" | "dark";
 
@@ -191,6 +192,8 @@ export function Settings() {
           <option value="dark">Dark</option>
         </select>
       </div>
+
+      <Updates />
 
       </>)}
 

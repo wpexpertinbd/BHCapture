@@ -49,6 +49,8 @@ Everything is on the [**latest release**](https://github.com/wpexpertinbd/BHCapt
 **Everywhere**
 - Every shortcut can be changed — click the box in Settings and press your keys.
 - Menu-bar / tray app: no Dock icon until you open a window.
+- **Updates itself** — checks GitHub at launch and every few hours (switch it off in Settings); one click
+  downloads and opens the installer. Nothing installs without your click, and no data is sent.
 
 ## ⌨️ Default shortcuts
 

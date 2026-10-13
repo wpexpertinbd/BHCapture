@@ -18,4 +18,5 @@ pub mod record;
 pub mod resample;
 pub mod settings;
 pub mod snap;
+pub mod update;
 pub mod voice_eq;

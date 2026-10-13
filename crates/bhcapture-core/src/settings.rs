@@ -82,6 +82,13 @@ pub struct Settings {
     pub record_countdown: bool,
     /// 1-60.
     pub record_fps: u32,
+    /// Look for a newer release at launch and every few hours (BHServe's model). On by default.
+    pub auto_update_check: bool,
+    /// Unix seconds of the last AUTOMATIC check, so restarts do not each ask GitHub.
+    pub last_update_check: i64,
+    /// The newest version the user has already been told about, so one release announces itself
+    /// once rather than at every launch.
+    pub notified_update: String,
 }
 
 impl Default for Settings {
@@ -112,6 +119,9 @@ impl Default for Settings {
             record_click_highlight: true,
             record_countdown: true,
             record_fps: 30,
+            auto_update_check: true,
+            last_update_check: 0,
+            notified_update: String::new(),
         }
     }
 }

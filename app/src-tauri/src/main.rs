@@ -10,6 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 mod recording;
+mod updater;
 
 use bhcapture_capture::{platform::{self, PlatformCapturer}, CaptureError, Capturer, Snapshot};
 use bhcapture_core::geom::{DisplayId, DisplayLayout, LogPoint, LogRect};
@@ -181,6 +182,10 @@ fn settings_save(state: tauri::State<Arc<AppState>>, next: Settings) -> Result<S
             .unwrap_or_else(|| "settings cannot be saved".into()));
     }
     let previous = state.settings.lock().unwrap().get().clone();
+    // The updater owns these (its own switch and bookkeeping); a Settings page holding an older copy
+    // must not write them back.
+    let next = Settings { auto_update_check: previous.auto_update_check, last_update_check: previous.last_update_check,
+                          notified_update: previous.notified_update.clone(), ..next };
     let mut notes = { state.settings.lock().unwrap().set(next) };
 
     // The shortcut takes effect NOW (sync commands run on the main thread, where the hotkey API
@@ -817,7 +822,8 @@ fn command_allowed(label: &str, cmd: &str) -> bool {
             | "selection_cancel" | "selection_commit" | "snap_at" | "loupe" | "selection_set_rect"
             | "selection_fullscreen" | "selector_set_mode" | "open_privacy_settings" | "relaunch_app"
             | "report_overlay_focus"),
-        "settings" => matches!(cmd, "settings_get" | "settings_save" | "settings_pick_dir" | "hotkey_check" | "hotkeys_suspend"),
+        "settings" => matches!(cmd, "settings_get" | "settings_save" | "settings_pick_dir" | "hotkey_check" | "hotkeys_suspend")
+            || cmd.starts_with("update_"),
         "editor" => cmd.starts_with("editor_"),
         "video" => cmd.starts_with("video_"),
         "recorder" => cmd.starts_with("recorder_"),
@@ -1488,7 +1494,8 @@ fn main() {
             editor_info, editor_pixels, editor_save, editor_copy, editor_close, editor_format_changed,
             recording::recorder_info, recording::recorder_option, recording::recorder_start,
             recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel, recording::recorder_hide, recording::recorder_restart,
-            recording::video_info, recording::video_save, recording::video_close, recording::video_export
+            recording::video_info, recording::video_save, recording::video_close, recording::video_export,
+            updater::update_info, updater::update_check, updater::update_set_auto, updater::update_install, updater::update_open_page
             ]);
             move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
                 let (label, cmd) = (invoke.message.webview_ref().label().to_string(), invoke.message.command().to_string());
@@ -1535,9 +1542,11 @@ fn main() {
             let pause_key = state.settings.lock().unwrap().get().pause_hotkey.clone();
             let pause_i = MenuItem::with_id(app, "pause", "Pause Recording", false, Some(pause_key.as_str()))?;
             let bar_i = MenuItem::with_id(app, "toggle-bar", "Hide Recording Bar", false, None::<&str>)?;
+            let upd_i = MenuItem::with_id(app, "check-updates", "Check for Updates…", true, None::<&str>)?;
             let set_i = MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit BHCapture", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&all_i, &cap_i, &rec_i, &pause_i, &bar_i, &PredefinedMenuItem::separator(app)?, &set_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&all_i, &cap_i, &rec_i, &pause_i, &bar_i, &PredefinedMenuItem::separator(app)?, &upd_i, &set_i, &quit_i])?;
+            updater::set_tray_item(upd_i.clone());
             *TRAY_CAPTURE_ITEM.lock().unwrap() = Some(MainThreadOnly(cap_i.clone()));
             *TRAY_ALLINONE_ITEM.lock().unwrap() = Some(MainThreadOnly(all_i.clone()));
             *recording::TRAY_RECORD_ITEM.lock().unwrap() = Some(MainThreadOnly(rec_i.clone()));
@@ -1558,12 +1567,19 @@ fn main() {
                     "toggle-bar" => recording::toggle_bar(app),
                     "pause" => recording::toggle_pause(app),
                     "settings" => { let _ = open_settings(app.clone()); }
+                    // Settings shows the result (and the Download & Install button).
+                    "check-updates" => {
+                        let _ = open_settings(app.clone());
+                        let a = app.clone();
+                        std::thread::spawn(move || updater::check(&a, true));
+                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
             // Keep the TrayIcon alive: dropping it removes the icon from the menu bar.
             app.manage(tray);
+            updater::start_background(&handle);
 
             // Kept (not leaked) so shortcuts can be changed and the selector's keys armed later,
             // always from the main thread; dropping it would unregister everything.
@@ -1733,6 +1749,17 @@ fn main() {
                                 ms(2000);
                             }
                             Err(e) => println!("[sec] video open FAILED {e}"),
+                        }
+                    }
+                    // 6. Updates: a check from Settings, then the download (test env stops before the installer).
+                    if std::env::var_os("BHC_UPDATE_AS_VERSION").is_some() {
+                        if let Some(w) = h.get_webview_window(SETTINGS_WINDOW) {
+                            let _ = w.eval("window.__TAURI_INTERNALS__.invoke('update_check')");
+                            ms(6000);
+                            let _ = w.eval("window.__TAURI_INTERNALS__.invoke('update_info').then(v=>window.__TAURI_INTERNALS__.invoke('plugin:event|emit',{event:'sec-probe',payload:{upd:v,text:document.body.innerText.split('Updates')[1]?.slice(0,300)}}))");
+                            ms(1000);
+                            let _ = w.eval("window.__TAURI_INTERNALS__.invoke('update_install').then(()=>'ok',e=>'ERR '+e).then(r=>window.__TAURI_INTERNALS__.invoke('update_info').then(v=>window.__TAURI_INTERNALS__.invoke('plugin:event|emit',{event:'sec-probe',payload:{install:r,upd:v}})))");
+                            ms(30000);
                         }
                     }
                     // 5. The recording bar: set up a recording (nothing is captured until Start) and cancel.
