@@ -377,6 +377,8 @@ struct Loupe {
 /// treats as "not available yet", not as an error.
 #[tauri::command]
 fn loupe(state: tauri::State<Arc<AppState>>, x: f64, y: f64) -> Option<Loupe> {
+    // Every pointer move lands here, so it doubles as "where is the mouse" for the F key.
+    *LAST_POINTER.lock().unwrap() = Some(LogPoint::new(x, y));
     let snap = state.snapshot.lock().unwrap().clone()?;
     let f = snap.loupe(LogPoint::new(x, y), 10)?;
     Some(Loupe {
@@ -384,6 +386,34 @@ fn loupe(state: tauri::State<Arc<AppState>>, x: f64, y: f64) -> Option<Loupe> {
         scale: f.scale().get(),
         rgba: base64::engine::general_purpose::STANDARD.encode(f.to_rgba8()),
     })
+}
+
+/// Last pointer position the selector saw, so F (full screen) picks the display the mouse is on.
+static LAST_POINTER: Mutex<Option<LogPoint>> = Mutex::new(None);
+
+/// Full screen in one step: select the whole of one display and go straight on, exactly as if it
+/// had been dragged and Enter pressed -- the editor for a screenshot, the control bar for a
+/// recording. `None` = the display under the mouse (the F key), else the first display.
+fn select_full_display(app: &tauri::AppHandle, display: Option<DisplayId>) {
+    let st = app.state::<Arc<AppState>>().inner().clone();
+    let bounds = {
+        let layout = st.layout.lock().unwrap();
+        let d = match display {
+            Some(id) => layout.get(id),
+            None => LAST_POINTER.lock().unwrap().and_then(|p| layout.display_at(p)),
+        }.or_else(|| layout.displays().first());
+        match d { Some(d) => d.bounds, None => return }
+    };
+    let (a, b) = (LogPoint::new(bounds.min_x(), bounds.min_y()), LogPoint::new(bounds.max_x(), bounds.max_y()));
+    *st.drag.lock().unwrap() = Some(Drag { anchor: a, cursor: b });
+    broadcast(app, Some(bounds));
+    run_commit(app, false);
+}
+
+/// The selector's Full screen button: the display that overlay sits on.
+#[tauri::command]
+fn selection_fullscreen(app: tauri::AppHandle, display_id: u32) {
+    select_full_display(&app, Some(DisplayId(display_id)));
 }
 
 /// Select a whole rectangle in one step (a click on a snapped window). The corner that nudge moves
@@ -853,7 +883,7 @@ fn relaunch_app(app: tauri::AppHandle) {
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug)]
-enum SelectorKey { Cancel, Save { dialog: bool }, Nudge(f64, f64) }
+enum SelectorKey { Cancel, Save { dialog: bool }, Nudge(f64, f64), FullScreen }
 
 /// `GlobalHotKeyManager` holds Carbon handles that must only be touched on the main thread. It is
 /// created there and only ever used inside `run_on_main_thread` closures, which makes this wrapper's
@@ -870,6 +900,8 @@ fn selector_keys() -> &'static [(HotKey, SelectorKey)] {
     KEYS.get_or_init(|| {
         let mut v = Vec::new();
         v.push((HotKey::new(None, Code::Escape), SelectorKey::Cancel));
+        // F = full screen. Plain F is only taken while the selector is open, like Esc and Enter.
+        v.push((HotKey::new(None, Code::KeyF), SelectorKey::FullScreen));
         for code in [Code::Enter, Code::NumpadEnter] {
             v.push((HotKey::new(None, code), SelectorKey::Save { dialog: false }));
             v.push((HotKey::new(Some(Modifiers::SHIFT), code), SelectorKey::Save { dialog: true }));
@@ -917,6 +949,7 @@ fn handle_selector_key(app: &tauri::AppHandle, key: SelectorKey) {
         SelectorKey::Cancel => cancel_selector(app, &st),
         SelectorKey::Save { dialog } => run_commit(app, dialog),
         SelectorKey::Nudge(dx, dy) => nudge(app, &st, dx, dy),
+        SelectorKey::FullScreen => select_full_display(app, None),
     }
 }
 
@@ -1252,7 +1285,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             overlay_info, selection_begin, selection_update,
             selection_nudge, selection_cancel, selection_commit,
-            snap_at, loupe, selection_set_rect, open_privacy_settings, relaunch_app, report_overlay_focus,
+            snap_at, loupe, selection_set_rect, selection_fullscreen, open_privacy_settings, relaunch_app, report_overlay_focus,
             settings_get, settings_save, settings_pick_dir, open_settings,
             editor_info, editor_pixels, editor_save, editor_copy, editor_close, editor_format_changed,
             recording::recorder_info, recording::recorder_option, recording::recorder_start,

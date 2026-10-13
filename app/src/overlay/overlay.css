@@ -118,3 +118,17 @@ html, body, #root {
   border: 2px dashed #e5484d; border-radius: 2px;
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
 }
+
+/* Full screen in one click. A real button (the hint pill ignores the mouse), so the cursor over it
+   is the arrow, not the selection crosshair. */
+.fs-btn {
+  position: fixed; left: 50%; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 7px;
+  height: 34px; padding: 0 14px; border-radius: 999px; cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.22); background: rgba(10, 132, 255, 0.92); color: #fff;
+  font: 600 13px/1 -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.45);
+}
+.fs-btn:hover { background: rgba(40, 150, 255, 1); }
+.fs-btn kbd { font: inherit; font-weight: 500; padding: 2px 6px; border-radius: 4px; background: rgba(255, 255, 255, 0.22); }
+.fs-icon { font-size: 15px; }

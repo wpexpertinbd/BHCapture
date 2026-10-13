@@ -49,6 +49,7 @@ export function Overlay() {
   const dragRef = useRef(false);
   const downAt = useRef<{ x: number; y: number } | null>(null);
   const snapRef = useRef<Rect | null>(null);
+  const infoRef = useRef<OverlayInfo | null>(null);
   snapRef.current = snap;
 
   const loadInfo = useCallback(() => {
@@ -182,6 +183,11 @@ export function Overlay() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") { e.preventDefault(); setNotice(null); void invoke("selection_cancel"); return; }
+      if ((e.key === "f" || e.key === "F") && !e.metaKey && !e.ctrlKey && !e.altKey && infoRef.current) {
+        e.preventDefault();
+        void invoke("selection_fullscreen", { displayId: infoRef.current.display_id });
+        return;
+      }
       // Shift+Enter routes this one capture through a native Save dialog, so the default
       // folder never becomes a cage.
       if (e.key === "Enter") {
@@ -204,6 +210,7 @@ export function Overlay() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  infoRef.current = info;
   if (!info) return frame ? <div /> : <div className="scrim-idle" />;
 
   if (frame) {
@@ -282,6 +289,14 @@ export function Overlay() {
           )}
         </div>
       )}
+
+      {/* One click: the whole of THIS screen, then straight on (editor, or the recording bar). */}
+      <button className="fs-btn" style={{ bottom: 70 }}
+              onMouseDown={(e) => e.stopPropagation()}
+              onMouseUp={(e) => e.stopPropagation()}
+              onClick={(e) => { e.stopPropagation(); void invoke("selection_fullscreen", { displayId: info.display_id }); }}>
+        <span className="fs-icon">⛶</span> {mode === "video" ? "Record full screen" : "Full screen"} <kbd>F</kbd>
+      </button>
 
       <div className="hint" style={{ bottom: 28 }}>
         {local
