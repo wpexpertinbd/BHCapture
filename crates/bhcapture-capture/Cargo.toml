@@ -12,7 +12,9 @@ bhcapture-core = { path = "../bhcapture-core" }
 [dev-dependencies]
 png = "0.17"
 
-[target.'cfg(target_os = "macos")'.build-dependencies]
+# Unconditional: build.rs must COMPILE on every OS even though it only uses cc when building for
+# macOS (CI on Linux/Windows failed with "cannot find crate cc").
+[build-dependencies]
 cc = "1"
 
 [target.'cfg(windows)'.dependencies]

@@ -169,6 +169,8 @@ fn set_reports_repairs_so_the_ui_can_say_so() {
     assert_eq!(store.get().pattern, DEFAULT_PATTERN);
 }
 
+// macOS's own chord and macOS's wording: only meaningful where the macOS rules apply.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_saved_system_owned_shortcut_is_migrated_to_the_new_default() {
     // Anyone who saved settings with the old default has ⌃⇧⌘4 on disk. Loading must repair it.
@@ -182,6 +184,8 @@ fn a_saved_system_owned_shortcut_is_migrated_to_the_new_default() {
     assert_eq!(store.get().region_hotkey, bhcapture_core::hotkey::DEFAULT_REGION_HOTKEY);
 }
 
+// "Cmd" is the Win key on Windows, which Windows keeps for itself; this pins the macOS spelling.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_valid_shortcut_is_stored_in_canonical_form() {
     let dir = tmpdir("hotkey2");
