@@ -741,7 +741,7 @@ pub(crate) fn open_video(app: &tauri::AppHandle, file: PathBuf, note: Option<Str
             .min_inner_size(520.0, 360.0)
             .center()
             .resizable(true);
-        let r = crate::with_window_menu(&a, b).build();
+        let r = crate::with_window_menu(&a, &l, b).build();
         let _ = tx.send(match r {
             Ok(w) => { sync_dock(&a, None); let _ = w.set_focus(); Ok(()) }
             Err(e) => Err(e.to_string()),

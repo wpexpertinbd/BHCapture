@@ -814,7 +814,7 @@ fn open_editor(app: &tauri::AppHandle, state: &Arc<AppState>, frame: Frame) -> R
             .min_inner_size(640.0, 420.0)
             .center()
             .resizable(true);
-        let r = with_window_menu(&a, b).build();
+        let r = with_window_menu(&a, &l, b).build();
         let _ = tx.send(match r {
             Ok(win) => {
                 // A real window: the Dock icon appears (decision 10), and regular mode lets it focus.
@@ -1253,12 +1253,21 @@ fn set_slot_hotkey(slot: &HotkeySlot, spec: &str) -> Result<String, String> {
 // Settings window is open (decision 10), so it never appears for a quick capture.
 // ---------------------------------------------------------------------------------------------
 
-/// The File > Format check items, so their ticks can follow the focused editor.
-static FORMAT_ITEMS: Mutex<Vec<MainThreadOnly<(ImageFormat, CheckMenuItem<tauri::Wry>)>>> = Mutex::new(Vec::new());
+/// The File > Format check items, so their ticks can follow the focused editor. The scope is the
+/// window that owns the menu (Windows/Linux, one menu per window), or None for the macOS app menu.
+static FORMAT_ITEMS: Mutex<Vec<MainThreadOnly<(Option<String>, ImageFormat, CheckMenuItem<tauri::Wry>)>>> = Mutex::new(Vec::new());
 
-fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+/// Separates the owning window from the action in a per-window menu item id: `w:<label>|ed:save`.
+const MENU_SCOPE_SEP: char = '|';
+
+/// `scope` = the window this menu belongs to (Windows/Linux). Its item ids then carry that window's
+/// label, because Tauri hands every menu click to every window and to the app alike, and on Windows
+/// "which window is focused" is false while the page inside it has the keyboard -- so neither can
+/// say which window's File > Save was clicked. macOS has one app menu: scope None, plain ids.
+fn build_app_menu(app: &tauri::AppHandle, scope: Option<&str>) -> tauri::Result<Menu<tauri::Wry>> {
+    let id = |s: &str| -> String { match scope { Some(l) => format!("w:{l}{MENU_SCOPE_SEP}{s}"), None => s.to_string() } };
     let about = PredefinedMenuItem::about(app, Some("About BHCapture"), None)?;
-    let settings = MenuItem::with_id(app, "app:settings", "Settings…", true, Some("CmdOrCtrl+,"))?;
+    let settings = MenuItem::with_id(app, id("app:settings"), "Settings…", true, Some("CmdOrCtrl+,"))?;
     let app_menu = Submenu::with_items(app, "BHCapture", true, &[
         &about, &PredefinedMenuItem::separator(app)?, &settings, &PredefinedMenuItem::separator(app)?,
         &PredefinedMenuItem::hide(app, None)?, &PredefinedMenuItem::hide_others(app, None)?,
@@ -1268,48 +1277,53 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     let mut checks = Vec::new();
     let mut format_items: Vec<CheckMenuItem<tauri::Wry>> = Vec::new();
     for f in ALL_FORMATS {
-        let it = CheckMenuItem::with_id(app, format!("ed:format:{}", f.extension()), f.label(), true,
+        let it = CheckMenuItem::with_id(app, id(&format!("ed:format:{}", f.extension())), f.label(), true,
                                         *f == ImageFormat::Jpeg, None::<&str>)?;
-        checks.push(MainThreadOnly((*f, it.clone())));
+        checks.push(MainThreadOnly((scope.map(str::to_string), *f, it.clone())));
         format_items.push(it);
     }
-    *FORMAT_ITEMS.lock().unwrap() = checks;
+    {
+        // Replace this menu's own items; drop those of windows that no longer exist.
+        let mut all = FORMAT_ITEMS.lock().unwrap();
+        all.retain(|it| it.0 .0.as_deref().is_some_and(|l| Some(l) != scope && app.get_webview_window(l).is_some()));
+        all.extend(checks);
+    }
     let fmt_refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = format_items.iter().map(|i| i as _).collect();
     let format_menu = Submenu::with_items(app, "Image Format", true, &fmt_refs)?;
     // Recordings: the popular upload formats (decision 22). Acts only in a recording window.
     let mut exports = vec![
-        MenuItem::with_id(app, "ed:export:mp4", "MP4 (H.264) — plays everywhere…", true, None::<&str>)?,
-        MenuItem::with_id(app, "ed:export:hevc", "MP4 (HEVC) — smaller file…", true, None::<&str>)?,
+        MenuItem::with_id(app, id("ed:export:mp4"), "MP4 (H.264) — plays everywhere…", true, None::<&str>)?,
+        MenuItem::with_id(app, id("ed:export:hevc"), "MP4 (HEVC) — smaller file…", true, None::<&str>)?,
     ];
     // MOV is Apple's container; Windows' Media Foundation cannot write it.
     if cfg!(target_os = "macos") {
-        exports.push(MenuItem::with_id(app, "ed:export:mov", "MOV — for Final Cut / iMovie…", true, None::<&str>)?);
+        exports.push(MenuItem::with_id(app, id("ed:export:mov"), "MOV — for Final Cut / iMovie…", true, None::<&str>)?);
     }
-    exports.push(MenuItem::with_id(app, "ed:export:gif", "Animated GIF — for chats and READMEs…", true, Some("Shift+CmdOrCtrl+E"))?);
+    exports.push(MenuItem::with_id(app, id("ed:export:gif"), "Animated GIF — for chats and READMEs…", true, Some("Shift+CmdOrCtrl+E"))?);
     let export_refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = exports.iter().map(|i| i as _).collect();
     let export_menu = Submenu::with_items(app, "Export Recording As", true, &export_refs)?;
 
     let file = Submenu::with_items(app, "File", true, &[
-        &MenuItem::with_id(app, "ed:save", "Save", true, Some("CmdOrCtrl+S"))?,
-        &MenuItem::with_id(app, "ed:save-as", "Save As…", true, Some("Shift+CmdOrCtrl+S"))?,
+        &MenuItem::with_id(app, id("ed:save"), "Save", true, Some("CmdOrCtrl+S"))?,
+        &MenuItem::with_id(app, id("ed:save-as"), "Save As…", true, Some("Shift+CmdOrCtrl+S"))?,
         &PredefinedMenuItem::separator(app)?,
         &format_menu,
         &export_menu,
         &PredefinedMenuItem::separator(app)?,
-        &MenuItem::with_id(app, "ed:close", "Close", true, Some("CmdOrCtrl+W"))?,
+        &MenuItem::with_id(app, id("ed:close"), "Close", true, Some("CmdOrCtrl+W"))?,
     ])?;
     // Undo/Redo/Copy are OURS (they act on the drawing), but they hand over to the text box when
     // one is being typed into. Cut/Paste/Select All are the system's, for that text box.
     let edit = Submenu::with_items(app, "Edit", true, &[
-        &MenuItem::with_id(app, "ed:undo", "Undo", true, Some("CmdOrCtrl+Z"))?,
-        &MenuItem::with_id(app, "ed:redo", "Redo", true, Some("Shift+CmdOrCtrl+Z"))?,
+        &MenuItem::with_id(app, id("ed:undo"), "Undo", true, Some("CmdOrCtrl+Z"))?,
+        &MenuItem::with_id(app, id("ed:redo"), "Redo", true, Some("Shift+CmdOrCtrl+Z"))?,
         &PredefinedMenuItem::separator(app)?,
         &PredefinedMenuItem::cut(app, None)?,
-        &MenuItem::with_id(app, "ed:copy", "Copy", true, Some("CmdOrCtrl+C"))?,
+        &MenuItem::with_id(app, id("ed:copy"), "Copy", true, Some("CmdOrCtrl+C"))?,
         &PredefinedMenuItem::paste(app, None)?,
         &PredefinedMenuItem::select_all(app, None)?,
         &PredefinedMenuItem::separator(app)?,
-        &MenuItem::with_id(app, "ed:delete", "Delete Selected", true, None::<&str>)?,
+        &MenuItem::with_id(app, id("ed:delete"), "Delete Selected", true, None::<&str>)?,
     ])?;
     let window = Submenu::with_items(app, "Window", true, &[
         &PredefinedMenuItem::minimize(app, None)?,
@@ -1320,17 +1334,27 @@ fn build_app_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
 
 /// Give a document window (editor, playback) its menu on Windows/Linux, where menus live inside
 /// windows. On macOS the app menu bar serves every window, so the builder is returned unchanged.
-fn with_window_menu<'a>(app: &tauri::AppHandle, b: WebviewWindowBuilder<'a, tauri::Wry, tauri::AppHandle>)
+fn with_window_menu<'a>(app: &tauri::AppHandle, label: &str, b: WebviewWindowBuilder<'a, tauri::Wry, tauri::AppHandle>)
     -> WebviewWindowBuilder<'a, tauri::Wry, tauri::AppHandle> {
     #[cfg(not(target_os = "macos"))]
-    if let Ok(m) = build_app_menu(app) { return b.menu(m); }
-    let _ = app;
+    if let Ok(m) = build_app_menu(app, Some(label)) { return b.menu(m); }
+    let _ = (app, label);
     b
 }
 
 /// Send a menu action to the editor the user is working in. Nothing happens if no editor has focus
 /// (for example while Settings is in front), rather than acting on a window the user cannot see.
 fn route_menu_event(app: &tauri::AppHandle, id: &str) {
+    // A per-window menu (Windows/Linux) names its window: act on exactly that one.
+    if let Some((label, rest)) = id.strip_prefix("w:").and_then(|r| r.split_once(MENU_SCOPE_SEP)) {
+        if rest == "app:settings" { let _ = open_settings(app.clone()); return; }
+        let Some(action) = rest.strip_prefix("ed:") else { return };
+        if (label.starts_with(EDITOR_PREFIX) || label.starts_with(recording::VIDEO_PREFIX))
+            && app.get_webview_window(label).is_some() {
+            let _ = app.emit_to(label, "editor-menu", action.to_string());
+        }
+        return;
+    }
     if id == "app:settings" { let _ = open_settings(app.clone()); return; }
     let Some(action) = id.strip_prefix("ed:") else { return };
     let focused = app.webview_windows().into_iter()
@@ -1344,9 +1368,11 @@ fn route_menu_event(app: &tauri::AppHandle, id: &str) {
 /// The focused editor reports its format so File > Format ticks the right one. Sync command, so it
 /// runs on the main thread, where menu items must be touched.
 #[tauri::command]
-fn editor_format_changed(format: ImageFormat) {
+fn editor_format_changed(window: tauri::WebviewWindow, format: ImageFormat) {
     for item in FORMAT_ITEMS.lock().unwrap().iter() {
-        let _ = item.0 .1.set_checked(item.0 .0 == format);
+        let (scope, f, it) = &item.0;
+        // The app menu (macOS), or this window's own menu (Windows/Linux).
+        if scope.as_deref().is_none_or(|l| l == window.label()) { let _ = it.set_checked(*f == format); }
     }
 }
 
@@ -1610,7 +1636,7 @@ fn main() {
             // app-wide one would land on every window -- the selector overlays and the recording bar
             // too -- so there the editor and playback windows get theirs (`with_window_menu`).
             #[cfg(target_os = "macos")]
-            match build_app_menu(&handle) {
+            match build_app_menu(&handle, None) {
                 Ok(m) => { let _ = app.set_menu(m); }
                 Err(e) => eprintln!("[menu] could not build the menu bar: {e}"),
             }
