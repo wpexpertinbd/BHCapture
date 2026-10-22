@@ -22,6 +22,9 @@
   padding: 8px 12px; background: var(--ed-chrome); border-bottom: 1px solid var(--ed-line);
 }
 .ed-group { display: flex; align-items: center; gap: 4px; }
+/* Crop: the size readout and Reset / Cancel / Apply, in place of the colours while cropping. */
+.ed-cropbar { gap: 8px; }
+.ed-cropbar .ed-dim { font-variant-numeric: tabular-nums; margin-right: 4px; }
 .ed-spacer { flex: 1; }
 .ed-tool {
   display: flex; flex-direction: column; align-items: center; gap: 1px;

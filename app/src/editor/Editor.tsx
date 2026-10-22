@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "../events";
 import { COLORS, WIDTHS, Shape, Tool, box, hitTest, moved, render } from "./model";
+import { Rect, drawnCrop, dragCrop, gripAt, gripCursor, isFull } from "./crop";
 
 type Format = "jpeg" | "png" | "webp" | "tiff" | "bmp" | "gif";
 type EditorInfo = { id: number; width: number; height: number; scale: number; saved_to: string | null; format: Format;
@@ -38,36 +39,84 @@ const TOOLS: { tool: Tool; key: string; label: string; icon: string }[] = [
 // array from the `shapes` they closed over lost work: a quick drag ended before React re-rendered,
 // so pointer-up saw a stale draft, and an append to a stale list dropped shapes that were on screen
 // but never reached the saved file.
-type Doc = { shapes: Shape[]; undo: Shape[][]; redo: Shape[][]; dirty: boolean; nextId: number };
+// The crop is part of the document (and of undo), but NON-destructive: shapes stay in full-image
+// coordinates and the crop only says which part of the image is shown and saved, so re-entering
+// Crop can widen it again.
+type Snap = { shapes: Shape[]; crop: Rect | null };
+type Doc = { shapes: Shape[]; crop: Rect | null; undo: Snap[]; redo: Snap[]; dirty: boolean; nextId: number };
 type Act =
   | { t: "add"; shape: Omit<Shape, "id" | "n"> }
   | { t: "remove"; id: number }
   | { t: "moveLive"; id: number; to: Shape }          // during a drag: no history entry
   | { t: "moveDone"; from: Shape }                    // drag ended: one history entry
+  | { t: "crop"; rect: Rect | null }                  // null = the whole image
   | { t: "undo" } | { t: "redo" } | { t: "saved" };
+
+const snap = (d: Doc): Snap => ({ shapes: d.shapes, crop: d.crop });
 
 function reduce(d: Doc, a: Act): Doc {
   switch (a.t) {
     case "add": {
       const n = a.shape.kind === "step" ? d.shapes.filter((s) => s.kind === "step").length + 1 : undefined;
       const shape: Shape = { ...a.shape, id: d.nextId, n };
-      return { shapes: [...d.shapes, shape], undo: [...d.undo, d.shapes], redo: [], dirty: true, nextId: d.nextId + 1 };
+      return { ...d, shapes: [...d.shapes, shape], undo: [...d.undo, snap(d)], redo: [], dirty: true, nextId: d.nextId + 1 };
     }
     case "remove":
-      return { ...d, shapes: d.shapes.filter((s) => s.id !== a.id), undo: [...d.undo, d.shapes], redo: [], dirty: true };
+      return { ...d, shapes: d.shapes.filter((s) => s.id !== a.id), undo: [...d.undo, snap(d)], redo: [], dirty: true };
     case "moveLive":
       return { ...d, shapes: d.shapes.map((s) => (s.id === a.id ? a.to : s)) };
     case "moveDone":
-      return { ...d, undo: [...d.undo, d.shapes.map((s) => (s.id === a.from.id ? a.from : s))], redo: [], dirty: true };
-    case "undo":
+      return { ...d, undo: [...d.undo, { shapes: d.shapes.map((s) => (s.id === a.from.id ? a.from : s)), crop: d.crop }],
+               redo: [], dirty: true };
+    case "crop":
+      return { ...d, crop: a.rect, undo: [...d.undo, snap(d)], redo: [], dirty: true };
+    case "undo": {
       if (!d.undo.length) return d;
-      return { ...d, shapes: d.undo[d.undo.length - 1], undo: d.undo.slice(0, -1), redo: [...d.redo, d.shapes], dirty: true };
-    case "redo":
+      const s = d.undo[d.undo.length - 1];
+      return { ...d, shapes: s.shapes, crop: s.crop, undo: d.undo.slice(0, -1), redo: [...d.redo, snap(d)], dirty: true };
+    }
+    case "redo": {
       if (!d.redo.length) return d;
-      return { ...d, shapes: d.redo[d.redo.length - 1], redo: d.redo.slice(0, -1), undo: [...d.undo, d.shapes], dirty: true };
+      const s = d.redo[d.redo.length - 1];
+      return { ...d, shapes: s.shapes, crop: s.crop, redo: d.redo.slice(0, -1), undo: [...d.undo, snap(d)], dirty: true };
+    }
     case "saved":
       return { ...d, dirty: false };
   }
+}
+
+/** The editor's tools: the drawing tools, plus Crop (which draws nothing). */
+type EdTool = Tool | "crop";
+const CROP_KEY = "c";
+
+/** The crop frame drawn over the WHOLE image while Crop is on: dimmed outside, thirds, 8 handles.
+ *  `px` = canvas pixels per screen point, so handles keep their on-screen size at any zoom. */
+function drawCropFrame(ctx: CanvasRenderingContext2D, r: Rect, W: number, H: number, px: number) {
+  const [x, y, w, h] = r;
+  ctx.save();
+  ctx.fillStyle = "rgba(0, 0, 0, 0.55)";
+  ctx.beginPath();
+  ctx.rect(0, 0, W, H);
+  ctx.rect(x, y, w, h);
+  ctx.fill("evenodd");
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.35)";
+  ctx.lineWidth = 1 * px;
+  for (const f of [1 / 3, 2 / 3]) {
+    ctx.beginPath(); ctx.moveTo(x + w * f, y); ctx.lineTo(x + w * f, y + h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y + h * f); ctx.lineTo(x + w, y + h * f); ctx.stroke();
+  }
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 1.5 * px;
+  ctx.strokeRect(x, y, w, h);
+  const s = 10 * px;
+  for (const [hx, hy] of [[x, y], [x + w / 2, y], [x + w, y], [x + w, y + h / 2], [x + w, y + h], [x + w / 2, y + h], [x, y + h], [x, y + h / 2]]) {
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(hx - s / 2, hy - s / 2, s, s);
+    ctx.strokeStyle = "rgba(0, 0, 0, 0.6)";
+    ctx.lineWidth = 1 * px;
+    ctx.strokeRect(hx - s / 2, hy - s / 2, s, s);
+  }
+  ctx.restore();
 }
 
 export function Editor() {
@@ -76,9 +125,13 @@ export function Editor() {
   const [error, setError] = useState<string | null>(null);
 
   // A fresh capture is unsaved by definition, hence dirty from the start.
-  const [doc, dispatch] = useReducer(reduce, { shapes: [], undo: [], redo: [], dirty: true, nextId: 1 });
+  const [doc, dispatch] = useReducer(reduce, { shapes: [], crop: null, undo: [], redo: [], dirty: true, nextId: 1 });
   const { shapes, dirty } = doc;
-  const [tool, setTool] = useState<Tool>("arrow");
+  const [tool, setToolRaw] = useState<EdTool>("arrow");
+  // The frame being adjusted while Crop is on; applied to the document only on Apply / Enter.
+  const [cropDraft, setCropDraft] = useState<Rect | null>(null);
+  const cropDrag = useRef<{ grip: string; start: Rect; x: number; y: number } | null>(null);
+  const cropping = tool === "crop";
   // The shape the group button currently stands for (Arrow until another is picked).
   const [shape, setShape] = useState<Tool>("arrow");
   const [shapeMenu, setShapeMenu] = useState(false);
@@ -100,6 +153,33 @@ export function Editor() {
   const draftRef = useRef<Shape | null>(null);
   const setDraftBoth = (d: Shape | null) => { draftRef.current = d; setDraft(d); };
   const k = info?.scale ?? 1;
+  const W = info?.width ?? 1, H = info?.height ?? 1;
+  const full: Rect = [0, 0, W, H];
+  // What the canvas shows: the whole image while cropping (to see what can be kept), else the crop.
+  const view: Rect = cropping ? full : (doc.crop ?? full);
+
+  // Entering Crop starts from the current crop (or the whole image); leaving it applies or drops it.
+  const setTool = useCallback((t: EdTool) => {
+    setToolRaw(t);
+    if (t === "crop") { setSelected(null); setCropDraft(doc.crop ?? [0, 0, W, H]); }
+    else setCropDraft(null);
+    // Switching tool ends any drag in progress -- a shape half-drawn in one coordinate space must
+    // not be finished in another (the crop view shows the whole image, the normal view the crop).
+    cropDrag.current = null;
+    drag.current = null;
+    setDraftBoth(null);
+    // The crop frame sets the cursor by hand while hovering; hand it back to the tool's CSS.
+    if (canvasRef.current) canvasRef.current.style.cursor = "";
+  }, [doc.crop, W, H]);
+  /** The crop the document gets if Crop is applied now (null = the whole image). */
+  const pendingCrop = (): Rect | null => (cropDraft && !isFull(cropDraft, W, H) ? cropDraft : null);
+  const applyCrop = () => {
+    const next = pendingCrop();
+    const same = JSON.stringify(next) === JSON.stringify(doc.crop);
+    if (!same) dispatch({ t: "crop", rect: next });
+    setTool("select");
+  };
+  const cancelCrop = () => setTool("select");
 
   // ---------------------------------------------------------------- load the capture
   useEffect(() => {
@@ -122,28 +202,53 @@ export function Editor() {
   useEffect(() => {
     const c = canvasRef.current;
     if (!c || !base || !info) return;
-    render(c.getContext("2d")!, base, info.width, info.height, visible, k, selected, false);
-  }, [visible, base, info, k, selected]);
+    const ctx = c.getContext("2d")!;
+    // Shapes live in full-image coordinates; shift so the shown part starts at the canvas corner.
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, -view[0], -view[1]);
+    render(ctx, base, info.width, info.height, visible, k, selected, false);
+    ctx.restore();
+    if (cropping && cropDraft) {
+      const css = c.getBoundingClientRect().width || c.width;
+      drawCropFrame(ctx, cropDraft, info.width, info.height, c.width / css);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visible, base, info, k, selected, cropping, cropDraft, view[0], view[1], view[2], view[3]]);
 
   // ---------------------------------------------------------------- history
   const doUndo = useCallback(() => { setSelected(null); dispatch({ t: "undo" }); }, []);
   const doRedo = useCallback(() => { setSelected(null); dispatch({ t: "redo" }); }, []);
 
   // ---------------------------------------------------------------- export
-  /** Render a CLEAN copy (no selection chrome) at full resolution, as a lossless PNG. */
-  const exportPng = useCallback(async (): Promise<Uint8Array> => {
+  /** Render a CLEAN copy (no selection chrome) at full resolution, as a lossless PNG -- only the
+   *  cropped part when there is a crop. */
+  const exportPng = useCallback(async (crop: Rect | null): Promise<Uint8Array> => {
     if (!base || !info) throw new Error("not loaded");
-    const off = new OffscreenCanvas(info.width, info.height);
-    render(off.getContext("2d") as unknown as CanvasRenderingContext2D, base, info.width, info.height, shapes, k, null, true);
+    const [x, y, w, h] = crop ?? [0, 0, info.width, info.height];
+    const off = new OffscreenCanvas(w, h);
+    const ctx = off.getContext("2d") as unknown as CanvasRenderingContext2D;
+    ctx.setTransform(1, 0, 0, 1, -x, -y);
+    render(ctx, base, info.width, info.height, shapes, k, null, true);
     const blob = await off.convertToBlob({ type: "image/png" });
     return new Uint8Array(await blob.arrayBuffer());
   }, [base, info, shapes, k]);
+
+  /** Save or Copy while Crop is still open uses the frame on screen (and applies it), the way a
+   *  user expects -- not the crop from before they started adjusting. */
+  const cropForOutput = useCallback((): Rect | null => {
+    if (!cropping) return doc.crop;
+    const next = pendingCrop();
+    if (JSON.stringify(next) !== JSON.stringify(doc.crop)) dispatch({ t: "crop", rect: next });
+    setTool("select");
+    return next;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cropping, cropDraft, doc.crop, setTool]);
 
   const save = useCallback(async (saveAs: boolean): Promise<boolean> => {
     if (busy) return false;
     setBusy(true);
     try {
-      const png = await exportPng();
+      const png = await exportPng(cropForOutput());
       const path = await invoke<string>("editor_save", png, { headers: { "x-save-as": saveAs ? "1" : "0", "x-format": format } });
       setSavedTo(path); dispatch({ t: "saved" });
       setNotice({ kind: "ok", message: `Saved ${path.split("/").pop()}` });
@@ -156,16 +261,16 @@ export function Editor() {
     } finally {
       setBusy(false);
     }
-  }, [busy, exportPng, format]);
+  }, [busy, exportPng, format, cropForOutput]);
 
   const copy = useCallback(async () => {
     try {
-      await invoke("editor_copy", await exportPng());
+      await invoke("editor_copy", await exportPng(cropForOutput()));
       setNotice({ kind: "ok", message: "Copied to the clipboard" });
     } catch (e) {
       setNotice({ kind: "error", message: String(e) });
     }
-  }, [exportPng]);
+  }, [exportPng, cropForOutput]);
 
   // Closing: ask only when there is something to lose. Our own dialog -- window.confirm in a Tauri
   // webview shows nothing and returns TRUE, which would discard work silently.
@@ -188,8 +293,9 @@ export function Editor() {
     else if (a === "close") requestClose();
     // While a text box is being typed into, Copy/Undo/Redo are for THAT text, not the drawing.
     else if (a === "copy") { if (typing) document.execCommand("copy"); else void copy(); }
-    else if (a === "undo") { if (typing) document.execCommand("undo"); else doUndo(); }
-    else if (a === "redo") { if (typing) document.execCommand("redo"); else doRedo(); }
+    // Undo/Redo can change the crop itself, so an open crop frame is closed first.
+    else if (a === "undo") { if (typing) document.execCommand("undo"); else { if (cropping) cancelCrop(); doUndo(); } }
+    else if (a === "redo") { if (typing) document.execCommand("redo"); else { if (cropping) cancelCrop(); doRedo(); } }
     else if (a === "delete") { if (selected !== null) { dispatch({ t: "remove", id: selected }); setSelected(null); } }
     else if (a.startsWith("format:")) {
       const ext = a.slice(7);
@@ -216,10 +322,16 @@ export function Editor() {
   }, [notice]);
 
   // ---------------------------------------------------------------- pointer
-  const toImage = (e: React.PointerEvent) => {
+  /** Pointer -> FULL-image pixels (the canvas may show only the cropped part). */
+  const toImage = (e: React.PointerEvent | React.MouseEvent) => {
     const c = canvasRef.current!;
     const r = c.getBoundingClientRect();
-    return { x: ((e.clientX - r.left) / r.width) * c.width, y: ((e.clientY - r.top) / r.height) * c.height };
+    return { x: view[0] + ((e.clientX - r.left) / r.width) * c.width, y: view[1] + ((e.clientY - r.top) / r.height) * c.height };
+  };
+  /** How far from a crop edge still grabs it: 10 screen points, in image pixels. */
+  const gripTol = () => {
+    const c = canvasRef.current!;
+    return 10 * (c.width / (c.getBoundingClientRect().width || c.width));
   };
 
   const onPointerDown = (e: React.PointerEvent) => {
@@ -228,6 +340,15 @@ export function Editor() {
     // consider active; drawing must not depend on it.
     try { (e.target as Element).setPointerCapture(e.pointerId); } catch { /* optional */ }
     const p = toImage(e);
+    if (cropping) {
+      if (!cropDraft) return;
+      // A handle or edge resizes, inside moves, outside draws a new frame from here. While the frame
+      // is still the whole image there is nothing to move, so dragging inside draws a new frame.
+      let g = gripAt(cropDraft, p.x, p.y, gripTol());
+      if (g === "move" && isFull(cropDraft, W, H)) g = null;
+      cropDrag.current = { grip: g ?? "new", start: cropDraft, x: p.x, y: p.y };
+      return;
+    }
     if (tool === "select") {
       const hit = hitTest(shapes, p.x, p.y, k, canvasRef.current!.getContext("2d")!);
       setSelected(hit?.id ?? null);
@@ -248,6 +369,23 @@ export function Editor() {
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
+    if (cropping && info) {
+      const p = toImage(e);
+      const cd = cropDrag.current;
+      if (!cd) {
+        // Hovering: show what a press here would do.
+        if (cropDraft) canvasRef.current!.style.cursor = gripCursor(gripAt(cropDraft, p.x, p.y, gripTol()));
+        return;
+      }
+      if (cd.grip === "new") {
+        // A new frame only once the pointer has really moved, so a stray click keeps the old one.
+        if (Math.hypot(p.x - cd.x, p.y - cd.y) < gripTol() / 2) return;
+        setCropDraft(drawnCrop(cd.x, cd.y, p.x, p.y, info.width, info.height));
+      } else {
+        setCropDraft(dragCrop(cd.start, cd.grip, p.x - cd.x, p.y - cd.y, info.width, info.height));
+      }
+      return;
+    }
     const d = drag.current;
     if (!d) return;
     const p = toImage(e);
@@ -264,6 +402,7 @@ export function Editor() {
   };
 
   const onPointerUp = (e: React.PointerEvent) => {
+    if (cropDrag.current) { cropDrag.current = null; return; }
     const d = drag.current;
     drag.current = null;
     if (!d) return;
@@ -307,6 +446,11 @@ export function Editor() {
       // Cmd-S/Shift-Cmd-S/Cmd-C/Cmd-Z/Cmd-W belong to the menu bar. Handling them here as well could
       // run an action twice.
       if (mod) return;
+      if (cropping) {
+        if (e.key === "Enter") { e.preventDefault(); applyCrop(); return; }
+        if (e.key === "Escape") { e.preventDefault(); cancelCrop(); return; }
+      }
+      if (key === CROP_KEY) { setTool(cropping ? "select" : "crop"); return; }
       if ((e.key === "Backspace" || e.key === "Delete") && selected !== null) {
         e.preventDefault(); dispatch({ t: "remove", id: selected }); setSelected(null); return;
       }
@@ -318,7 +462,8 @@ export function Editor() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [textEdit, askClose, save, copy, requestClose, doUndo, doRedo, selected]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [textEdit, askClose, save, copy, requestClose, doUndo, doRedo, selected, cropping, cropDraft, doc.crop, setTool]);
 
   // ---------------------------------------------------------------- view
   if (error) return <div className="editor-error">Could not open this capture: {error}</div>;
@@ -327,8 +472,8 @@ export function Editor() {
   const c = canvasRef.current;
   const r = c?.getBoundingClientRect();
   const textStyle = textEdit && r ? {
-    left: (textEdit.x / info.width) * r.width, top: (textEdit.y / info.height) * r.height,
-    color, fontSize: `${((14 + width * 3) * k * r.width) / info.width}px`,
+    left: ((textEdit.x - view[0]) / view[2]) * r.width, top: ((textEdit.y - view[1]) / view[3]) * r.height,
+    color, fontSize: `${((14 + width * 3) * k * r.width) / view[2]}px`,
   } : undefined;
 
   return (
@@ -368,6 +513,21 @@ export function Editor() {
           ))}
         </div>
         <div className="ed-group">
+          <button className={`ed-tool ${cropping ? "on" : ""}`} title="Crop (C)"
+                  onClick={() => setTool(cropping ? "select" : "crop")}>
+            <span className="ed-icon">⛶</span><span className="ed-label">Crop</span>
+          </button>
+        </div>
+        {cropping && cropDraft ? (
+          <div className="ed-group ed-cropbar">
+            <span className="ed-dim">{cropDraft[2]} × {cropDraft[3]} px</span>
+            <button className="ed-btn" onClick={() => setCropDraft([0, 0, W, H])}
+                    disabled={isFull(cropDraft, W, H)}>Reset</button>
+            <button className="ed-btn" onClick={cancelCrop}>Cancel <kbd>Esc</kbd></button>
+            <button className="ed-btn primary" onClick={applyCrop}>Apply <kbd>↩</kbd></button>
+          </div>
+        ) : (
+        <div className="ed-group">
           {COLORS.map((cl) => (
             <button key={cl} className={`ed-swatch ${color === cl ? "on" : ""}`} style={{ background: cl }}
                     title={cl} onClick={() => setColor(cl)} />
@@ -380,14 +540,31 @@ export function Editor() {
             </button>
           ))}
         </div>
+        )}
       </div>
 
       <div className="ed-stage">
         <div className="ed-canvas-wrap">
-          <canvas ref={canvasRef} width={info.width} height={info.height}
+          <canvas ref={canvasRef} width={view[2]} height={view[3]}
                   className={`ed-canvas tool-${tool}`}
-                  style={{ aspectRatio: `${info.width} / ${info.height}`, maxWidth: `${info.width / k}px` }}
-                  onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} />
+                  style={{ aspectRatio: `${view[2]} / ${view[3]}`, maxWidth: `${view[2] / k}px` }}
+                  onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
+                  onPointerCancel={() => {
+                    // The system took the pointer away mid-drag: end the drag, keep what was there.
+                    cropDrag.current = null;
+                    if (drag.current?.mode === "move" && drag.current.moved && drag.current.orig) {
+                      dispatch({ t: "moveDone", from: drag.current.orig });
+                    }
+                    drag.current = null;
+                    setDraftBoth(null);
+                  }}
+                  onDoubleClick={(e) => {
+                    // Double-click inside the frame applies it, as in most editors.
+                    if (cropping && cropDraft) {
+                      const p = toImage(e);
+                      if (gripAt(cropDraft, p.x, p.y, 0) === "move") applyCrop();
+                    }
+                  }} />
           {textEdit && textStyle && (
             <input className="ed-text-input" autoFocus style={textStyle} value={textEdit.value}
                    placeholder="Type, then Enter"
@@ -399,7 +576,8 @@ export function Editor() {
       </div>
 
       <div className="ed-status">
-        <span>{info.width} × {info.height} px</span>
+        <span>{(doc.crop ?? full)[2]} × {(doc.crop ?? full)[3]} px</span>
+        {doc.crop && <span className="ed-dim">Cropped from {info.width} × {info.height}</span>}
         <span className="ed-dim">{FORMATS.find((f) => f.value === format)?.label}</span>
         <span className="ed-dim">{savedTo
           ? (dirty ? "Edited since last save" : `Saved · ${savedTo.split(/[\\/]/).pop()}`)
