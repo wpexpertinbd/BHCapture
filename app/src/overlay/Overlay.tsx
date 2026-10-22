@@ -13,8 +13,7 @@ type OverlayInfo = {
   scale: number;
 };
 
-/** Global logical rect: [x, y, w, h]. */
-type Rect = [number, number, number, number];
+import { GRIPS, Grip, Rect, reshape } from "./reshape";
 
 /** Why a capture did not happen, as the Rust side reports it. */
 type Notice = { kind: "permission" | "empty" | "cancelled" | "failed"; message: string };
@@ -55,7 +54,11 @@ export function Overlay() {
   const downAt = useRef<{ x: number; y: number } | null>(null);
   const snapRef = useRef<Rect | null>(null);
   const infoRef = useRef<OverlayInfo | null>(null);
+  // Resizing or moving the existing selection: which sides, from what rect, from which point.
+  const reshapeRef = useRef<{ grip: Grip; start: Rect; from: { x: number; y: number } } | null>(null);
+  const selRef = useRef<Rect | null>(null);
   snapRef.current = snap;
+  selRef.current = sel;
 
   const loadInfo = useCallback(() => {
     invoke<OverlayInfo>("overlay_info").then(setInfo).catch(() => setInfo(null));
@@ -83,11 +86,23 @@ export function Overlay() {
     return () => { un.then((f) => f()); };
   }, []);
 
+  // A drag can end without its mouseup reaching us: Enter/F/Esc are global keys, so the selector can
+  // close (or turn into the click-through recording frame) while the button is still held. The
+  // overlays are reused, so that drag must not survive into the next session -- a stale resize would
+  // otherwise replay the old selection under the pointer on the very first mouse move.
+  const endDrag = useCallback(() => {
+    dragRef.current = false;
+    reshapeRef.current = null;
+    downAt.current = null;
+    setDragging(false);
+  }, []);
+
   useEffect(() => {
     const a = listen<{ mode: "image" | "video"; switchable: boolean }>("selector-mode", (e) => {
+      endDrag();
       setMode(e.payload.mode); setSwitchable(e.payload.switchable); setFrame(null);
     });
-    const b = listen<Rect | null>("record-frame", (e) => { setFrame(e.payload); setRings([]); });
+    const b = listen<Rect | null>("record-frame", (e) => { endDrag(); setFrame(e.payload); setRings([]); });
     const c = listen<[number, number, boolean]>("record-click", (e) => {
       const [x, y, right] = e.payload;
       const id = ++ringId.current;
@@ -95,7 +110,7 @@ export function Overlay() {
       setTimeout(() => setRings((r) => r.filter((q) => q.id !== id)), 650);
     });
     return () => { a.then((f) => f()); b.then((f) => f()); c.then((f) => f()); };
-  }, []);
+  }, [endDrag]);
 
   // A capture started by a global key (Enter pressed while another app is in front) has no promise
   // to reject, so its failure arrives as an event instead.
@@ -156,6 +171,18 @@ export function Overlay() {
     dragRef.current = true;
     setDragging(true);
     setNotice(null);
+    // A press on a handle, an edge or inside the selection adjusts THAT selection, so a region
+    // that came out a little short is fixed by dragging its side -- not by drawing it again.
+    const grip = GRIPS[(e.target as HTMLElement).dataset?.grip ?? ""];
+    const cur = selRef.current;
+    if (grip && cur) {
+      reshapeRef.current = { grip, start: cur, from: g };
+      // A press inside that never moves is still a CLICK, which can pick a highlighted window
+      // inside the selection (onMouseUp). Handles and edges are always a resize.
+      downAt.current = grip.move ? { x: e.clientX, y: e.clientY } : null;
+      return;
+    }
+    reshapeRef.current = null;
     downAt.current = { x: e.clientX, y: e.clientY };
     void invoke("selection_begin", g);
   }, [toGlobal]);
@@ -164,11 +191,23 @@ export function Overlay() {
     setCursor({ x: e.clientX, y: e.clientY });
     const g = toGlobal(e.clientX, e.clientY);
     if (!g) return;
-    if (dragRef.current) void invoke("selection_update", g);
+    // No button held means the press ended somewhere we never heard about: the drag is over.
+    if (dragRef.current && e.buttons === 0) endDrag();
+    const rs = reshapeRef.current;
+    const d = downAt.current;
+    if (dragRef.current && rs) {
+      // A move starts only past the click slop, so a click inside does not nudge the selection;
+      // once past it, the press is a drag for good (no window pick on release).
+      if (rs.grip.move && d && Math.hypot(e.clientX - d.x, e.clientY - d.y) >= CLICK_SLOP) downAt.current = null;
+      if (!(rs.grip.move && downAt.current)) {
+        const [x, y, w, h] = reshape(rs.start, rs.grip, g.x - rs.from.x, g.y - rs.from.y);
+        void invoke("selection_set_rect", { x, y, w, h });
+      }
+    } else if (dragRef.current) void invoke("selection_update", g);
     lastPointer.current = g;
     pending.current = g;
     void pump();
-  }, [toGlobal, pump]);
+  }, [toGlobal, pump, endDrag]);
 
   // Releasing ENDS THE DRAG but keeps the selection, so it can still be nudged with the arrow
   // keys for pixel-accurate edges. Enter is what commits.
@@ -177,6 +216,7 @@ export function Overlay() {
     dragRef.current = false;
     setDragging(false);
     downAt.current = null;
+    reshapeRef.current = null;
     if (!start) return;
 
     const moved = Math.hypot(e.clientX - start.x, e.clientY - start.y);
@@ -278,8 +318,21 @@ export function Overlay() {
 
       {local && local.w > 0 && local.h > 0 && (
         <>
-          <div className="selection"
+          <div className="selection" data-grip="move"
                style={{ left: local.x, top: local.y, width: local.w, height: local.h }} />
+          {/* Edges (invisible, wide enough to catch) and eight visible handles. */}
+          {(["n", "s", "e", "w"] as const).map((k) => (
+            <div key={k} data-grip={k} className={`sel-edge sel-edge-${k}`}
+                 style={k === "n" || k === "s"
+                   ? { left: local.x, width: local.w, top: (k === "n" ? local.y : local.y + local.h) - 5 }
+                   : { top: local.y, height: local.h, left: (k === "w" ? local.x : local.x + local.w) - 5 }} />
+          ))}
+          {(["nw", "n", "ne", "e", "se", "s", "sw", "w"] as const).map((k) => {
+            const hx = k.includes("w") ? local.x : k.includes("e") ? local.x + local.w : local.x + local.w / 2;
+            const hy = k.includes("n") ? local.y : k.includes("s") ? local.y + local.h : local.y + local.h / 2;
+            return <div key={`h-${k}`} data-grip={k} className={`sel-handle sel-cur-${k}`}
+                        style={{ left: hx - 5, top: hy - 5 }} />;
+          })}
           <div className="readout" style={{ left: Math.max(4, local.x), top: readoutTop }}>
             {Math.round(local.w)} &times; {Math.round(local.h)}
             <span className="px">&nbsp;&nbsp;{px} px</span>
@@ -331,7 +384,7 @@ export function Overlay() {
 
       <div className="hint" style={{ bottom: 28 }}>
         {local
-          ? <><kbd>Enter</kbd> {mode === "video" ? "record this area" : "edit"} <kbd>&larr;&uarr;&rarr;&darr;</kbd> nudge <kbd>Esc</kbd> cancel</>
+          ? <><kbd>Enter</kbd> {mode === "video" ? "record this area" : "edit"} &nbsp;drag edges to resize &nbsp;<kbd>&larr;&uarr;&rarr;&darr;</kbd> nudge <kbd>Esc</kbd> cancel</>
           : <>{mode === "video" ? "Record: click a window or drag any size" : "Click a window or drag any size"} &nbsp;<kbd>Esc</kbd> cancel</>}
       </div>
     </div>

@@ -23,8 +23,28 @@ html, body, #root {
   position: fixed;
   box-shadow: 0 0 0 100000px rgba(0, 0, 0, 0.45);
   outline: 1px solid rgba(255, 255, 255, 0.95);
-  pointer-events: none;
+  /* Inside the selection drags it; the shadow around it is not hit-tested, so a press out there
+     still starts a new selection. */
+  cursor: move;
 }
+
+/* Resize: invisible 10pt strips along each side, and eight visible handles. */
+.sel-edge { position: fixed; }
+.sel-edge-n, .sel-edge-s { height: 10px; cursor: ns-resize; }
+.sel-edge-e, .sel-edge-w { width: 10px; cursor: ew-resize; }
+.sel-handle {
+  position: fixed;
+  width: 10px; height: 10px;
+  box-sizing: border-box;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.55);
+  border-radius: 2px;
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.4);
+}
+.sel-cur-nw, .sel-cur-se { cursor: nwse-resize; }
+.sel-cur-ne, .sel-cur-sw { cursor: nesw-resize; }
+.sel-cur-n, .sel-cur-s { cursor: ns-resize; }
+.sel-cur-e, .sel-cur-w { cursor: ew-resize; }
 
 .crosshair-h, .crosshair-v {
   position: fixed;

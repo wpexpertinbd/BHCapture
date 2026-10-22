@@ -360,6 +360,22 @@ fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// The Dock / Launchpad icon was clicked while BHCapture runs (see the `Reopen` handler).
+#[cfg(target_os = "macos")]
+fn reopen(app: &tauri::AppHandle) {
+    let docs: Vec<_> = app.webview_windows().into_iter()
+        .filter(|(l, _)| l.starts_with(EDITOR_PREFIX) || l.starts_with(recording::VIDEO_PREFIX) || l == SETTINGS_WINDOW)
+        .map(|(_, w)| w)
+        .collect();
+    if docs.is_empty() { let _ = open_settings(app.clone()); return; }
+    for w in &docs {
+        let _ = w.unminimize();
+        let _ = w.show();
+    }
+    sync_dock(app, None);
+    let _ = docs[0].set_focus();
+}
+
 /// Release the frozen frames (tens of MB on a Retina panel) and invalidate in-flight work.
 fn release_frozen(state: &AppState) {
     // The epoch moves under the snapshot lock, so a capture finishing on another thread either sees
@@ -2306,10 +2322,12 @@ fn main() {
         .run(|app, event| {
             // Quitting mid-recording finishes the file, so it is playable and offered next launch.
             if let tauri::RunEvent::Exit = event { recording::finish_on_exit(); }
-            // Opening BHCapture again while it runs (Launchpad, Finder, Spotlight) opens Settings --
-            // a menu-bar app otherwise gives no sign that anything happened.
+            // Opening BHCapture again while it runs (Dock, Launchpad, Finder, Spotlight): bring back
+            // what the user was working on -- an unsaved capture, a recording, Settings. Only when
+            // nothing is open does it open Settings, since a menu-bar app otherwise gives no sign
+            // that anything happened. (It used to open Settings every time, on top of the editor.)
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event { let _ = open_settings(app.clone()); }
+            if let tauri::RunEvent::Reopen { .. } = event { reopen(app); }
             #[cfg(not(target_os = "macos"))]
             let _ = app;
         });
