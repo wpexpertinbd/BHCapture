@@ -20,6 +20,10 @@ shiguredo_mp4 = "=2026.5.0"
 # lightly patched copy (third_party/tract-tflite/BHCAPTURE-PATCH.md). macOS uses Vision instead.
 tract-tflite = { path = "../../third_party/tract-tflite", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# O_NOFOLLOW, whose value differs between platforms and CPUs (library.rs). Already in the build.
+libc = "0.2"
+
 [features]
 segment = ["dep:tract-tflite"]
 

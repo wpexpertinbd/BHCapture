@@ -12,6 +12,7 @@ pub mod gif_export;
 pub mod hotkey;
 pub mod image;
 pub mod level;
+pub mod library;
 pub mod mp4_writer;
 pub mod naming;
 pub mod private_file;

@@ -7,6 +7,7 @@ import "./editor/editor.css";
 import "./recorder/recorder.css";
 import "./video/video.css";
 import "./camera/camera.css";
+import "./home/home.css";
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

@@ -5,6 +5,7 @@ import { Editor } from "./editor/Editor";
 import { Recorder } from "./recorder/Recorder";
 import { VideoWindow } from "./video/VideoWindow";
 import { CameraBubble } from "./camera/CameraBubble";
+import { Home } from "./home/Home";
 
 /// Every window loads the same bundle; the label decides what it is. Overlays are "overlay-<display>",
 /// editors are "editor-<n>", the recording bar is "recorder", recordings play in "video-<n>", and the
@@ -16,5 +17,6 @@ export function App() {
   if (label === "recorder") return <Recorder />;
   if (label.startsWith("video-")) return <VideoWindow />;
   if (label === "camera") return <CameraBubble />;
+  if (label === "home") return <Home />;
   return <Settings />;
 }

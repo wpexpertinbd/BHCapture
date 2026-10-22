@@ -5,7 +5,9 @@ import { listen } from "../events";
 import { COLORS, WIDTHS, Shape, Tool, box, hitTest, moved, render } from "./model";
 
 type Format = "jpeg" | "png" | "webp" | "tiff" | "bmp" | "gif";
-type EditorInfo = { id: number; width: number; height: number; scale: number; saved_to: string | null; format: Format };
+type EditorInfo = { id: number; width: number; height: number; scale: number; saved_to: string | null; format: Format;
+                    /** Opened from this file (start window); Save writes a new "… edited" file beside it. */
+                    origin: string | null };
 type Notice = { kind: string; message: string };
 
 const FORMATS: { value: Format; label: string }[] = [
@@ -107,6 +109,8 @@ export function Editor() {
         const buf = await invoke<ArrayBuffer>("editor_pixels");
         const bmp = await createImageBitmap(new ImageData(new Uint8ClampedArray(buf), i.width, i.height));
         setInfo(i); setFormat(i.format); setSavedTo(i.saved_to); setBase(bmp);
+        // An image opened from disk is already safe there: closing it unedited asks nothing.
+        if (i.origin) dispatch({ t: "saved" });
       } catch (e) {
         setError(String(e));
       }
@@ -397,7 +401,11 @@ export function Editor() {
       <div className="ed-status">
         <span>{info.width} × {info.height} px</span>
         <span className="ed-dim">{FORMATS.find((f) => f.value === format)?.label}</span>
-        <span className="ed-dim">{savedTo ? (dirty ? "Edited since last save" : `Saved · ${savedTo.split("/").pop()}`) : "Not saved yet"}</span>
+        <span className="ed-dim">{savedTo
+          ? (dirty ? "Edited since last save" : `Saved · ${savedTo.split(/[\\/]/).pop()}`)
+          : info?.origin
+            ? (dirty ? "Edited — Save makes a new copy, the original stays" : `Opened · ${info.origin.split(/[\\/]/).pop()}`)
+            : "Not saved yet"}</span>
         <span className="ed-dim ed-keys">File › Save ⌘S · Save As ⇧⌘S · Image Format · Edit › Copy ⌘C · Undo ⌘Z</span>
       </div>
 

@@ -68,6 +68,34 @@ pub fn write_private(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     write_private_with(dest, |f| f.write_all(bytes))
 }
 
+/// Like [`write_private`], but `dest` must be NEW: if anything appears at that name before the write
+/// lands (another save, another program), this fails with `AlreadyExists` instead of replacing it.
+/// The final step is a hard link, which the OS refuses when the name is taken -- an atomic
+/// "create only if absent" that a rename cannot give. A volume without hard links (FAT, some network
+/// shares) falls back to checking the name just before renaming, the best those can do.
+pub fn write_private_new(dest: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut last = None;
+    for _ in 0..8 {
+        let tmp = temp_beside(dest);
+        let mut f = match create_new_private(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => { last = Some(e); continue; }
+            Err(e) => return Err(e),
+        };
+        let written = f.write_all(bytes).and_then(|_| f.sync_all());
+        drop(f);
+        let done = written.and_then(|_| match std::fs::hard_link(&tmp, dest) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(e),
+            Err(_) if occupied(dest) => Err(io::Error::new(io::ErrorKind::AlreadyExists, "the name is taken")),
+            Err(_) => std::fs::rename(&tmp, dest),
+        });
+        let _ = std::fs::remove_file(&tmp);
+        return done;
+    }
+    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "no free temporary name")))
+}
+
 /// Copy `src` to `dest` as a private file (see the module notes).
 pub fn copy_private(src: &Path, dest: &Path) -> io::Result<()> {
     let mut from = File::open(src)?;
@@ -98,6 +126,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn write_new_never_replaces_what_is_already_there() {
+        let d = dir("new");
+        let dest = d.join("shot edited.png");
+        write_private_new(&dest, b"first").unwrap();
+        let e = write_private_new(&dest, b"second").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"first");
+        // Nothing left behind but the one file.
+        assert_eq!(std::fs::read_dir(&d).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777, 0o600);
+            // A dangling symlink at the name also counts as taken, and is not followed.
+            let link = d.join("link.png");
+            std::os::unix::fs::symlink(d.join("nowhere.png"), &link).unwrap();
+            assert_eq!(write_private_new(&link, b"x").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+            assert!(!d.join("nowhere.png").exists());
+        }
     }
 
     #[cfg(unix)]

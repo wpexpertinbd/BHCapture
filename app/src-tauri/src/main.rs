@@ -36,6 +36,10 @@ const OVERLAY_PREFIX: &str = "overlay-";
 
 const SETTINGS_WINDOW: &str = "settings";
 const EDITOR_PREFIX: &str = "editor-";
+/// The start window (decision 40): new capture, open an image, recent captures.
+const HOME_WINDOW: &str = "home";
+/// How many recent captures the start window shows.
+const RECENT_MAX: usize = 12;
 
 struct AppState {
     capturer: PlatformCapturer,
@@ -57,6 +61,9 @@ struct AppState {
     /// Captures open in editor windows, by editor id. Nothing is on disk until the user saves.
     editors: Mutex<std::collections::HashMap<u64, EditorDoc>>,
     next_editor: AtomicU64,
+    /// The files the start window last listed. Its page refers to them by position only, so the
+    /// webview never hands us a path to open.
+    recent: Mutex<Vec<std::path::PathBuf>>,
 }
 
 /// One capture being edited. The pixels stay in memory until the window closes; a save writes the
@@ -64,6 +71,8 @@ struct AppState {
 struct EditorDoc {
     frame: Frame,
     saved_to: Option<std::path::PathBuf>,
+    /// The file this was opened from (start window). Save writes a NEW file beside it, never over it.
+    origin: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -360,20 +369,144 @@ fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// The Dock / Launchpad icon was clicked while BHCapture runs (see the `Reopen` handler).
-#[cfg(target_os = "macos")]
+/// BHCapture was opened again while it runs: the Dock / Launchpad / Finder icon on macOS (the
+/// `Reopen` handler), a second launch on Windows/Linux (the single-instance hand-off).
+///
+/// Captures and recordings are what the user comes back for (Benjamin, 2026-10-22: "I was just
+/// need to see the last editor that was opened"), so those come to the front. Nothing else does:
+/// with nothing open, BHCapture simply stays in the menu bar / tray, ready for a shortcut
+/// ("as normally it will stay open as topbar"). Settings opens only when asked for (tray menu,
+/// app menu, ⌘,).
 fn reopen(app: &tauri::AppHandle) {
     let docs: Vec<_> = app.webview_windows().into_iter()
-        .filter(|(l, _)| l.starts_with(EDITOR_PREFIX) || l.starts_with(recording::VIDEO_PREFIX) || l == SETTINGS_WINDOW)
+        .filter(|(l, _)| l.starts_with(EDITOR_PREFIX) || l.starts_with(recording::VIDEO_PREFIX))
         .map(|(_, w)| w)
         .collect();
-    if docs.is_empty() { let _ = open_settings(app.clone()); return; }
+    // Nothing open: the start window, Snagit's model (decision 40) -- never Settings.
+    if docs.is_empty() { let _ = open_home(app); return; }
     for w in &docs {
         let _ = w.unminimize();
         let _ = w.show();
     }
     sync_dock(app, None);
     let _ = docs[0].set_focus();
+}
+
+/// Show the start window (create it, or bring an open one forward). Main thread.
+fn open_home(app: &tauri::AppHandle) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window(HOME_WINDOW) {
+        let _ = w.unminimize();
+        let _ = w.show();
+        sync_dock(app, None);
+        let _ = w.set_focus();
+        return Ok(());
+    }
+    let w = WebviewWindowBuilder::new(app, HOME_WINDOW, WebviewUrl::App("index.html".into()))
+        .title("BHCapture")
+        .inner_size(780.0, 560.0)
+        .min_inner_size(420.0, 380.0)
+        .center()
+        .resizable(true)
+        .build().map_err(|e| e.to_string())?;
+    sync_dock(app, None);
+    let _ = w.set_focus();
+    Ok(())
+}
+
+/// The start window goes away once it has handed over to a capture or an editor.
+fn close_home(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window(HOME_WINDOW) {
+        let _ = w.destroy();
+        sync_dock(app, Some(HOME_WINDOW));
+    }
+}
+
+#[derive(Serialize)]
+struct RecentCapture { name: String, width: u32, height: u32, thumb: String }
+
+/// The latest saved captures in the save folder, with small previews. Decoding is slow-ish, so it
+/// runs off the main thread; a file that cannot be read is left out, not reported.
+#[tauri::command]
+async fn home_recent(state: tauri::State<'_, Arc<AppState>>) -> Result<Vec<RecentCapture>, String> {
+    use base64::Engine;
+    let dir = state.settings.lock().unwrap().get().output_dir.clone().unwrap_or_else(default_capture_dir);
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // One listing at a time: the list this returns and the one `home_open_recent` indexes into
+        // must be the same, and two decodes at once would only double the memory.
+        static LISTING: Mutex<()> = Mutex::new(());
+        let _one = LISTING.lock().unwrap_or_else(|p| p.into_inner());
+        let files = bhcapture_core::library::recent_images(&dir, RECENT_MAX);
+        let mut kept = Vec::new();
+        let mut out = Vec::new();
+        for p in files {
+            let Ok((jpeg, width, height)) = bhcapture_core::library::thumbnail_jpeg(&p, 360) else { continue };
+            out.push(RecentCapture {
+                name: p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                width, height,
+                thumb: format!("data:image/jpeg;base64,{}", base64::engine::general_purpose::STANDARD.encode(jpeg)),
+            });
+            kept.push(p);
+        }
+        *st.recent.lock().unwrap() = kept;
+        out
+    }).await.map_err(|e| e.to_string())
+}
+
+/// Open an image file in a new editor (async: `open_editor` waits on the main thread).
+/// `listed`: the file came from the recent-captures list, so a symlink put in its place since is
+/// refused (a file picked in Open Image… may be a link on purpose).
+async fn open_image(app: &tauri::AppHandle, state: &Arc<AppState>, path: std::path::PathBuf, listed: bool) -> Result<(), String> {
+    let p = path.clone();
+    let (rgba, w, h) = tauri::async_runtime::spawn_blocking(move || if listed {
+            bhcapture_core::library::decode_listed(&p)
+        } else {
+            bhcapture_core::library::decode_file(&p)
+        })
+        .await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let mut bgra = rgba;
+    for px in bgra.chunks_exact_mut(4) { px.swap(0, 2); }
+    let frame = Frame::from_bgra(bgra, w, h, w as usize * 4, bhcapture_core::geom::Scale::new(1.0).unwrap())
+        .map_err(|e| e.to_string())?;
+    open_editor(app, state, frame, Some(path))?;
+    let a = app.clone();
+    let _ = app.run_on_main_thread(move || close_home(&a));
+    Ok(())
+}
+
+/// A recent capture, by its position in the list `home_recent` returned (never a path).
+#[tauri::command]
+async fn home_open_recent(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>, index: usize) -> Result<(), String> {
+    let path = state.recent.lock().unwrap().get(index).cloned().ok_or("that capture is no longer listed")?;
+    open_image(&app, state.inner(), path, true).await
+}
+
+/// Open Image…: the file is chosen in a native dialog here, never named by the webview.
+#[tauri::command]
+async fn home_open_file(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    let dir = state.settings.lock().unwrap().get().output_dir.clone().unwrap_or_else(default_capture_dir);
+    let mut d = app.dialog().file().set_title("Open an image to edit").set_directory(&dir);
+    let exts: Vec<&str> = ALL_FORMATS.iter().flat_map(|f| f.extensions().iter().copied()).collect();
+    d = d.add_filter("Images", &exts);
+    if let Some(w) = app.get_webview_window(HOME_WINDOW) { d = d.set_parent(&w); }
+    let Some(picked) = d.blocking_pick_file() else { return Ok(()) };
+    let path = picked.into_path().map_err(|e| e.to_string())?;
+    open_image(&app, state.inner(), path, false).await
+}
+
+/// New Screenshot / Record Video from the start window: the same as the tray items.
+#[tauri::command]
+fn home_capture(app: tauri::AppHandle, video: bool) {
+    close_home(&app);
+    // A capture leaves out only the selector's own windows, so give the start window time to be
+    // gone from the screen first -- it must not end up in the screenshot it was used to take.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let a = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if video { recording::record_shortcut(&a) } else { open_selector(&a, false) }
+        });
+    });
 }
 
 /// Release the frozen frames (tens of MB on a Retina panel) and invalidate in-flight work.
@@ -748,7 +881,7 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, _save_as: bool) -> Resu
     broadcast(app, None);
     hide_overlays(app);
 
-    open_editor(app, state, frame).map_err(CommitError::Failed)
+    open_editor(app, state, frame, None).map_err(CommitError::Failed)
 }
 
 /// Where a save goes, and in which format: the default folder with a generated, collision-free name,
@@ -757,7 +890,7 @@ fn commit(app: &tauri::AppHandle, state: &Arc<AppState>, _save_as: bool) -> Resu
 /// In Save As the extension the user types wins (`shot.jpg` is a JPEG even if PNG was selected), and a
 /// name with no extension we write gets the selected format's.
 fn choose_save_path(app: &tauri::AppHandle, state: &AppState, width: u32, height: u32, save_as: bool,
-                    format: ImageFormat, parent: Option<&tauri::WebviewWindow>)
+                    format: ImageFormat, parent: Option<&tauri::WebviewWindow>, origin: Option<&std::path::Path>)
                     -> Result<(std::path::PathBuf, ImageFormat), CommitError> {
     // The name is built from the pattern; `{title}`/`{app}` are untrusted window metadata, so
     // core sanitises them to a single path component (see bhcapture_core::naming).
@@ -768,7 +901,14 @@ fn choose_save_path(app: &tauri::AppHandle, state: &AppState, width: u32, height
          s.output_dir.clone().unwrap_or_else(default_capture_dir),
          s.always_ask_where_to_save)
     };
-    let stem = pattern.render(local_stamp(), &Fields { width, height, ..Default::default() });
+    let mut stem = pattern.render(local_stamp(), &Fields { width, height, ..Default::default() });
+    // An image opened for editing: the edited copy goes BESIDE it as "<name> edited", and the
+    // original is never written (decision 40). unique_path adds " (2)" rather than overwrite.
+    let mut out_dir = out_dir;
+    if let Some(o) = origin {
+        if let Some(d) = o.parent() { out_dir = d.to_path_buf(); }
+        stem = bhcapture_core::library::edited_stem(o);
+    }
 
     if save_as || ask {
         let mut d = app.dialog().file()
@@ -808,10 +948,15 @@ fn choose_save_path(app: &tauri::AppHandle, state: &AppState, width: u32, height
 
 /// Open `frame` in a new editor window. Windows are created on the main thread; this waits for it.
 /// Must not be called ON the main thread (every caller is a command or worker thread).
-fn open_editor(app: &tauri::AppHandle, state: &Arc<AppState>, frame: Frame) -> Result<String, String> {
+fn open_editor(app: &tauri::AppHandle, state: &Arc<AppState>, frame: Frame, origin: Option<std::path::PathBuf>)
+    -> Result<String, String> {
     let id = state.next_editor.fetch_add(1, Ordering::SeqCst) + 1;
     let (w, h, scale) = (frame.width(), frame.height(), frame.scale().get());
-    state.editors.lock().unwrap().insert(id, EditorDoc { frame, saved_to: None });
+    let title = match &origin {
+        Some(p) => format!("BHCapture — {}", p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+        None => format!("BHCapture — {w} × {h}"),
+    };
+    state.editors.lock().unwrap().insert(id, EditorDoc { frame, saved_to: None, origin });
 
     // Show the capture at 1:1 (in points) when it fits, otherwise fit 85% of the main display.
     let (dw, dh) = state.layout.lock().unwrap().displays().first()
@@ -825,7 +970,7 @@ fn open_editor(app: &tauri::AppHandle, state: &Arc<AppState>, frame: Frame) -> R
     let (tx, rx) = std::sync::mpsc::channel();
     let queued = app.run_on_main_thread(move || {
         let b = WebviewWindowBuilder::new(&a, &l, WebviewUrl::App("index.html".into()))
-            .title(format!("BHCapture — {w} × {h}"))
+            .title(title)
             .inner_size(ww, wh)
             .min_inner_size(640.0, 420.0)
             .center()
@@ -860,7 +1005,9 @@ fn editor_id_of(label: &str) -> Result<u64, String> {
 }
 
 #[derive(Serialize)]
-struct EditorInfo { id: u64, width: u32, height: u32, scale: f64, saved_to: Option<String>, format: ImageFormat }
+struct EditorInfo { id: u64, width: u32, height: u32, scale: f64, saved_to: Option<String>, format: ImageFormat,
+                    /// Opened from this file (start window): nothing to lose by closing it unedited.
+                    origin: Option<String> }
 
 #[tauri::command]
 fn editor_info(window: tauri::Window, state: tauri::State<Arc<AppState>>) -> Result<EditorInfo, String> {
@@ -869,7 +1016,8 @@ fn editor_info(window: tauri::Window, state: tauri::State<Arc<AppState>>) -> Res
     let docs = state.editors.lock().unwrap();
     let d = docs.get(&id).ok_or("this capture is no longer open")?;
     Ok(EditorInfo { id, width: d.frame.width(), height: d.frame.height(), scale: d.frame.scale().get(),
-                    saved_to: d.saved_to.as_ref().map(|p| p.display().to_string()), format })
+                    saved_to: d.saved_to.as_ref().map(|p| p.display().to_string()), format,
+                    origin: d.origin.as_ref().map(|p| p.display().to_string()) })
 }
 
 /// The capture's pixels as raw RGBA8, sent as binary rather than a multi-megabyte JSON array.
@@ -910,6 +1058,7 @@ fn command_allowed(label: &str, cmd: &str) -> bool {
         else if label == SETTINGS_WINDOW { "settings" }
         else if label == recording::HUD { "recorder" }
         else if label == camera_bubble::CAMERA_WINDOW { "camera" }
+        else if label == HOME_WINDOW { "home" }
         else { return false };
     match window {
         "overlay" => matches!(cmd, "overlay_info" | "selection_begin" | "selection_update" | "selection_nudge"
@@ -922,6 +1071,7 @@ fn command_allowed(label: &str, cmd: &str) -> bool {
         "video" => cmd.starts_with("video_"),
         "recorder" => cmd.starts_with("recorder_"),
         "camera" => cmd == "camera_attach",
+        "home" => matches!(cmd, "home_recent" | "home_open_recent" | "home_open_file" | "home_capture"),
         _ => false,
     }
 }
@@ -966,10 +1116,40 @@ async fn editor_save(app: tauri::AppHandle, window: tauri::WebviewWindow, state:
         return Err(CommitError::Failed("this capture is no longer open".into()));
     }
 
-    let (path, format) = choose_save_path(&app, &state, w, h, save_as, wanted, Some(&window))?;
+    let origin = state.editors.lock().unwrap().get(&id).and_then(|d| d.origin.clone());
+    let dialog = save_as || state.settings.lock().unwrap().get().always_ask_where_to_save;
+    let (mut path, format) = choose_save_path(&app, &state, w, h, save_as, wanted, Some(&window), origin.as_deref())?;
+    // An image opened for editing is never written over (decision 40) -- not even when the user
+    // picks its own name in the Save dialog.
+    if origin.as_deref().is_some_and(|o| same_file(&path, o)) {
+        return Err(CommitError::Failed("That is the original image, which BHCapture leaves unchanged. Choose another name.".into()));
+    }
     let (rgba, rw, rh) = decode_png_rgba(&png).map_err(CommitError::Failed)?;
     let bytes = export::encode(&rgba, rw, rh, format, quality).map_err(|e| CommitError::Failed(e.to_string()))?;
-    bhcapture_core::private_file::write_private(&path, &bytes).map_err(|e| CommitError::Failed(format!("Could not save the file: {e}")))?;
+    let failed = |e: std::io::Error| CommitError::Failed(format!("Could not save the file: {e}"));
+    if dialog {
+        // A name the user chose (the dialog has already asked about replacing an existing file).
+        bhcapture_core::private_file::write_private(&path, &bytes).map_err(failed)?;
+    } else {
+        // A generated name must be NEW: if something took it meanwhile, pick the next free one
+        // rather than replace it. An opened image whose folder cannot be written to (a read-only
+        // share, another user's folder) is saved to the normal capture folder instead.
+        let mut origin_here = origin.clone();
+        let mut tries = 0;
+        loop {
+            match bhcapture_core::private_file::write_private_new(&path, &bytes) {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
+                Err(e) if origin_here.is_some()
+                    && matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem) => {
+                    println!("[editor] cannot write beside the original ({e}); saving to the capture folder");
+                    origin_here = None;
+                }
+                Err(e) => return Err(failed(e)),
+            }
+            path = choose_save_path(&app, &state, w, h, false, format, Some(&window), origin_here.as_deref())?.0;
+        }
+    }
     if let Some(d) = state.editors.lock().unwrap().get_mut(&id) { d.saved_to = Some(path.clone()); }
 
     // Clipboard is a convenience on top of a file that already exists -- never fail the save for it.
@@ -978,6 +1158,26 @@ async fn editor_save(app: tauri::AppHandle, window: tauri::WebviewWindow, state:
     }
     println!("[editor] {} saved {w}x{h} as {} ({} bytes) to {}", window.label(), format.label(), bytes.len(), path.display());
     Ok(path.display().to_string())
+}
+
+/// Whether two paths are the same file on disk (so a different spelling, case or a link still
+/// matches). A path that does not exist yet is never the same file.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(a), std::fs::metadata(b)) {
+            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
+            _ => false,
+        }
+    }
 }
 
 #[tauri::command]
@@ -1569,19 +1769,24 @@ fn main() {
         epoch: AtomicU64::new(0),
         editors: Mutex::new(std::collections::HashMap::new()),
         next_editor: AtomicU64::new(0),
+        recent: Mutex::new(Vec::new()),
     });
     apply_settings(&state);
 
     let builder = tauri::Builder::default();
     // First, so a second launch is handed over before anything else starts: launching BHCapture
-    // again (Start menu, app launcher, Finder) opens Settings in the copy already running.
+    // again (Start menu, app launcher, Finder) brings the running copy's open captures forward --
+    // the same rule as the macOS Dock click (`reopen`): never Settings on its own.
     // Test builds run beside the user's own BHCapture under a throwaway HOME, so they may skip it.
     #[cfg(feature = "demo")]
     let skip_single = std::env::var_os("BHC_TEST_OUT").is_some();
     #[cfg(not(feature = "demo"))]
     let skip_single = false;
     let builder = if skip_single { builder } else {
-        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| { let _ = open_settings(app.clone()); }))
+        builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            let a = app.clone();
+            let _ = app.run_on_main_thread(move || reopen(&a));
+        }))
     };
     builder
         .plugin(tauri_plugin_dialog::init())
@@ -1625,7 +1830,8 @@ fn main() {
             recording::recorder_pause, recording::recorder_stop, recording::recorder_cancel, recording::recorder_hide, recording::recorder_restart,
             recording::video_info, recording::video_save, recording::video_close, recording::video_export,
             camera_bubble::camera_attach, camera_bubble::camera_devices,
-            updater::update_info, updater::update_check, updater::update_set_auto, updater::update_install, updater::update_open_page, login_open_settings
+            updater::update_info, updater::update_check, updater::update_set_auto, updater::update_install, updater::update_open_page, login_open_settings,
+            home_recent, home_open_recent, home_open_file, home_capture
             ]);
             move |invoke: tauri::ipc::Invoke<tauri::Wry>| {
                 let (label, cmd) = (invoke.message.webview_ref().label().to_string(), invoke.message.command().to_string());
@@ -2323,9 +2529,7 @@ fn main() {
             // Quitting mid-recording finishes the file, so it is playable and offered next launch.
             if let tauri::RunEvent::Exit = event { recording::finish_on_exit(); }
             // Opening BHCapture again while it runs (Dock, Launchpad, Finder, Spotlight): bring back
-            // what the user was working on -- an unsaved capture, a recording, Settings. Only when
-            // nothing is open does it open Settings, since a menu-bar app otherwise gives no sign
-            // that anything happened. (It used to open Settings every time, on top of the editor.)
+            // open captures and recordings, nothing else (see `reopen`).
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event { reopen(app); }
             #[cfg(not(target_os = "macos"))]

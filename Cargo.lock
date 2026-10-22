@@ -308,6 +308,7 @@ version = "1.1.4"
 dependencies = [
  "gif",
  "image",
+ "libc",
  "nnnoiseless",
  "openh264",
  "serde",
