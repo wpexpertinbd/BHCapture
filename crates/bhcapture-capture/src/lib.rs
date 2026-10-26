@@ -68,6 +68,20 @@ pub mod platform {
         { let _ = handle; true }
     }
 
+    /// Undo [`prepare_tool_window`] — call it right BEFORE destroying such a window. On macOS the
+    /// panel conversion replaced the class WebKit's observers were registered under, and destroying
+    /// the window without restoring it throws an Objective-C exception that aborts the app (1.1.5
+    /// crash when a display went away). Elsewhere nothing to undo.
+    ///
+    /// # Safety
+    /// As [`prepare_tool_window`].
+    pub unsafe fn release_tool_window(handle: *mut std::ffi::c_void) {
+        #[cfg(target_os = "macos")]
+        { unsafe { crate::macos::restore_window_class(handle); } }
+        #[cfg(not(target_os = "macos"))]
+        { let _ = handle; }
+    }
+
     /// Let a tool window be IN recordings (the click-highlight layer) or keep it out. Only Windows
     /// needs this per window; macOS includes it through the recorder's filter instead.
     ///

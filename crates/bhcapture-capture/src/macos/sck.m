@@ -5,6 +5,7 @@
 #import <string.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <objc/objc-exception.h>
 #import "sck.h"
 
 /* Every async entry point blocks on a semaphore WITH A TIMEOUT. Without it a missing TCC grant
@@ -395,6 +396,24 @@ void bhc_watch_displays(void (*cb)(void *), void *ctx) {
     });
 }
 
+/* Diagnostics: log each Objective-C exception before it is thrown (see log_objc_exceptions). */
+static objc_exception_preprocessor bhc_prev_preprocessor;
+static id bhc_exception_logger(id exc) {
+    if ([exc isKindOfClass:[NSException class]]) {
+        NSException *e = exc;
+        fprintf(stderr, "[objc-exception] %s: %s\n%s\n", e.name.UTF8String ?: "?", e.reason.UTF8String ?: "?",
+                [[e.callStackSymbols componentsJoinedByString:@"\n"] UTF8String] ?: "");
+        fflush(stderr);
+    }
+    return bhc_prev_preprocessor ? bhc_prev_preprocessor(exc) : exc;
+}
+void bhc_log_objc_exceptions(void) {
+    bhc_prev_preprocessor = objc_setExceptionPreprocessor(bhc_exception_logger);
+}
+
+/* The class bhc_make_overlay_panel replaced, per window (a Class is never freed: ASSIGN is safe). */
+static char bhc_original_class_key;
+
 @interface BHCOverlayPanel : NSPanel
 @end
 @implementation BHCOverlayPanel
@@ -423,6 +442,11 @@ int32_t bhc_make_overlay_panel(void *nswindow) {
      * rather than trust that a future OS keeps it so. */
     if (class_getInstanceSize(want) > class_getInstanceSize(cur)) return -1;
 
+    /* Remember the class we replace, so bhc_restore_window_class can put it back before the window
+     * is destroyed. That class is usually not Tao's own but the KVO subclass macOS made for WebKit's
+     * observers; tearing the window down under OUR class makes WebKit's removeObserver throw
+     * ("…is not registered as an observer") and Rust aborts. (1.1.5 crash, 2026-10-25.) */
+    objc_setAssociatedObject(w, &bhc_original_class_key, cur, OBJC_ASSOCIATION_ASSIGN);
     object_setClass(w, want);
     NSPanel *p = (NSPanel *)w;
     p.styleMask |= NSWindowStyleMaskNonactivatingPanel;
@@ -440,6 +464,19 @@ int32_t bhc_make_overlay_panel(void *nswindow) {
     if ([p respondsToSelector:prevents]) {
         ((void (*)(id, SEL, BOOL))objc_msgSend)(p, prevents, YES);
     }
+    return 1;
+}
+
+/* Undo bhc_make_overlay_panel's class swap. MUST run before such a window is destroyed: see the
+ * note at the swap. Returns 1 if restored, 0 if there was nothing to restore. Main thread only. */
+int32_t bhc_restore_window_class(void *nswindow) {
+    if (!nswindow) return 0;
+    NSWindow *w = (__bridge NSWindow *)nswindow;
+    if (object_getClass(w) != [BHCOverlayPanel class]) return 0;
+    Class orig = objc_getAssociatedObject(w, &bhc_original_class_key);
+    if (!orig) return 0;
+    object_setClass(w, orig);
+    objc_setAssociatedObject(w, &bhc_original_class_key, nil, OBJC_ASSOCIATION_ASSIGN);
     return 1;
 }
 

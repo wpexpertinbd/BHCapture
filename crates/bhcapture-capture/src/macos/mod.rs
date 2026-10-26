@@ -75,7 +75,20 @@ extern "C" {
     fn bhc_watch_displays(cb: extern "C" fn(*mut c_void), ctx: *mut c_void);
     fn bhc_make_overlay_panel(nswindow: *mut c_void) -> i32;
     fn bhc_refresh_menu_bar();
+    fn bhc_log_objc_exceptions();
+    fn bhc_restore_window_class(nswindow: *mut c_void) -> i32;
 }
+
+/// Undo `make_overlay_panel` before the window is destroyed (see `bhc_restore_window_class`).
+///
+/// # Safety
+/// `ptr` must be a live `NSWindow*`, and this must run on the main thread.
+pub unsafe fn restore_window_class(ptr: *mut c_void) -> i32 { bhc_restore_window_class(ptr) }
+
+/// Print every Objective-C exception (name, reason, stack) to stderr just before it is thrown.
+/// Rust aborts on a foreign exception without saying what it was, so this is the only way to see
+/// one. Diagnostic use (test builds); harmless anywhere.
+pub fn log_objc_exceptions() { unsafe { bhc_log_objc_exceptions() } }
 
 static DISPLAY_WATCHER: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>> = std::sync::OnceLock::new();
 

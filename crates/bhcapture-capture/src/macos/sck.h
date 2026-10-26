@@ -82,6 +82,8 @@ void    bhc_watch_displays(void (*cb)(void *), void *ctx);
  *
  * Returns 1 on success, 0 on a bad argument, -1 if the swap was refused as unsafe. Main thread only. */
 int32_t bhc_make_overlay_panel(void *nswindow);
+void bhc_log_objc_exceptions(void);
+int32_t bhc_restore_window_class(void *nswindow);
 
 /* Make the menu bar respond after a runtime accessory -> regular switch (see sck.m). Main thread. */
 void    bhc_refresh_menu_bar(void);

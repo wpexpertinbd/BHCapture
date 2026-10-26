@@ -1606,6 +1606,8 @@ fn sync_overlays(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result
     for (label, w) in app.webview_windows() {
         if label.starts_with(OVERLAY_PREFIX) && !wanted.contains(&label) {
             println!("[display] removing {label}: its display is gone");
+            // Undo the panel conversion first, or WebKit's teardown throws and the app aborts.
+            if let Some(p) = native_handle(&w) { unsafe { platform::release_tool_window(p); } }
             let _ = w.destroy();
         }
     }
@@ -2289,6 +2291,59 @@ fn main() {
                 });
             }
 
+            // A display going away (monitor unplugged / switched to another input): the real
+            // `sync_overlays` path, with the current display replaced by one with a new id, so the
+            // old display's overlay is destroyed and a new one created. Crashed 1.1.5 (2026-10-25).
+            if std::env::args().any(|a| a == "--demo-display-gone") {
+                #[cfg(target_os = "macos")]
+                bhcapture_capture::macos::log_objc_exceptions();
+                let (h, st) = (handle.clone(), state.clone());
+                std::thread::spawn(move || {
+                    let ms = |n| std::thread::sleep(std::time::Duration::from_millis(n));
+                    ms(2500);
+                    // Away and back three times: a monitor switched to another input and back.
+                    for round in 0..6 {
+                        let shift: i64 = if round % 2 == 0 { 1000 } else { -1000 };
+                        let moved: Vec<_> = st.layout.lock().unwrap().displays().iter()
+                            .map(|d| { let mut d = d.clone(); d.id = DisplayId((d.id.0 as i64 + shift) as u32); d }).collect();
+                        println!("[gone] round {round}: overlays before: {:?}",
+                            h.webview_windows().keys().filter(|l| l.starts_with(OVERLAY_PREFIX)).collect::<Vec<_>>());
+                        *st.layout.lock().unwrap() = bhcapture_core::geom::DisplayLayout::new(moved);
+                        let (a, s2) = (h.clone(), st.clone());
+                        let _ = h.run_on_main_thread(move || {
+                            if let Err(e) = sync_overlays(&a, &s2) { eprintln!("[gone] sync failed: {e}"); }
+                        });
+                        ms(1500);
+                    }
+                    // The selector still opens on the overlay that exists now.
+                    open_selector(&h, false);
+                    ms(1200);
+                    println!("[gone] selector visible after the changes: {:?}",
+                        h.webview_windows().iter().filter(|(l, _)| l.starts_with(OVERLAY_PREFIX))
+                            .map(|(l, w)| (l.clone(), w.is_visible().unwrap_or(false))).collect::<Vec<_>>());
+                    hide_overlays(&h);
+                    ms(800);
+                    println!("[gone] SURVIVED; overlays after: {:?}",
+                        h.webview_windows().keys().filter(|l| l.starts_with(OVERLAY_PREFIX)).collect::<Vec<_>>());
+                    h.exit(0);
+                });
+            }
+
+            // Open the image files named after this switch in editors (one each), with no capture --
+            // for reproducing Save / Save As behaviour on known files.
+            if let Some(pos) = std::env::args().position(|a| a == "--demo-open-images") {
+                let files: Vec<std::path::PathBuf> = std::env::args().skip(pos + 1).map(Into::into).collect();
+                let (h, st) = (handle.clone(), state.clone());
+                tauri::async_runtime::spawn(async move {
+                    for f in files {
+                        match open_image(&h, &st, f.clone(), false).await {
+                            Ok(()) => println!("[open-images] opened {}", f.display()),
+                            Err(e) => println!("[open-images] FAILED {}: {e}", f.display()),
+                        }
+                    }
+                });
+            }
+
             if std::env::args().any(|a| a == "--demo-focus") {
                 let h = handle.clone();
                 std::thread::spawn(move || {
@@ -2527,7 +2582,15 @@ fn main() {
         .expect("error while building BHCapture")
         .run(|app, event| {
             // Quitting mid-recording finishes the file, so it is playable and offered next launch.
-            if let tauri::RunEvent::Exit = event { recording::finish_on_exit(); }
+            if let tauri::RunEvent::Exit = event {
+                recording::finish_on_exit();
+                // Undo every panel conversion before shutdown tears the windows and their web views
+                // down -- the same WebKit teardown that aborted 1.1.5 when a display went away.
+                // (A window that was never converted is left as it is.) Exit runs on the main thread.
+                for (_, w) in app.webview_windows() {
+                    if let Some(p) = native_handle(&w) { unsafe { platform::release_tool_window(p); } }
+                }
+            }
             // Opening BHCapture again while it runs (Dock, Launchpad, Finder, Spotlight): bring back
             // open captures and recordings, nothing else (see `reopen`).
             #[cfg(target_os = "macos")]
