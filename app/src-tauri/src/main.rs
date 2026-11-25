@@ -561,43 +561,43 @@ fn open_selector_as(app: &tauri::AppHandle, video: bool, switchable: bool) {
     release_frozen(&state);
     let epoch = state.epoch.load(Ordering::SeqCst);
     broadcast(app, None);
-    // Where a capture cannot leave our own windows out (X11), freeze the screen BEFORE the overlay
-    // appears -- afterwards it would photograph its own dim scrim. Costs the time of one capture.
-    let frozen_first = platform::CAPTURE_SEES_OWN_WINDOWS;
-    if frozen_first {
-        let layout = state.layout.lock().unwrap().clone();
-        match Snapshot::take(&state.capturer, &layout) {
-            Ok(snap) => *state.snapshot.lock().unwrap() = Some(Arc::new(snap)),
-            Err(e) => eprintln!("[warn] could not freeze the screen ({e})"),
-        }
-    }
-    show_overlays(app); // appear first; also arms the selector keys, in the same main-thread step
-    for (label, w) in app.webview_windows() {
-        if label.starts_with(OVERLAY_PREFIX) {
-            println!("[selector] {label} shown: visible={:?} at {:?} size {:?}",
-                w.is_visible(), w.outer_position().ok().map(|p| (p.x, p.y)),
-                w.inner_size().ok().map(|s| (s.width, s.height)));
-        }
-    }
-
-    // Two independent jobs, each discarded if the selector has since closed or reopened.
+    // Freeze the screen BEFORE the overlay appears, on every OS. The moment our overlay shows (and
+    // takes the key window / covers the pointer), the app underneath loses focus and hover: open
+    // dropdowns, menus, popups and tooltips close. Frozen afterwards, the capture showed the page
+    // WITHOUT the popup the user pressed the shortcut for. (X11 needs this order anyway: there a
+    // capture would also photograph our own dim scrim.) Costs the time of one capture before the
+    // overlay appears; off the main thread so nothing else stalls.
+    // Test builds only: the OLD order (overlay first), for an A/B against the popup test.
+    let show_first = cfg!(feature = "demo") && std::env::var_os("BHC_SHOW_FIRST").is_some();
+    if show_first { show_overlays(app); std::thread::sleep(std::time::Duration::from_millis(150)); }
     let st = state.clone();
     let app_for_freeze = app.clone();
-    if !frozen_first { std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let layout = st.layout.lock().unwrap().clone();
-        match Snapshot::take(&st.capturer, &layout) {
+        let t0 = std::time::Instant::now();
+        let frozen = match Snapshot::take(&st.capturer, &layout) {
             Ok(snap) => {
                 let mut slot = st.snapshot.lock().unwrap();
                 if st.epoch.load(Ordering::SeqCst) != epoch { return; }
                 *slot = Some(Arc::new(snap));
-                drop(slot);
-                // A pointer that has not moved since the overlay opened would otherwise show no
-                // magnifier until its next movement.
-                let _ = app_for_freeze.emit("frozen-ready", ());
+                true
             }
-            Err(e) => eprintln!("[warn] could not freeze the screen ({e}); the magnifier is off and capture will be live"),
+            Err(e) => {
+                eprintln!("[warn] could not freeze the screen ({e}); the magnifier is off and capture will be live");
+                false
+            }
+        };
+        println!("[selector] screen frozen in {} ms (ok={frozen})", t0.elapsed().as_millis());
+        if st.epoch.load(Ordering::SeqCst) != epoch { return; }
+        // The epoch is checked AGAIN on the main thread: a cancel or display change queued between
+        // the check above and this show must win, or a stale selector would reappear with its keys.
+        show_overlays_for(&app_for_freeze, Some(epoch)); // also arms the selector keys
+        if frozen {
+            // A pointer that has not moved since the overlay opened would otherwise show no
+            // magnifier until its next movement.
+            let _ = app_for_freeze.emit("frozen-ready", ());
         }
-    }); }
+    });
     let st = state.clone();
     std::thread::spawn(move || {
         match st.capturer.list_targets() {
@@ -1701,7 +1701,10 @@ fn on_displays_changed(app: &tauri::AppHandle) {
     });
 }
 
-fn show_overlays(app: &tauri::AppHandle) {
+fn show_overlays(app: &tauri::AppHandle) { show_overlays_for(app, None) }
+
+/// [`show_overlays`], skipped if `epoch` is given and the selector session has since moved on.
+fn show_overlays_for(app: &tauri::AppHandle, epoch: Option<u64>) {
     // The overlays are non-activating panels (see `bhc_make_overlay_panel`): the key window inside
     // this app without the app becoming active, so no Dock icon and no focus fight with the app in
     // front. Showing and focusing happen together on the main thread, window first and then its web
@@ -1711,6 +1714,9 @@ fn show_overlays(app: &tauri::AppHandle) {
     // when the overlay is opened from a hotkey. That is what the selector's global keys are for.
     let a = app.clone();
     let _ = app.run_on_main_thread(move || {
+        if let Some(e) = epoch {
+            if a.state::<Arc<AppState>>().epoch.load(Ordering::SeqCst) != e { return; }
+        }
         for (label, w) in a.webview_windows() {
             if label.starts_with(OVERLAY_PREFIX) {
                 let _ = w.show();
@@ -2413,6 +2419,35 @@ fn main() {
                     println!("[notice] after SUCCESS: selection cleared = {}, overlay hidden = {}",
                         st.drag.lock().unwrap().is_none(), !w.is_visible().unwrap_or(true));
                     ms(500);
+                    h.exit(0);
+                });
+            }
+
+            // Popup test: something else is in front with a popup open; after BHC_POPUP_WAIT seconds
+            // the selector opens and the frozen frame of the main display is written as PNG.
+            if std::env::args().any(|a| a == "--demo-popup") {
+                let (h, st) = (handle.clone(), state.clone());
+                std::thread::spawn(move || {
+                    let wait: u64 = std::env::var("BHC_POPUP_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+                    std::thread::sleep(std::time::Duration::from_secs(wait));
+                    open_selector(&h, false);
+                    let t0 = std::time::Instant::now();
+                    while st.snapshot.lock().unwrap().is_none() && t0.elapsed().as_secs() < 5 {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    let snap = st.snapshot.lock().unwrap().clone();
+                    if let (Some(snap), Ok(dir)) = (snap, std::env::var("BHC_TEST_OUT")) {
+                        let id = snap.layout().displays()[0].id;
+                        if let Ok(f) = snap.capture_display(id) {
+                            match bhcapture_core::export::encode(&f.to_rgba8(), f.width(), f.height(),
+                                    bhcapture_core::export::ImageFormat::Png, 90) {
+                                Ok(png) => { let _ = std::fs::write(std::path::Path::new(&dir).join("popup.png"), png);
+                                             println!("[popup] wrote popup.png"); }
+                                Err(e) => println!("[popup] encode failed: {e}"),
+                            }
+                        }
+                    } else { println!("[popup] no frozen frame"); }
                     h.exit(0);
                 });
             }
